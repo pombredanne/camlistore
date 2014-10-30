@@ -12,7 +12,7 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-*/
+ */
 
 package org.camlistore;
 
@@ -21,6 +21,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.util.Log;
 
 public class WifiPowerReceiver extends BroadcastReceiver {
@@ -44,22 +46,45 @@ public class WifiPowerReceiver extends BroadcastReceiver {
         }
 
         if (ConnectivityManager.CONNECTIVITY_ACTION.equals(action)) {
-            NetworkInfo ni = intent.getParcelableExtra(ConnectivityManager.EXTRA_NETWORK_INFO);
-            Log.d(TAG, "NetworkInfo: " + ni);
-
-            // Nexus one, starting with Wifi, and then turning it off, and watching it flip back
-            // to 3G:
-
-            // D/WifiPowerReceiver(25298): connectivity extras: Bundle[{networkInfo=NetworkInfo: type: WIFI[], state: DISCONNECTED/DISCONNECTED, reason: (unspecified), extra: (none), roaming: false, failover: false, isAvailable: false, otherNetwork=NetworkInfo: type: mobile[HSDPA], state: CONNECTING/CONNECTING, reason: apnSwitched, extra: epc.tmobile.com, roaming: false, failover: true, isAvailable: true}]
-
-            // D/WifiPowerReceiver(25298): connectivity extras: Bundle[{networkInfo=NetworkInfo: type: mobile[HSDPA], state: CONNECTED/CONNECTED, reason: apnSwitched, extra: epc.tmobile.com, roaming: false, failover: false, isAvailable: true, reason=apnSwitched, isFailover=true, extraInfo=epc.tmobile.com}]
-            
-            
-            // On Droid, Wifi turning off, switching to 3G:
-            
-            // D/WifiPowerReceiver( 2443): connectivity extras: Bundle[{networkInfo=NetworkInfo: type: WIFI[], state: DISCONNECTED/DISCONNECTED, reason: (unspecified), extra: (none), roaming: false, failover: false, isAvailable: false, otherNetwork=NetworkInfo: type: mobile[CDMA - EvDo rev. A], state: CONNECTING/CONNECTING, reason: apnSwitched, extra: (none), roaming: false, failover: true, isAvailable: true}]
-
-            // D/WifiPowerReceiver( 2443): connectivity extras: Bundle[{networkInfo=NetworkInfo: type: mobile[CDMA - EvDo rev. A], state: CONNECTED/CONNECTED, reason: apnSwitched, extra: (none), roaming: false, failover: false, isAvailable: true, isFailover=true, reason=apnSwitched}]
+            boolean wifi = onWifi(context);
+            Log.d(TAG, "onWifi = " + wifi);
+            Intent cmd = new Intent(wifi ? UploadService.INTENT_NETWORK_WIFI : UploadService.INTENT_NETWORK_NOT_WIFI);
+            String ssid = getSSID(context);
+            cmd.putExtra("SSID", ssid);
+            Log.d(TAG, "extra ssid (chk)= " + cmd.getStringExtra("SSID"));
+            cmd.setClass(context, UploadService.class);
+            context.startService(cmd);
         }
+    }
+
+    public static boolean onPower(Context context) {
+        // TODO Auto-generated method stub
+        return false;
+    }
+
+    public static boolean onWifi(Context context) {
+        NetworkInfo ni = ((ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE)).getActiveNetworkInfo();
+        if (ni != null && ni.isConnected()
+                && (ni.getType() == ConnectivityManager.TYPE_WIFI || ni.getType() == ConnectivityManager.TYPE_ETHERNET)) {
+            return true;
+        }
+        return false;
+    }
+
+    public static String getSSID(Context context) {
+        NetworkInfo ni = ((ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE)).getActiveNetworkInfo();
+        if (ni != null && ni.isConnected()
+                && (ni.getType() == ConnectivityManager.TYPE_WIFI || ni.getType() == ConnectivityManager.TYPE_ETHERNET)) {
+            WifiManager wifiMgr = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
+            if (wifiMgr != null) {
+                WifiInfo wifiInfo = wifiMgr.getConnectionInfo();
+                String ssid = wifiInfo.getSSID();
+                if (ssid.startsWith("\"") && ssid.endsWith("\"")){
+                    ssid = ssid.substring(1, ssid.length()-1);
+                }
+                return ssid;
+            }
+        }
+        return "";
     }
 }

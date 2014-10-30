@@ -16,24 +16,24 @@ limitations under the License.
 
 package server
 
-const topWizard =`
+// TODO: this file and the code in wizard.go is outdated. Anyone interested enough
+// can take care of updating it as something nicer which would fit better with the
+// react UI. But in the meantime we don't link to it anymore.
+
+const topWizard = `
 <!doctype html>
 <html>
 <head>
-	<title>Permanode</title>
-	<link rel="stylesheet" href="/ui/camli.css">
+	<title>Camlistore setup</title>
 </head>
-<body class="camli-ui-permanode">
-	<div class="camli-nav">Setup Wizard</div>
-	<form id="WizardForm" action="setup" method="post" enctype="multipart/form-data">
+<body>
+	<p>[<a href="/">Back</a>]</p>
+	<h1>Setup Wizard</h1>
+	<p> See <a href="http://camlistore.org/docs/server-config">Server Configuration</a> for information on configuring the values below.</p>
+	<form id="WizardForm" action="" method="post" enctype="multipart/form-data">
 `
 
-const bottomWizard =`
-<p> <a href="/">Back</a> </p>
-<p>
-	<form id="Restart" name="Restart" action="restartCamli" method="post">
-	<input type="submit" form="Restart" value="RestartCamli"></form>
-</p>
+const bottomWizard = `
 </body>
 </html>
 `

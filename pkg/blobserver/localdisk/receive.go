@@ -23,26 +23,21 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"os/exec"
-	"path/filepath"
 
-	"camlistore.org/pkg/blobref"
-	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/blob"
 )
 
-func (ds *DiskStorage) ReceiveBlob(blobRef *blobref.BlobRef, source io.Reader) (blobGot blobref.SizedBlobRef, err error) {
-	pname := ds.partition
-	if pname != "" {
-		err = fmt.Errorf("refusing upload directly to queue partition %q", pname)
-		return
-	}
-	hashedDirectory := ds.blobDirectory(pname, blobRef)
+func (ds *DiskStorage) ReceiveBlob(blobRef blob.Ref, source io.Reader) (ref blob.SizedRef, err error) {
+	ds.dirLockMu.RLock()
+	defer ds.dirLockMu.RUnlock()
+
+	hashedDirectory := ds.blobDirectory(blobRef)
 	err = os.MkdirAll(hashedDirectory, 0700)
 	if err != nil {
 		return
 	}
 
-	tempFile, err := ioutil.TempFile(hashedDirectory, BlobFileBaseName(blobRef)+".tmp")
+	tempFile, err := ioutil.TempFile(hashedDirectory, blobFileBaseName(blobRef)+".tmp")
 	if err != nil {
 		return
 	}
@@ -55,8 +50,7 @@ func (ds *DiskStorage) ReceiveBlob(blobRef *blobref.BlobRef, source io.Reader) (
 		}
 	}()
 
-	hash := blobRef.Hash()
-	written, err := io.Copy(io.MultiWriter(hash, tempFile), source)
+	written, err := io.Copy(tempFile, source)
 	if err != nil {
 		return
 	}
@@ -66,76 +60,31 @@ func (ds *DiskStorage) ReceiveBlob(blobRef *blobref.BlobRef, source io.Reader) (
 	if err = tempFile.Close(); err != nil {
 		return
 	}
-
-	if !blobRef.HashMatches(hash) {
-		err = blobserver.ErrCorruptBlob
-		return
-	}
-
-	fileName := ds.blobPath("", blobRef)
-	if err = os.Rename(tempFile.Name(), fileName); err != nil {
-		return
-	}
-
-	stat, err := os.Lstat(fileName)
+	stat, err := os.Lstat(tempFile.Name())
 	if err != nil {
 		return
 	}
-	if !!stat.IsDir() || stat.Size() != written {
+	if stat.Size() != written {
+		err = fmt.Errorf("temp file %q size %d didn't match written size %d", tempFile.Name(), stat.Size(), written)
+		return
+	}
+
+	fileName := ds.blobPath(blobRef)
+	if err = os.Rename(tempFile.Name(), fileName); err != nil {
+		if err = mapRenameError(err, tempFile.Name(), fileName); err != nil {
+			return
+		}
+	}
+
+	stat, err = os.Lstat(fileName)
+	if err != nil {
+		return
+	}
+	if stat.Size() != written {
 		err = errors.New("Written size didn't match.")
 		return
 	}
 
-	for _, mirror := range ds.mirrorPartitions {
-		pname := mirror.partition
-		if pname == "" {
-			panic("expected partition name")
-		}
-		partitionDir := ds.blobDirectory(pname, blobRef)
-
-		// Prevent the directory from being unlinked by
-		// enumerate code, which cleans up.
-		defer keepDirectoryLock(partitionDir).Unlock()
-		defer keepDirectoryLock(filepath.Dir(partitionDir)).Unlock()
-		defer keepDirectoryLock(filepath.Dir(filepath.Dir(partitionDir))).Unlock()
-
-		if err = os.MkdirAll(partitionDir, 0700); err != nil {
-			return blobref.SizedBlobRef{}, fmt.Errorf("localdisk.receive: MkdirAll(%q) after lock on it: %v", partitionDir, err)
-		}
-		partitionFileName := ds.blobPath(pname, blobRef)
-		pfi, err := os.Stat(partitionFileName)
-		if err == nil && !pfi.IsDir() {
-			log.Printf("Skipped dup on partition %q", pname)
-		} else {
-			if err = os.Link(fileName, partitionFileName); err != nil && !linkAlreadyExists(err) {
-				log.Fatalf("got link error %T %#v", err, err)
-				return blobref.SizedBlobRef{}, err
-			}
-			log.Printf("Mirrored blob %s to partition %q", blobRef, pname)
-		}
-	}
-
-	blobGot = blobref.SizedBlobRef{BlobRef: blobRef, Size: stat.Size()}
-	success = true
-
-	if os.Getenv("CAMLI_HACK_OPEN_IMAGES") == "1" {
-		exec.Command("eog", fileName).Run()
-	}
-
-	hub := ds.GetBlobHub()
-	hub.NotifyBlobReceived(blobRef)
-	for _, mirror := range ds.mirrorPartitions {
-		mirror.GetBlobHub().NotifyBlobReceived(blobRef)
-	}
-	return
-}
-
-func linkAlreadyExists(err error) bool {
-	if os.IsExist(err) {
-		return true
-	}
-	if le, ok := err.(*os.LinkError); ok && os.IsExist(le.Err) {
-		return true
-	}
-	return false
+	success = true // used in defer above
+	return blob.SizedRef{Ref: blobRef, Size: uint32(stat.Size())}, nil
 }

@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 /*
-#fileembed pattern .+\.(js|css|html)
+The below is read by genfileembed.go to determine the files to embed in the
+server binary. Crazy, but true.
+#fileembed pattern .+\.(js|css|html|png|svg)$
 */
 package ui
 
@@ -23,6 +25,9 @@ import (
 	"camlistore.org/pkg/fileembed"
 )
 
-var Files = &fileembed.Files{
-	OverrideEnv: "CAMLI_DEV_UI_FILES",
-}
+const GaeSourceRoot = "source_root"
+
+var (
+	Files                        *fileembed.Files
+	IsAppEngine, IsProdAppEngine bool
+)

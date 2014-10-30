@@ -28,57 +28,65 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"os"
-	"path/filepath"
+	"reflect"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/strutil"
+	"camlistore.org/pkg/types"
+	"camlistore.org/third_party/github.com/bradfitz/latlong"
+	"camlistore.org/third_party/github.com/rwcarlsen/goexif/exif"
+	"camlistore.org/third_party/github.com/rwcarlsen/goexif/tiff"
 )
 
-// Map is an unencoded schema blob.
-//
-// A Map is typically used during construction of a new schema blob or
-// claim.
-type Map map[string]interface{}
-
-// Type returns the map's "camliType" value.
-func (m Map) Type() string {
-	t, _ := m["camliType"].(string)
-	return t
+func init() {
+	// Intern common strings as used by schema blobs (camliType values), to reduce
+	// index memory usage, which uses strutil.StringFromBytes.
+	strutil.RegisterCommonString(
+		"bytes",
+		"claim",
+		"directory",
+		"file",
+		"permanode",
+		"share",
+		"static-set",
+		"symlink",
+	)
 }
 
-// SetClaimDate sets the "claimDate" on a claim.
-// It is a fatal error to call SetClaimDate if the Map isn't of Type "claim".
-func (m Map) SetClaimDate(t time.Time) {
-	if t := m.Type(); t != "claim" {
-		// This is a little gross, using panic here, but I
-		// don't want all callers to check errors.  This is
-		// really a programming error, not a runtime error
-		// that would arise from e.g. random user data.
-		panic("SetClaimDate called on non-claim Map; camliType=" + t)
-	}
-	m["claimDate"] = RFC3339FromTime(t)
-}
+// MaxSchemaBlobSize represents the upper bound for how large
+// a schema blob may be.
+const MaxSchemaBlobSize = 1 << 20
 
-var _ = log.Printf
+var sha1Type = reflect.TypeOf(sha1.New())
 
-var ErrNoCamliVersion = errors.New("schema: no camliVersion key in map")
-var ErrUnimplemented = errors.New("schema: unimplemented")
+var (
+	ErrNoCamliVersion = errors.New("schema: no camliVersion key in map")
+)
+
+var clockNow = time.Now
 
 type StatHasher interface {
 	Lstat(fileName string) (os.FileInfo, error)
-	Hash(fileName string) (*blobref.BlobRef, error)
+	Hash(fileName string) (blob.Ref, error)
 }
 
+// File is the interface returned when opening a DirectoryEntry that
+// is a regular file.
 type File interface {
-	Close() error
-	Skip(skipBytes uint64) uint64
-	Read(p []byte) (int, error)
+	io.Closer
+	io.ReaderAt
+	io.Reader
+	Size() int64
 }
 
 // Directory is a read-only interface to a "directory" schema blob.
@@ -104,6 +112,16 @@ type Symlink interface {
 	// .. TODO
 }
 
+// FIFO is the read-only interface to a "fifo" schema blob.
+type FIFO interface {
+	// .. TODO
+}
+
+// Socket is the read-only interface to a "socket" schema blob.
+type Socket interface {
+	// .. TODO
+}
+
 // DirectoryEntry is a read-only interface to an entry in a (static)
 // directory.
 type DirectoryEntry interface {
@@ -113,20 +131,26 @@ type DirectoryEntry interface {
 	CamliType() string
 
 	FileName() string
-	BlobRef() *blobref.BlobRef
+	BlobRef() blob.Ref
 
 	File() (File, error)           // if camliType is "file"
 	Directory() (Directory, error) // if camliType is "directory"
 	Symlink() (Symlink, error)     // if camliType is "symlink"
+	FIFO() (FIFO, error)           // if camliType is "fifo"
+	Socket() (Socket, error)       // If camliType is "socket"
 }
 
 // dirEntry is the default implementation of DirectoryEntry
 type dirEntry struct {
-	ss      Superset
-	fetcher blobref.SeekFetcher
+	ss      superset
+	fetcher blob.Fetcher
 	fr      *FileReader // or nil if not a file
 	dr      *DirReader  // or nil if not a directory
 }
+
+// A SearchQuery must be of type *search.SearchQuery.
+// This type breaks an otherwise-circular dependency.
+type SearchQuery interface{}
 
 func (de *dirEntry) CamliType() string {
 	return de.ss.Type
@@ -136,7 +160,7 @@ func (de *dirEntry) FileName() string {
 	return de.ss.FileNameString()
 }
 
-func (de *dirEntry) BlobRef() *blobref.BlobRef {
+func (de *dirEntry) BlobRef() blob.Ref {
 	return de.ss.BlobRef
 }
 
@@ -172,20 +196,27 @@ func (de *dirEntry) Symlink() (Symlink, error) {
 	return 0, errors.New("TODO: Symlink not implemented")
 }
 
-// NewDirectoryEntry takes a Superset and returns a DirectoryEntry if
+func (de *dirEntry) FIFO() (FIFO, error) {
+	return 0, errors.New("TODO: FIFO not implemented")
+}
+
+func (de *dirEntry) Socket() (Socket, error) {
+	return 0, errors.New("TODO: Socket not implemented")
+}
+
+// newDirectoryEntry takes a superset and returns a DirectoryEntry if
 // the Supserset is valid and represents an entry in a directory.  It
-// must by of type "file", "directory", or "symlink".
-// TODO(mpl): symlink
-// TODO: "fifo", "socket", "char", "block", probably.  later.
-func NewDirectoryEntry(fetcher blobref.SeekFetcher, ss *Superset) (DirectoryEntry, error) {
+// must by of type "file", "directory", "symlink" or "socket".
+// TODO: "char", block", probably.  later.
+func newDirectoryEntry(fetcher blob.Fetcher, ss *superset) (DirectoryEntry, error) {
 	if ss == nil {
 		return nil, errors.New("ss was nil")
 	}
-	if ss.BlobRef == nil {
-		return nil, errors.New("ss.BlobRef was nil")
+	if !ss.BlobRef.Valid() {
+		return nil, errors.New("ss.BlobRef was invalid")
 	}
 	switch ss.Type {
-	case "file", "directory", "symlink":
+	case "file", "directory", "symlink", "fifo", "socket":
 		// Okay
 	default:
 		return nil, fmt.Errorf("invalid DirectoryEntry camliType of %q", ss.Type)
@@ -195,44 +226,48 @@ func NewDirectoryEntry(fetcher blobref.SeekFetcher, ss *Superset) (DirectoryEntr
 }
 
 // NewDirectoryEntryFromBlobRef takes a BlobRef and returns a
-// DirectoryEntry if the BlobRef contains a type "file", "directory"
-// or "symlink".
-// TODO: "fifo", "socket", "char", "block", probably.  later.
-func NewDirectoryEntryFromBlobRef(fetcher blobref.SeekFetcher, blobRef *blobref.BlobRef) (DirectoryEntry, error) {
-	ss := new(Superset)
+//  DirectoryEntry if the BlobRef contains a type "file", "directory",
+//  "symlink", "fifo" or "socket".
+// TODO: ""char", "block", probably.  later.
+func NewDirectoryEntryFromBlobRef(fetcher blob.Fetcher, blobRef blob.Ref) (DirectoryEntry, error) {
+	ss := new(superset)
 	err := ss.setFromBlobRef(fetcher, blobRef)
 	if err != nil {
-		return nil, fmt.Errorf("schema/filereader: can't fill Superset: %v\n", err)
+		return nil, fmt.Errorf("schema/filereader: can't fill superset: %v\n", err)
 	}
-	return NewDirectoryEntry(fetcher, ss)
+	return newDirectoryEntry(fetcher, ss)
 }
 
-// Superset represents the superset of common Camlistore JSON schema
+// superset represents the superset of common Camlistore JSON schema
 // keys as a convenient json.Unmarshal target.
-type Superset struct {
-	BlobRef *blobref.BlobRef // Not in JSON, but included for
-	// those who want to set it.
+// TODO(bradfitz): unexport this type. Getting too gross. Move to schema.Blob
+type superset struct {
+	// BlobRef isn't for a particular metadata blob field, but included
+	// for convenience.
+	BlobRef blob.Ref
 
 	Version int    `json:"camliVersion"`
 	Type    string `json:"camliType"`
 
-	Signer string `json:"camliSigner"`
-	Sig    string `json:"camliSig"`
+	Signer blob.Ref `json:"camliSigner"`
+	Sig    string   `json:"camliSig"`
 
-	ClaimType string `json:"claimType"`
-	ClaimDate string `json:"claimDate"`
+	ClaimType string         `json:"claimType"`
+	ClaimDate types.Time3339 `json:"claimDate"`
 
-	Permanode string `json:"permaNode"`
-	Attribute string `json:"attribute"`
-	Value     string `json:"value"`
+	Permanode blob.Ref `json:"permaNode"`
+	Attribute string   `json:"attribute"`
+	Value     string   `json:"value"`
 
-	// TODO: ditch both the FooBytes variants below. a string doesn't have to be UTF-8.
-
+	// FileName and FileNameBytes represent one of the two
+	// representations of file names in schema blobs.  They should
+	// not be accessed directly.  Use the FileNameString accessor
+	// instead, which also sanitizes malicious values.
 	FileName      string        `json:"fileName"`
-	FileNameBytes []interface{} `json:"fileNameBytes"` // TODO: needs custom UnmarshalJSON?
+	FileNameBytes []interface{} `json:"fileNameBytes"`
 
 	SymlinkTarget      string        `json:"symlinkTarget"`
-	SymlinkTargetBytes []interface{} `json:"symlinkTargetBytes"` // TODO: needs custom UnmarshalJSON?
+	SymlinkTargetBytes []interface{} `json:"symlinkTargetBytes"`
 
 	UnixPermission string `json:"unixPermission"`
 	UnixOwnerId    int    `json:"unixOwnerId"`
@@ -243,27 +278,110 @@ type Superset struct {
 	UnixCtime      string `json:"unixCtime"`
 	UnixAtime      string `json:"unixAtime"`
 
+	// Parts are references to the data chunks of a regular file (or a "bytes" schema blob).
+	// See doc/schema/bytes.txt and doc/schema/files/file.txt.
 	Parts []*BytesPart `json:"parts"`
 
-	Entries string   `json:"entries"` // for directories, a blobref to a static-set
-	Members []string `json:"members"` // for static sets (for directory static-sets:
-	// blobrefs to child dirs/files)
+	Entries blob.Ref   `json:"entries"` // for directories, a blobref to a static-set
+	Members []blob.Ref `json:"members"` // for static sets (for directory static-sets: blobrefs to child dirs/files)
+
+	// Search allows a "share" blob to share an entire search. Contrast with "target".
+	Search SearchQuery `json:"search"`
+	// Target is a "share" blob's target (the thing being shared)
+	// Or it is the object being deleted in a DeleteClaim claim.
+	Target blob.Ref `json:"target"`
+	// Transitive is a property of a "share" blob.
+	Transitive bool `json:"transitive"`
+	// AuthType is a "share" blob's authentication type that is required.
+	// Currently (2013-01-02) just "haveref" (if you know the share's blobref,
+	// you get access: the secret URL model)
+	AuthType string         `json:"authType"`
+	Expires  types.Time3339 `json:"expires"` // or zero for no expiration
 }
 
+func parseSuperset(r io.Reader) (*superset, error) {
+	var ss superset
+	if err := json.NewDecoder(io.LimitReader(r, MaxSchemaBlobSize)).Decode(&ss); err != nil {
+		return nil, err
+	}
+	return &ss, nil
+}
+
+// BlobReader returns a new Blob from the provided Reader r,
+// which should be the body of the provided blobref.
+// Note: the hash checksum is not verified.
+func BlobFromReader(ref blob.Ref, r io.Reader) (*Blob, error) {
+	if !ref.Valid() {
+		return nil, errors.New("schema.BlobFromReader: invalid blobref")
+	}
+	var buf bytes.Buffer
+	tee := io.TeeReader(r, &buf)
+	ss, err := parseSuperset(tee)
+	if err != nil {
+		return nil, err
+	}
+	var wb [16]byte
+	afterObj := 0
+	for {
+		n, err := tee.Read(wb[:])
+		afterObj += n
+		for i := 0; i < n; i++ {
+			if !isASCIIWhite(wb[i]) {
+				return nil, fmt.Errorf("invalid bytes after JSON schema blob in %v", ref)
+			}
+		}
+		if afterObj > MaxSchemaBlobSize {
+			break
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	json := buf.String()
+	if len(json) > MaxSchemaBlobSize {
+		return nil, fmt.Errorf("schema: metadata blob %v is over expected limit; size=%d", ref, len(json))
+	}
+	return &Blob{ref, json, ss}, nil
+}
+
+func isASCIIWhite(b byte) bool {
+	switch b {
+	case ' ', '\t', '\r', '\n':
+		return true
+	}
+	return false
+}
+
+// BytesPart is the type representing one of the "parts" in a "file"
+// or "bytes" JSON schema.
+//
+// See doc/schema/bytes.txt and doc/schema/files/file.txt.
 type BytesPart struct {
-	// Required.
+	// Size is the number of bytes that this part contributes to the overall segment.
 	Size uint64 `json:"size"`
 
-	// At most one of:
-	BlobRef  *blobref.BlobRef `json:"blobRef,omitempty"`
-	BytesRef *blobref.BlobRef `json:"bytesRef,omitempty"`
+	// At most one of BlobRef or BytesRef must be non-zero
+	// (Valid), but it's illegal for both.
+	// If neither are set, this BytesPart represents Size zero bytes.
+	// BlobRef refers to raw bytes. BytesRef references a "bytes" schema blob.
+	BlobRef  blob.Ref `json:"blobRef,omitempty"`
+	BytesRef blob.Ref `json:"bytesRef,omitempty"`
 
-	// Optional (default value is zero if unset anyway):
+	// Offset optionally specifies the offset into BlobRef to skip
+	// when reading Size bytes.
 	Offset uint64 `json:"offset,omitempty"`
 }
 
+// stringFromMixedArray joins a slice of either strings or float64
+// values (as retrieved from JSON decoding) into a string.  These are
+// used for non-UTF8 filenames in "fileNameBytes" fields.  The strings
+// are UTF-8 segments and the float64s (actually uint8 values) are
+// byte values.
 func stringFromMixedArray(parts []interface{}) string {
-	buf := new(bytes.Buffer)
+	var buf bytes.Buffer
 	for _, part := range parts {
 		if s, ok := part.(string); ok {
 			buf.WriteString(s)
@@ -277,36 +395,92 @@ func stringFromMixedArray(parts []interface{}) string {
 	return buf.String()
 }
 
-func (ss *Superset) SumPartsSize() (size uint64) {
+// mixedArrayFromString is the inverse of stringFromMixedArray. It
+// splits a string to a series of either UTF-8 strings and non-UTF-8
+// bytes.
+func mixedArrayFromString(s string) (parts []interface{}) {
+	for len(s) > 0 {
+		if n := utf8StrLen(s); n > 0 {
+			parts = append(parts, s[:n])
+			s = s[n:]
+		} else {
+			parts = append(parts, s[0])
+			s = s[1:]
+		}
+	}
+	return parts
+}
+
+// utf8StrLen returns how many prefix bytes of s are valid UTF-8.
+func utf8StrLen(s string) int {
+	for i, r := range s {
+		for r == utf8.RuneError {
+			// The RuneError value can be an error
+			// sentinel value (if it's size 1) or the same
+			// value encoded properly. Decode it to see if
+			// it's the 1 byte sentinel value.
+			_, size := utf8.DecodeRuneInString(s[i:])
+			if size == 1 {
+				return i
+			}
+		}
+	}
+	return len(s)
+}
+
+func (ss *superset) SumPartsSize() (size uint64) {
 	for _, part := range ss.Parts {
 		size += uint64(part.Size)
 	}
 	return size
 }
 
-func (ss *Superset) SymlinkTargetString() string {
+func (ss *superset) SymlinkTargetString() string {
 	if ss.SymlinkTarget != "" {
 		return ss.SymlinkTarget
 	}
 	return stringFromMixedArray(ss.SymlinkTargetBytes)
 }
 
-func (ss *Superset) FileNameString() string {
-	if ss.FileName != "" {
-		return ss.FileName
+// FileNameString returns the schema blob's base filename.
+//
+// If the fileName field of the blob accidentally or maliciously
+// contains a slash, this function returns an empty string instead.
+func (ss *superset) FileNameString() string {
+	v := ss.FileName
+	if v == "" {
+		v = stringFromMixedArray(ss.FileNameBytes)
 	}
-	return stringFromMixedArray(ss.FileNameBytes)
+	if v != "" {
+		if strings.Index(v, "/") != -1 {
+			// Bogus schema blob; ignore.
+			return ""
+		}
+		if strings.Index(v, "\\") != -1 {
+			// Bogus schema blob; ignore.
+			return ""
+		}
+	}
+	return v
 }
 
-func (ss *Superset) HasFilename(name string) bool {
+func (ss *superset) HasFilename(name string) bool {
 	return ss.FileNameString() == name
 }
 
-func (ss *Superset) FileMode() os.FileMode {
+func (b *Blob) FileMode() os.FileMode {
+	// TODO: move this to a different type, off *Blob
+	return b.ss.FileMode()
+}
+
+func (ss *superset) FileMode() os.FileMode {
 	var mode os.FileMode
-	m64, err := strconv.ParseUint(ss.UnixPermission, 8, 64)
-	if err == nil {
-		mode = mode | os.FileMode(m64)
+	hasPerm := ss.UnixPermission != ""
+	if hasPerm {
+		m64, err := strconv.ParseUint(ss.UnixPermission, 8, 64)
+		if err == nil {
+			mode = mode | os.FileMode(m64)
+		}
 	}
 
 	// TODO: add other types (block, char, etc)
@@ -317,6 +491,18 @@ func (ss *Superset) FileMode() os.FileMode {
 		// No extra bit.
 	case "symlink":
 		mode = mode | os.ModeSymlink
+	case "fifo":
+		mode = mode | os.ModeNamedPipe
+	case "socket":
+		mode = mode | os.ModeSocket
+	}
+	if !hasPerm {
+		switch ss.Type {
+		case "directory":
+			mode |= 0755
+		default:
+			mode |= 0644
+		}
 	}
 	return mode
 }
@@ -324,7 +510,14 @@ func (ss *Superset) FileMode() os.FileMode {
 // MapUid returns the most appropriate mapping from this file's owner
 // to the local machine's owner, trying first a match by name,
 // followed by just mapping the number through directly.
-func (ss *Superset) MapUid() int {
+func (b *Blob) MapUid() int { return b.ss.MapUid() }
+
+// MapGid returns the most appropriate mapping from this file's group
+// to the local machine's group, trying first a match by name,
+// followed by just mapping the number through directly.
+func (b *Blob) MapGid() int { return b.ss.MapGid() }
+
+func (ss *superset) MapUid() int {
 	if ss.UnixOwner != "" {
 		uid, ok := getUidFromName(ss.UnixOwner)
 		if ok {
@@ -334,7 +527,7 @@ func (ss *Superset) MapUid() int {
 	return ss.UnixOwnerId // TODO: will be 0 if unset, which isn't ideal
 }
 
-func (ss *Superset) MapGid() int {
+func (ss *superset) MapGid() int {
 	if ss.UnixGroup != "" {
 		gid, ok := getGidFromName(ss.UnixGroup)
 		if ok {
@@ -344,7 +537,7 @@ func (ss *Superset) MapGid() int {
 	return ss.UnixGroupId // TODO: will be 0 if unset, which isn't ideal
 }
 
-func (ss *Superset) ModTime() time.Time {
+func (ss *superset) ModTime() time.Time {
 	if ss.UnixMtime == "" {
 		return time.Time{}
 	}
@@ -363,64 +556,74 @@ func (d *defaultStatHasher) Lstat(fileName string) (os.FileInfo, error) {
 	return os.Lstat(fileName)
 }
 
-func (d *defaultStatHasher) Hash(fileName string) (*blobref.BlobRef, error) {
+func (d *defaultStatHasher) Hash(fileName string) (blob.Ref, error) {
 	s1 := sha1.New()
 	file, err := os.Open(fileName)
 	if err != nil {
-		return nil, err
+		return blob.Ref{}, err
 	}
 	defer file.Close()
 	_, err = io.Copy(s1, file)
 	if err != nil {
-		return nil, err
+		return blob.Ref{}, err
 	}
-	return blobref.FromHash("sha1", s1), nil
+	return blob.RefFromHash(s1), nil
 }
 
 type StaticSet struct {
 	l    sync.Mutex
-	refs []*blobref.BlobRef
+	refs []blob.Ref
 }
 
-func (ss *StaticSet) Add(ref *blobref.BlobRef) {
+func (ss *StaticSet) Add(ref blob.Ref) {
 	ss.l.Lock()
 	defer ss.l.Unlock()
 	ss.refs = append(ss.refs, ref)
 }
 
-func newMap(version int, ctype string) Map {
-	return Map{
+func base(version int, ctype string) *Builder {
+	return &Builder{map[string]interface{}{
 		"camliVersion": version,
-		"camliType": ctype,
-	}
+		"camliType":    ctype,
+	}}
 }
 
 // NewUnsignedPermanode returns a new random permanode, not yet signed.
-func NewUnsignedPermanode() Map {
-	m := newMap(1, "permanode")
+func NewUnsignedPermanode() *Builder {
+	bb := base(1, "permanode")
 	chars := make([]byte, 20)
 	_, err := io.ReadFull(rand.Reader, chars)
 	if err != nil {
 		panic("error reading random bytes: " + err.Error())
 	}
-	m["random"] = base64.StdEncoding.EncodeToString(chars)
-	return m
+	bb.m["random"] = base64.StdEncoding.EncodeToString(chars)
+	return bb
 }
 
 // NewPlannedPermanode returns a permanode with a fixed key.  Like
-// NewUnsignedPermanode, this Map is also not yet signed.  Callers of
+// NewUnsignedPermanode, this builder is also not yet signed.  Callers of
 // NewPlannedPermanode must sign the map with a fixed claimDate and
 // GPG date to create consistent JSON encodings of the Map (its
 // blobref), between runs.
-func NewPlannedPermanode(key string) Map {
-	m := newMap(1, "permanode")
-	m["key"] = key
-	return m
+func NewPlannedPermanode(key string) *Builder {
+	bb := base(1, "permanode")
+	bb.m["key"] = key
+	return bb
+}
+
+// NewHashPlannedPermanode returns a planned permanode with the sum
+// of the hash, prefixed with "sha1-", as the key.
+func NewHashPlannedPermanode(h hash.Hash) *Builder {
+	if reflect.TypeOf(h) != sha1Type {
+		panic("Hash not supported. Only sha1 for now.")
+	}
+	return NewPlannedPermanode(fmt.Sprintf("sha1-%x", h.Sum(nil)))
 }
 
 // Map returns a Camli map of camliType "static-set"
-func (ss *StaticSet) Map() Map {
-	m := newMap(1, "static-set")
+// TODO: delete this method
+func (ss *StaticSet) Blob() *Blob {
+	bb := base(1, "static-set")
 	ss.l.Lock()
 	defer ss.l.Unlock()
 
@@ -430,8 +633,8 @@ func (ss *StaticSet) Map() Map {
 			members = append(members, ref.String())
 		}
 	}
-	m["members"] = members
-	return m
+	bb.m["members"] = members
+	return bb.Blob()
 }
 
 // JSON returns the map m encoded as JSON in its
@@ -440,7 +643,7 @@ func (ss *StaticSet) Map() Map {
 //
 //   {"camliVersion":
 //
-func (m Map) JSON() (string, error) {
+func mapJSON(m map[string]interface{}) (string, error) {
 	version, hasVersion := m["camliVersion"]
 	if !hasVersion {
 		return "", ErrNoCamliVersion
@@ -457,60 +660,68 @@ func (m Map) JSON() (string, error) {
 	return buf.String(), nil
 }
 
-// NewFileMap returns a new Map of type "file" for the provided fileName.
+// NewFileMap returns a new builder of a type "file" schema for the provided fileName.
 // The chunk parts of the file are not populated.
-func NewFileMap(fileName string) Map {
-	m := newCommonFilenameMap(fileName)
-	m["camliType"] = "file"
-	return m
+func NewFileMap(fileName string) *Builder {
+	return newCommonFilenameMap(fileName).SetType("file")
 }
 
-func newCommonFilenameMap(fileName string) Map {
-	m := newMap(1, "" /* no type yet */)
+// NewDirMap returns a new builder of a type "directory" schema for the provided fileName.
+func NewDirMap(fileName string) *Builder {
+	return newCommonFilenameMap(fileName).SetType("directory")
+}
+
+func newCommonFilenameMap(fileName string) *Builder {
+	bb := base(1, "" /* no type yet */)
 	if fileName != "" {
-		baseName := filepath.Base(fileName)
-		if utf8.ValidString(baseName) {
-			m["fileName"] = baseName
-		} else {
-			m["fileNameBytes"] = []uint8(baseName)
-		}
+		bb.SetFileName(fileName)
 	}
-	return m
+	return bb
 }
 
-var populateSchemaStat []func(schemaMap Map, fi os.FileInfo)
+var populateSchemaStat []func(schemaMap map[string]interface{}, fi os.FileInfo)
 
-func NewCommonFileMap(fileName string, fi os.FileInfo) Map {
-	m := newCommonFilenameMap(fileName)
+func NewCommonFileMap(fileName string, fi os.FileInfo) *Builder {
+	bb := newCommonFilenameMap(fileName)
 	// Common elements (from file-common.txt)
 	if fi.Mode()&os.ModeSymlink == 0 {
-		m["unixPermission"] = fmt.Sprintf("0%o", fi.Mode().Perm())
+		bb.m["unixPermission"] = fmt.Sprintf("0%o", fi.Mode().Perm())
 	}
 
 	// OS-specific population; defined in schema_posix.go, etc. (not on App Engine)
 	for _, f := range populateSchemaStat {
-		f(m, fi)
+		f(bb.m, fi)
 	}
 
 	if mtime := fi.ModTime(); !mtime.IsZero() {
-		m["unixMtime"] = RFC3339FromTime(mtime)
+		bb.m["unixMtime"] = RFC3339FromTime(mtime)
 	}
-	return m
+	return bb
 }
 
-func PopulateParts(m Map, size int64, parts []BytesPart) error {
+// PopulateParts sets the "parts" field of the blob with the provided
+// parts.  The sum of the sizes of parts must match the provided size
+// or an error is returned.  Also, each BytesPart may only contain either
+// a BytesPart or a BlobRef, but not both.
+func (bb *Builder) PopulateParts(size int64, parts []BytesPart) error {
+	return populateParts(bb.m, size, parts)
+}
+
+func populateParts(m map[string]interface{}, size int64, parts []BytesPart) error {
 	sumSize := int64(0)
-	mparts := make([]Map, len(parts))
+	mparts := make([]map[string]interface{}, len(parts))
 	for idx, part := range parts {
-		mpart := make(Map)
+		mpart := make(map[string]interface{})
 		mparts[idx] = mpart
 		switch {
-		case part.BlobRef != nil && part.BytesRef != nil:
-			return errors.New("schema: part contains both blobRef and bytesRef")
-		case part.BlobRef != nil:
+		case part.BlobRef.Valid() && part.BytesRef.Valid():
+			return errors.New("schema: part contains both BlobRef and BytesRef")
+		case part.BlobRef.Valid():
 			mpart["blobRef"] = part.BlobRef.String()
-		case part.BytesRef != nil:
+		case part.BytesRef.Valid():
 			mpart["bytesRef"] = part.BytesRef.String()
+		default:
+			return errors.New("schema: part must contain either a BlobRef or BytesRef")
 		}
 		mpart["size"] = part.Size
 		sumSize += int64(part.Size)
@@ -525,77 +736,310 @@ func PopulateParts(m Map, size int64, parts []BytesPart) error {
 	return nil
 }
 
-// SetSymlinkTarget sets m to be of type "symlink" and sets the symlink's target.
-func (m Map) SetSymlinkTarget(target string) {
-	m["camliType"] = "symlink"
-	if utf8.ValidString(target) {
-		m["symlinkTarget"] = target
-	} else {
-		m["symlinkTargetBytes"] = []uint8(target)
+func newBytes() *Builder {
+	return base(1, "bytes")
+}
+
+// ClaimType is one of the valid "claimType" fields in a "claim" schema blob. See doc/schema/claims/.
+type ClaimType string
+
+const (
+	SetAttributeClaim ClaimType = "set-attribute"
+	AddAttributeClaim ClaimType = "add-attribute"
+	DelAttributeClaim ClaimType = "del-attribute"
+	ShareClaim        ClaimType = "share"
+	// DeleteClaim deletes a permanode or another claim.
+	// A delete claim can itself be deleted, and so on.
+	DeleteClaim ClaimType = "delete"
+)
+
+// claimParam is used to populate a claim map when building a new claim
+type claimParam struct {
+	claimType ClaimType
+
+	// Params specific to *Attribute claims:
+	permanode blob.Ref // modified permanode
+	attribute string   // required
+	value     string   // optional if Type == DelAttributeClaim
+
+	// Params specific to ShareClaim claims:
+	authType     string
+	transitive   bool
+	shareExpires time.Time // Zero means no expiration
+
+	// Params specific to ShareClaim and DeleteClaim claims.
+	target blob.Ref
+}
+
+func newClaim(claims ...*claimParam) *Builder {
+	bb := base(1, "claim")
+	bb.SetClaimDate(clockNow())
+	if len(claims) == 1 {
+		cp := claims[0]
+		populateClaimMap(bb.m, cp)
+		return bb
+	}
+	var claimList []interface{}
+	for _, cp := range claims {
+		m := map[string]interface{}{}
+		populateClaimMap(m, cp)
+		claimList = append(claimList, m)
+	}
+	bb.m["claimType"] = "multi"
+	bb.m["claims"] = claimList
+	return bb
+}
+
+func populateClaimMap(m map[string]interface{}, cp *claimParam) {
+	m["claimType"] = string(cp.claimType)
+	switch cp.claimType {
+	case ShareClaim:
+		m["authType"] = cp.authType
+		m["transitive"] = cp.transitive
+	case DeleteClaim:
+		m["target"] = cp.target.String()
+	default:
+		m["permaNode"] = cp.permanode.String()
+		m["attribute"] = cp.attribute
+		if !(cp.claimType == DelAttributeClaim && cp.value == "") {
+			m["value"] = cp.value
+		}
 	}
 }
 
-func newBytes() Map {
-	return newMap(1, "bytes")
+// NewShareRef creates a *Builder for a "share" claim.
+func NewShareRef(authType string, transitive bool) *Builder {
+	return newClaim(&claimParam{
+		claimType:  ShareClaim,
+		authType:   authType,
+		transitive: transitive,
+	})
 }
 
-func PopulateDirectoryMap(m Map, staticSetRef *blobref.BlobRef) {
-	m["camliType"] = "directory"
-	m["entries"] = staticSetRef.String()
+func NewSetAttributeClaim(permaNode blob.Ref, attr, value string) *Builder {
+	return newClaim(&claimParam{
+		permanode: permaNode,
+		claimType: SetAttributeClaim,
+		attribute: attr,
+		value:     value,
+	})
 }
 
-func NewShareRef(authType string, target *blobref.BlobRef, transitive bool) Map {
-	m := newMap(1, "share")
-	m["authType"] = authType
-	m["target"] = target.String()
-	m["transitive"] = transitive
-	return m
+func NewAddAttributeClaim(permaNode blob.Ref, attr, value string) *Builder {
+	return newClaim(&claimParam{
+		permanode: permaNode,
+		claimType: AddAttributeClaim,
+		attribute: attr,
+		value:     value,
+	})
 }
 
-const (
-	SetAttribute = "set-attribute"
-	AddAttribute = "add-attribute"
-	DelAttribute = "del-attribute"
-)
-
-func newClaim(permaNode *blobref.BlobRef, t time.Time, claimType string) Map {
-	m := newMap(1, "claim")
-	m["permaNode"] = permaNode.String()
-	m["claimType"] = claimType
-	m.SetClaimDate(t)
-	return m
+// NewDelAttributeClaim creates a new claim to remove value from the
+// values set for the attribute attr of permaNode. If value is empty then
+// all the values for attribute are cleared.
+func NewDelAttributeClaim(permaNode blob.Ref, attr, value string) *Builder {
+	return newClaim(&claimParam{
+		permanode: permaNode,
+		claimType: DelAttributeClaim,
+		attribute: attr,
+		value:     value,
+	})
 }
 
-func newAttrChangeClaim(permaNode *blobref.BlobRef, t time.Time, claimType, attr, value string) Map {
-	m := newClaim(permaNode, t, claimType)
-	m["attribute"] = attr
-	m["value"] = value
-	return m
+// NewDeleteClaim creates a new claim to delete a target claim or permanode.
+func NewDeleteClaim(target blob.Ref) *Builder {
+	return newClaim(&claimParam{
+		target:    target,
+		claimType: DeleteClaim,
+	})
 }
 
-func NewSetAttributeClaim(permaNode *blobref.BlobRef, attr, value string) Map {
-	return newAttrChangeClaim(permaNode, time.Now(), SetAttribute, attr, value)
-}
-
-func NewAddAttributeClaim(permaNode *blobref.BlobRef, attr, value string) Map {
-	return newAttrChangeClaim(permaNode, time.Now(), AddAttribute, attr, value)
-}
-
-func NewDelAttributeClaim(permaNode *blobref.BlobRef, attr string) Map {
-	m := newAttrChangeClaim(permaNode, time.Now(), DelAttribute, attr, "")
-	delete(m, "value")
-	return m
-}
-
-// Types of ShareRefs
+// ShareHaveRef is the auth type specifying that if you "have the
+// reference" (know the blobref to the haveref share blob), then you
+// have access to the referenced object from that share blob.
+// This is the "send a link to a friend" access model.
 const ShareHaveRef = "haveref"
 
-// RFC3339FromTime returns an RFC3339-formatted time in UTC.
+// UnknownLocation is a magic timezone value used when the actual location
+// of a time is unknown. For instance, EXIF files commonly have a time without
+// a corresponding location or timezone offset.
+var UnknownLocation = time.FixedZone("Unknown", -60) // 1 minute west
+
+// IsZoneKnown reports whether t is in a known timezone.
+// Camlistore uses the magic timezone offset of 1 minute west of UTC
+// to mean that the timezone wasn't known.
+func IsZoneKnown(t time.Time) bool {
+	if t.Location() == UnknownLocation {
+		return false
+	}
+	if _, off := t.Zone(); off == -60 {
+		return false
+	}
+	return true
+}
+
+// RFC3339FromTime returns an RFC3339-formatted time.
+//
+// If the timezone is known, the time will be converted to UTC and
+// returned with a "Z" suffix. For unknown zones, the timezone will be
+// "-00:01" (1 minute west of UTC).
+//
 // Fractional seconds are only included if the time has fractional
 // seconds.
 func RFC3339FromTime(t time.Time) string {
-	if t.UnixNano()%1e9 == 0 {
-		return t.UTC().Format(time.RFC3339)
+	if IsZoneKnown(t) {
+		t = t.UTC()
 	}
-	return t.UTC().Format(time.RFC3339Nano)
+	if t.UnixNano()%1e9 == 0 {
+		return t.Format(time.RFC3339)
+	}
+	return t.Format(time.RFC3339Nano)
+}
+
+var bytesCamliVersion = []byte("camliVersion")
+
+// LikelySchemaBlob returns quickly whether buf likely contains (or is
+// the prefix of) a schema blob.
+func LikelySchemaBlob(buf []byte) bool {
+	if len(buf) == 0 || buf[0] != '{' {
+		return false
+	}
+	return bytes.Contains(buf, bytesCamliVersion)
+}
+
+// findSize checks if v is an *os.File or if it has
+// a Size() int64 method, to find its size.
+// It returns 0, false otherwise.
+func findSize(v interface{}) (size int64, ok bool) {
+	if fi, ok := v.(*os.File); ok {
+		v, _ = fi.Stat()
+	}
+	if sz, ok := v.(interface {
+		Size() int64
+	}); ok {
+		return sz.Size(), true
+	}
+	// For bytes.Reader, strings.Reader, etc:
+	if li, ok := v.(interface {
+		Len() int
+	}); ok {
+		ln := int64(li.Len()) // unread portion, typically
+		// If it's also a seeker, remove add any seek offset:
+		if sk, ok := v.(io.Seeker); ok {
+			if cur, err := sk.Seek(0, 1); err == nil {
+				ln += cur
+			}
+		}
+		return ln, true
+	}
+	return 0, false
+}
+
+// FileTime returns the best guess of the file's creation time (or modtime).
+// If the file doesn't have its own metadata indication the creation time (such as in EXIF),
+// FileTime uses the modification time from the file system.
+// It there was a valid EXIF but an error while trying to get a date from it,
+// it logs the error and tries the other methods.
+func FileTime(f io.ReaderAt) (time.Time, error) {
+	var ct time.Time
+	defaultTime := func() (time.Time, error) {
+		if osf, ok := f.(*os.File); ok {
+			fi, err := osf.Stat()
+			if err != nil {
+				return ct, fmt.Errorf("Failed to find a modtime: lstat: %v", err)
+			}
+			return fi.ModTime(), nil
+		}
+		return ct, errors.New("All methods failed to find a creation time or modtime.")
+	}
+
+	size, ok := findSize(f)
+	if !ok {
+		size = 256 << 10 // enough to get the EXIF
+	}
+	r := io.NewSectionReader(f, 0, size)
+	ex, err := exif.Decode(r)
+	if err != nil {
+		return defaultTime()
+	}
+	ct, err = ex.DateTime()
+	if err != nil {
+		return defaultTime()
+	}
+	// If the EXIF file only had local timezone, but it did have
+	// GPS, then lookup the timezone and correct the time.
+	if ct.Location() == time.Local {
+		if lat, long, err := ex.LatLong(); err == nil {
+			if loc := lookupLocation(latlong.LookupZoneName(lat, long)); loc != nil {
+				if t, err := exifDateTimeInLocation(ex, loc); err == nil {
+					return t, nil
+				}
+			}
+		} else if !exif.IsTagNotPresentError(err) {
+			log.Printf("Invalid EXIF GPS data: %v", err)
+		}
+	}
+	return ct, nil
+}
+
+// This is basically a copy of the exif.Exif.DateTime() method, except:
+//   * it takes a *time.Location to assume
+//   * the caller already assumes there's no timezone offset or GPS time
+//     in the EXIF, so any of that code can be ignored.
+func exifDateTimeInLocation(x *exif.Exif, loc *time.Location) (time.Time, error) {
+	tag, err := x.Get(exif.DateTimeOriginal)
+	if err != nil {
+		tag, err = x.Get(exif.DateTime)
+		if err != nil {
+			return time.Time{}, err
+		}
+	}
+	if tag.Format() != tiff.StringVal {
+		return time.Time{}, errors.New("DateTime[Original] not in string format")
+	}
+	const exifTimeLayout = "2006:01:02 15:04:05"
+	dateStr := strings.TrimRight(string(tag.Val), "\x00")
+	return time.ParseInLocation(exifTimeLayout, dateStr, loc)
+}
+
+var zoneCache struct {
+	sync.RWMutex
+	m map[string]*time.Location
+}
+
+func lookupLocation(zone string) *time.Location {
+	if zone == "" {
+		return nil
+	}
+	zoneCache.RLock()
+	l, ok := zoneCache.m[zone]
+	zoneCache.RUnlock()
+	if ok {
+		return l
+	}
+	// could use singleflight here, but doesn't really
+	// matter if two callers both do this.
+	loc, err := time.LoadLocation(zone)
+
+	zoneCache.Lock()
+	if zoneCache.m == nil {
+		zoneCache.m = make(map[string]*time.Location)
+	}
+	zoneCache.m[zone] = loc // even if nil
+	zoneCache.Unlock()
+
+	if err != nil {
+		log.Printf("failed to lookup timezone %q: %v", zone, err)
+		return nil
+	}
+	return loc
+}
+
+var boringTitlePattern = regexp.MustCompile(`^(?:IMG_|DSC|PANO_|ESR_).*$`)
+
+// IsInterestingTitle returns whether title would be interesting information as
+// a title for a permanode. For example, filenames automatically created by
+// cameras, such as IMG_XXXX.JPG, do not add any interesting value.
+func IsInterestingTitle(title string) bool {
+	return !boringTitlePattern.MatchString(title)
 }

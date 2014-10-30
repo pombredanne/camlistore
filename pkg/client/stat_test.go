@@ -17,16 +17,21 @@ limitations under the License.
 package client
 
 import (
+	"io/ioutil"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
 )
 
+// Note: a few of the fields are here are before the protocol change
+// (camlistore.org/issue/123) but preserved to make sure we don't
+// choke on them.
 var response = `{
    "stat": [
-      {"blobRef": "foo-abc",
+      {"blobRef": "foo-abcd",
        "size": 123},
-      {"blobRef": "foo-def",
+      {"blobRef": "foo-cdef",
        "size": 999}
    ],
    "maxUploadSize": 1048576,
@@ -37,28 +42,27 @@ var response = `{
 `
 
 func TestParseStatResponse(t *testing.T) {
-	res, err := parseStatResponse(strings.NewReader(response))
+	res, err := parseStatResponse(&http.Response{
+		Body: ioutil.NopCloser(strings.NewReader(response)),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	hm := res.HaveMap
 	res.HaveMap = nil
 	want := &statResponse{
-		HaveMap:                    nil,
-		maxUploadSize:              1048576,
-		uploadUrl:                  "http://upload-server.example.com/some/server-chosen/url",
-		uploadUrlExpirationSeconds: 7200,
-		canLongPoll:                true,
+		HaveMap:     nil,
+		canLongPoll: true,
 	}
 	if !reflect.DeepEqual(want, res) {
 		t.Errorf(" Got: %#v\nWant: %#v", res, want)
 	}
 
-	if sb, ok := hm["foo-abc"]; !ok || sb.Size != 123 {
+	if sb, ok := hm["foo-abcd"]; !ok || sb.Size != 123 {
 		t.Errorf("Got unexpected map: %#v", hm)
 	}
 
-	if sb, ok := hm["foo-def"]; !ok || sb.Size != 999 {
+	if sb, ok := hm["foo-cdef"]; !ok || sb.Size != 999 {
 		t.Errorf("Got unexpected map: %#v", hm)
 	}
 }

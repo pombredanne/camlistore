@@ -17,18 +17,19 @@ limitations under the License.
 package blobserver
 
 import (
-	"camlistore.org/pkg/blobref"
-	. "camlistore.org/pkg/test/asserts"
 	"testing"
 	"time"
+
+	"camlistore.org/pkg/blob"
+	. "camlistore.org/pkg/test/asserts"
 )
 
 func TestHubRegistration(t *testing.T) {
-	hub := &SimpleBlobHub{}
-	ch := make(chan *blobref.BlobRef)
-	ch2 := make(chan *blobref.BlobRef)
-	b1 := blobref.Parse("sha1-0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33")
-	b2 := blobref.Parse("sha1-62cdb7020ff920e5aa642c3d4066950dd1f01f4d")
+	hub := &memHub{}
+	ch := make(chan blob.Ref)
+	ch2 := make(chan blob.Ref)
+	b1 := blob.MustParse("sha1-0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33")
+	b2 := blob.MustParse("sha1-62cdb7020ff920e5aa642c3d4066950dd1f01f4d")
 
 	Expect(t, hub.listeners == nil, "hub.listeners is nil before RegisterListener")
 
@@ -48,43 +49,43 @@ func TestHubRegistration(t *testing.T) {
 
 	hub.RegisterBlobListener(b1, ch)
 	Expect(t, hub.blobListeners != nil, "hub.blobListeners is not nil before RegisterBlobListener")
-	Expect(t, hub.blobListeners[b1.String()] != nil, "b1 in hub.blobListeners map")
-	ExpectInt(t, 1, len(hub.blobListeners[b1.String()]), "hub.blobListeners[b1] size")
+	Expect(t, hub.blobListeners[b1] != nil, "b1 in hub.blobListeners map")
+	ExpectInt(t, 1, len(hub.blobListeners[b1]), "hub.blobListeners[b1] size")
 	ExpectInt(t, 1, len(hub.blobListeners), "hub.blobListeners size")
 
 	hub.RegisterBlobListener(b2, ch)
-	ExpectInt(t, 1, len(hub.blobListeners[b2.String()]), "hub.blobListeners[b1] size")
+	ExpectInt(t, 1, len(hub.blobListeners[b2]), "hub.blobListeners[b1] size")
 	ExpectInt(t, 2, len(hub.blobListeners), "hub.blobListeners size")
 
 	hub.UnregisterBlobListener(b2, ch)
-	Expect(t, hub.blobListeners[b2.String()] == nil, "b2 not in hub.blobListeners")
+	Expect(t, hub.blobListeners[b2] == nil, "b2 not in hub.blobListeners")
 	ExpectInt(t, 1, len(hub.blobListeners), "hub.blobListeners size")
 
 	hub.UnregisterBlobListener(b1, ch)
-	Expect(t, hub.blobListeners[b1.String()] == nil, "b1 not in hub.blobListeners")
+	Expect(t, hub.blobListeners[b1] == nil, "b1 not in hub.blobListeners")
 	ExpectInt(t, 0, len(hub.blobListeners), "hub.blobListeners size")
 }
 
 func TestHubFiring(t *testing.T) {
-	hub := &SimpleBlobHub{}
-	ch := make(chan *blobref.BlobRef)
-	bch := make(chan *blobref.BlobRef)
-	blob := blobref.Parse("sha1-0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33")
-	blobsame := blobref.Parse("sha1-0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33")
+	hub := &memHub{}
+	ch := make(chan blob.Ref)
+	bch := make(chan blob.Ref)
+	blob1 := blob.MustParse("sha1-0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33")
+	blobsame := blob.MustParse("sha1-0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33")
 
-	hub.NotifyBlobReceived(blob) // no-op
+	hub.NotifyBlobReceived(blob.SizedRef{blob1, 123}) // no-op
 
 	hub.RegisterListener(ch)
-	hub.RegisterBlobListener(blob, bch)
+	hub.RegisterBlobListener(blob1, bch)
 
-	hub.NotifyBlobReceived(blobsame)
+	hub.NotifyBlobReceived(blob.SizedRef{blobsame, 456})
 
-	tmr1 := time.NewTimer(1e9)
+	tmr1 := time.NewTimer(1 * time.Second)
 	select {
 	case <-tmr1.C:
 		t.Fatal("timer expired on receiving from ch")
 	case got := <-ch:
-		if !blob.Equal(got) {
+		if got != blob1 {
 			t.Fatalf("got wrong blob")
 		}
 	}
@@ -93,7 +94,7 @@ func TestHubFiring(t *testing.T) {
 	case <-tmr1.C:
 		t.Fatal("timer expired on receiving from bch")
 	case got := <-bch:
-		if !blob.Equal(got) {
+		if got != blob1 {
 			t.Fatalf("got wrong blob")
 		}
 	}

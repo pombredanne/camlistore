@@ -14,22 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package pinentry interfaces with the pinentry(1) command to securely
+// prompt the user for a password using whichever user interface the
+// user is currently using.
 package pinentry
 
 import (
 	"bufio"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"strings"
 )
 
-var _ = log.Printf
-
+// ErrCancel is returned when the user explicitly aborts the password
+// request.
 var ErrCancel = errors.New("pinentry: Cancel")
 
+// Request describes what the user should see during the request for
+// their password.
 type Request struct {
 	Desc, Prompt, OK, Cancel, Error string
 }

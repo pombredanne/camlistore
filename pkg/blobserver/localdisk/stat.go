@@ -18,82 +18,45 @@ package localdisk
 
 import (
 	"os"
-	"sync"
-	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/syncutil"
+	"camlistore.org/pkg/types"
 )
 
 const maxParallelStats = 20
 
-func (ds *DiskStorage) StatBlobs(dest chan<- blobref.SizedBlobRef, blobs []*blobref.BlobRef, wait time.Duration) error {
+var statGate = syncutil.NewGate(maxParallelStats)
+
+func (ds *DiskStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
 	if len(blobs) == 0 {
 		return nil
 	}
 
-	var missingLock sync.Mutex
-	var missing []*blobref.BlobRef
-
-	statSend := func(ref *blobref.BlobRef, appendMissing bool) error {
-		fi, err := os.Stat(ds.blobPath(ds.partition, ref))
+	statSend := func(ref blob.Ref) error {
+		fi, err := os.Stat(ds.blobPath(ref))
 		switch {
-		case err == nil && !fi.IsDir():
-			dest <- blobref.SizedBlobRef{BlobRef: ref, Size: fi.Size()}
-		case err != nil && appendMissing && errorIsNoEnt(err):
-			missingLock.Lock()
-			missing = append(missing, ref)
-			missingLock.Unlock()
-		case err != nil && !errorIsNoEnt(err):
+		case err == nil && fi.Mode().IsRegular():
+			dest <- blob.SizedRef{Ref: ref, Size: types.U32(fi.Size())}
+			return nil
+		case err != nil && !os.IsNotExist(err):
 			return err
 		}
 		return nil
 	}
 
-	// Stat all the files in parallel if there are multiple
 	if len(blobs) == 1 {
-		if err := statSend(blobs[0], wait > 0); err != nil {
-			return err
-		}
-	} else {
-		errCh := make(chan error)
-		rateLimiter := make(chan bool, maxParallelStats)
-		for _, ref := range blobs {
-			go func(ref *blobref.BlobRef) {
-				rateLimiter <- true
-				errCh <- statSend(ref, wait > 0)
-				<-rateLimiter
-			}(ref)
-		}
-		for _, _ = range blobs {
-			if err := <-errCh; err != nil {
-				return err
-			}
-		}
+		return statSend(blobs[0])
 	}
 
-	if needed := len(missing); needed > 0 {
-		if wait > 1 * time.Minute {
-			// TODO: use a flag, defaulting to a minute?
-			wait = 1 * time.Minute
-		}
-		hub := ds.GetBlobHub()
-		ch := make(chan *blobref.BlobRef, 1)
-		for _, missblob := range missing {
-			hub.RegisterBlobListener(missblob, ch)
-			defer hub.UnregisterBlobListener(missblob, ch)
-		}
-		timer := time.NewTimer(wait)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-			// Done waiting.
-			return nil
-		case blobref := <-ch:
-			statSend(blobref, false)
-			if needed--; needed == 0 {
-				return nil
-			}
-		}
+	var wg syncutil.Group
+	for _, ref := range blobs {
+		ref := ref
+		statGate.Start()
+		wg.Go(func() error {
+			defer statGate.Done()
+			return statSend(ref)
+		})
 	}
-	return nil
+	return wg.Err()
 }

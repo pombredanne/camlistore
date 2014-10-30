@@ -17,35 +17,42 @@ limitations under the License.
 package index
 
 import (
-	"encoding/json"
+	"bytes"
 	"errors"
 
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/magic"
 	"camlistore.org/pkg/schema"
 )
 
-// maxSniffSize is how much of a blob to buffer in memory for both
-// MIME sniffing (in which case 1MB is way overkill) and also for
-// holding a schema blob in memory for analysis in later steps (where
-// 1MB is about the max size a claim can be, with about 1023K (of
-// slack space)
-const maxSniffSize = 1024 * 1024
-
 type BlobSniffer struct {
-	header   []byte
-	written  int64
-	camli    *schema.Superset
-	mimeType *string
+	br blob.Ref
+
+	header    []byte
+	written   int64
+	meta      *schema.Blob // or nil
+	mimeType  string
+	camliType string
 }
 
-func (sn *BlobSniffer) Superset() (*schema.Superset, bool) {
-	return sn.camli, sn.camli != nil
+func NewBlobSniffer(ref blob.Ref) *BlobSniffer {
+	if !ref.Valid() {
+		panic("invalid ref")
+	}
+	return &BlobSniffer{br: ref}
+}
+
+func (sn *BlobSniffer) SchemaBlob() (meta *schema.Blob, ok bool) {
+	return sn.meta, sn.meta != nil
 }
 
 func (sn *BlobSniffer) Write(d []byte) (int, error) {
+	if !sn.br.Valid() {
+		panic("write on sniffer with invalid blobref")
+	}
 	sn.written += int64(len(d))
-	if len(sn.header) < maxSniffSize {
-		n := maxSniffSize - len(sn.header)
+	if len(sn.header) < schema.MaxSchemaBlobSize {
+		n := schema.MaxSchemaBlobSize - len(sn.header)
 		if len(d) < n {
 			n = len(d)
 		}
@@ -59,48 +66,41 @@ func (sn *BlobSniffer) Size() int64 {
 }
 
 func (sn *BlobSniffer) IsTruncated() bool {
-	return sn.written > maxSniffSize
+	return sn.written > schema.MaxSchemaBlobSize
 }
 
 func (sn *BlobSniffer) Body() ([]byte, error) {
 	if sn.IsTruncated() {
-		return nil, errors.New("was truncated")
+		return nil, errors.New("index.Body: was truncated")
 	}
 	return sn.header, nil
 }
 
-// returns content type or empty string if unknown
-func (sn *BlobSniffer) MimeType() string {
-	if sn.mimeType != nil {
-		return *sn.mimeType
-	}
-	return ""
-}
+// MIMEType returns the sniffed blob's content-type or the empty string if unknown.
+// If the blob is a Camlistore schema metadata blob, the MIME type will be of
+// the form "application/json; camliType=foo".
+func (sn *BlobSniffer) MIMEType() string { return sn.mimeType }
+
+func (sn *BlobSniffer) CamliType() string { return sn.camliType }
 
 func (sn *BlobSniffer) Parse() {
-	// Try to parse it as JSON
-	// TODO: move this into the magic library?  Is the magic library Camli-specific
-	// or to be upstreamed elsewhere?
-	if sn.bufferIsCamliJson() {
-		str := "application/json; camliType=" + sn.camli.Type
-		sn.mimeType = &str
-	}
-
-	if mime := magic.MimeType(sn.header); mime != "" {
-		sn.mimeType = &mime
+	if sn.bufferIsCamliJSON() {
+		sn.camliType = sn.meta.Type()
+		sn.mimeType = "application/json; camliType=" + sn.camliType
+	} else {
+		sn.mimeType = magic.MIMEType(sn.header)
 	}
 }
 
-func (sn *BlobSniffer) bufferIsCamliJson() bool {
+func (sn *BlobSniffer) bufferIsCamliJSON() bool {
 	buf := sn.header
-	if len(buf) < 2 || buf[0] != '{' {
+	if !schema.LikelySchemaBlob(buf) {
 		return false
 	}
-	camli := new(schema.Superset)
-	err := json.Unmarshal(buf, camli)
+	blob, err := schema.BlobFromReader(sn.br, bytes.NewReader(buf))
 	if err != nil {
 		return false
 	}
-	sn.camli = camli
+	sn.meta = blob
 	return true
 }

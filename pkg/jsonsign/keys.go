@@ -18,15 +18,16 @@ package jsonsign
 
 import (
 	"bytes"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
+	"camlistore.org/pkg/osutil"
+	"camlistore.org/pkg/wkfs"
 	"camlistore.org/third_party/code.google.com/p/go.crypto/openpgp"
 	"camlistore.org/third_party/code.google.com/p/go.crypto/openpgp/armor"
 	"camlistore.org/third_party/code.google.com/p/go.crypto/openpgp/packet"
@@ -34,8 +35,21 @@ import (
 
 const publicKeyMaxSize = 256 * 1024
 
+// ParseArmoredPublicKey tries to parse an armored public key from r,
+// taking care to bound the amount it reads.
+// The returned shortKeyId is 8 capital hex digits.
+// The returned armoredKey is a copy of the contents read.
+func ParseArmoredPublicKey(r io.Reader) (shortKeyId, armoredKey string, err error) {
+	var buf bytes.Buffer
+	pk, err := openArmoredPublicKeyFile(ioutil.NopCloser(io.TeeReader(r, &buf)))
+	if err != nil {
+		return
+	}
+	return publicKeyId(pk), buf.String(), nil
+}
+
 func VerifyPublicKeyFile(file, keyid string) (bool, error) {
-	f, err := os.Open(file)
+	f, err := wkfs.Open(file)
 	if err != nil {
 		return false, err
 	}
@@ -44,12 +58,18 @@ func VerifyPublicKeyFile(file, keyid string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	keyId := fmt.Sprintf("%X", key.Fingerprint[len(key.Fingerprint)-4:])
+	keyId := publicKeyId(key)
 	if keyId != strings.ToUpper(keyid) {
-		return false, errors.New(fmt.Sprintf("Key in file %q has id %q; expected %q",
-			file, keyId, keyid))
+		return false, fmt.Errorf("Key in file %q has id %q; expected %q",
+			file, keyId, keyid)
 	}
 	return true, nil
+}
+
+// publicKeyId returns the short (8 character) capital hex GPG key ID
+// of the provided public key.
+func publicKeyId(pubKey *packet.PublicKey) string {
+	return fmt.Sprintf("%X", pubKey.Fingerprint[len(pubKey.Fingerprint)-4:])
 }
 
 func openArmoredPublicKeyFile(reader io.ReadCloser) (*packet.PublicKey, error) {
@@ -65,27 +85,27 @@ func openArmoredPublicKeyFile(reader io.ReadCloser) (*packet.PublicKey, error) {
 	}
 	p, err := packet.Read(block.Body)
 	if err != nil {
-		return nil, errors.New(fmt.Sprintf("Invalid public key blob: %v", err))
+		return nil, fmt.Errorf("Invalid public key blob: %v", err)
 	}
 
 	pk, ok := p.(*packet.PublicKey)
 	if !ok {
-		return nil, errors.New(fmt.Sprintf("Invalid public key blob; not a public key packet"))
+		return nil, fmt.Errorf("Invalid public key blob; not a public key packet")
 	}
 	return pk, nil
 }
 
-func DefaultSecRingPath() string {
-	return filepath.Join(os.Getenv("HOME"), ".gnupg", "secring.gpg")
-}
-
-// keyFile defaults to $HOME/.gnupg/secring.gpg
+// EntityFromSecring returns the openpgp Entity from keyFile that matches keyId.
+// If empty, keyFile defaults to osutil.SecretRingFile().
 func EntityFromSecring(keyId, keyFile string) (*openpgp.Entity, error) {
+	if keyId == "" {
+		return nil, errors.New("empty keyId passed to EntityFromSecring")
+	}
 	keyId = strings.ToUpper(keyId)
 	if keyFile == "" {
-		keyFile = DefaultSecRingPath()
+		keyFile = osutil.SecretRingFile()
 	}
-	secring, err := os.Open(keyFile)
+	secring, err := wkfs.Open(keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("jsonsign: failed to open keyring: %v", err)
 	}
@@ -141,14 +161,60 @@ func NewEntity() (*openpgp.Entity, error) {
 	name := "" // intentionally empty
 	comment := "camlistore"
 	email := "" // intentionally empty
-	return openpgp.NewEntity(rand.Reader, time.Now(), name, comment, email)
+	return openpgp.NewEntity(name, comment, email, nil)
 }
 
 func WriteKeyRing(w io.Writer, el openpgp.EntityList) error {
 	for _, ent := range el {
-		if err := ent.SerializePrivate(w); err != nil {
+		if err := ent.SerializePrivate(w, nil); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// KeyIdFromRing returns the public keyId contained in the secret
+// ring file secRing. It expects only one keyId in this secret ring
+// and returns an error otherwise.
+func KeyIdFromRing(secRing string) (keyId string, err error) {
+	f, err := wkfs.Open(secRing)
+	if err != nil {
+		return "", fmt.Errorf("Could not open secret ring file %v: %v", secRing, err)
+	}
+	defer f.Close()
+	el, err := openpgp.ReadKeyRing(f)
+	if err != nil {
+		return "", fmt.Errorf("Could not read secret ring file %s: %v", secRing, err)
+	}
+	if len(el) != 1 {
+		return "", fmt.Errorf("Secret ring file %v contained %d identities; expected 1", secRing, len(el))
+	}
+	ent := el[0]
+	return ent.PrimaryKey.KeyIdShortString(), nil
+}
+
+// GenerateNewSecRing creates a new secret ring file secRing, with
+// a new GPG identity. It returns the public keyId of that identity.
+// It returns an error if the file already exists.
+func GenerateNewSecRing(secRing string) (keyId string, err error) {
+	ent, err := NewEntity()
+	if err != nil {
+		return "", fmt.Errorf("generating new identity: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(secRing), 0700); err != nil {
+		return "", err
+	}
+	f, err := wkfs.OpenFile(secRing, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return "", err
+	}
+	err = WriteKeyRing(f, openpgp.EntityList([]*openpgp.Entity{ent}))
+	if err != nil {
+		f.Close()
+		return "", fmt.Errorf("Could not write new key ring to %s: %v", secRing, err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("Could not close %v: %v", secRing, err)
+	}
+	return ent.PrimaryKey.KeyIdShortString(), nil
 }

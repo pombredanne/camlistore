@@ -25,27 +25,41 @@ import (
 	"io"
 	"os"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/client"
+	"camlistore.org/pkg/cmdmain"
+	"camlistore.org/pkg/constants"
 )
 
 type blobCmd struct{}
 
 func init() {
-	RegisterCommand("blob", func(flags *flag.FlagSet) CommandRunner {
+	cmdmain.RegisterCommand("blob", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		return new(blobCmd)
 	})
 }
 
-func (c *blobCmd) Usage() {
-	fmt.Fprintf(os.Stderr, "Usage: camput [globalopts] blob <files>\n	camput [globalopts] blob -\n")
+func (c *blobCmd) Describe() string {
+	return "Upload raw blob(s)."
 }
 
-func (c *blobCmd) RunCommand(up *Uploader, args []string) error {
+func (c *blobCmd) Usage() {
+	fmt.Fprintf(cmdmain.Stderr, "Usage: camput [globalopts] blob <files>\n	camput [globalopts] blob -\n")
+}
+
+func (c *blobCmd) Examples() []string {
+	return []string{
+		"<files>     (raw, without any metadata)",
+		"-           (read from stdin)",
+	}
+}
+
+func (c *blobCmd) RunCommand(args []string) error {
 	if len(args) == 0 {
 		return errors.New("No files given.")
 	}
 
+	up := getUploader()
 	for _, arg := range args {
 		var (
 			handle *client.UploadHandle
@@ -68,20 +82,25 @@ func (c *blobCmd) RunCommand(up *Uploader, args []string) error {
 
 func stdinBlobHandle() (uh *client.UploadHandle, err error) {
 	var buf bytes.Buffer
-	size, err := io.Copy(&buf, os.Stdin)
+	size, err := io.CopyN(&buf, cmdmain.Stdin, constants.MaxBlobSize+1)
+	if err == io.EOF {
+		err = nil
+	}
 	if err != nil {
 		return
 	}
-	// TODO(bradfitz,mpl): limit this buffer size?
+	if size > constants.MaxBlobSize {
+		err = fmt.Errorf("blob size cannot be bigger than %d", constants.MaxBlobSize)
+	}
 	file := buf.Bytes()
-	s1 := sha1.New()
-	size, err = io.Copy(s1, &buf)
+	h := blob.NewHash()
+	size, err = io.Copy(h, bytes.NewReader(file))
 	if err != nil {
 		return
 	}
 	return &client.UploadHandle{
-		BlobRef:  blobref.FromHash("sha1", s1),
-		Size:     size,
+		BlobRef:  blob.RefFromHash(h),
+		Size:     uint32(size),
 		Contents: io.LimitReader(bytes.NewReader(file), size),
 	}, nil
 }
@@ -105,17 +124,34 @@ func fileBlobHandle(up *Uploader, path string) (uh *client.UploadHandle, err err
 	return &client.UploadHandle{
 		BlobRef:  ref,
 		Size:     size,
-		Contents: io.LimitReader(file, size),
+		Contents: io.LimitReader(file, int64(size)),
 	}, nil
 }
 
-func blobDetails(contents io.ReadSeeker) (bref *blobref.BlobRef, size int64, err error) {
+func blobDetails(contents io.ReadSeeker) (bref blob.Ref, size uint32, err error) {
 	s1 := sha1.New()
-	contents.Seek(0, 0)
-	size, err = io.Copy(s1, contents)
-	if err == nil {
-		bref = blobref.FromHash("sha1", s1)
+	if _, err = contents.Seek(0, 0); err != nil {
+		return
 	}
-	contents.Seek(0, 0)
+	defer func() {
+		if _, seekErr := contents.Seek(0, 0); seekErr != nil {
+			if err == nil {
+				err = seekErr
+			} else {
+				err = fmt.Errorf("%s, cannot seek back: %v", err, seekErr)
+			}
+		}
+	}()
+	sz, err := io.CopyN(s1, contents, constants.MaxBlobSize+1)
+	if err == nil || err == io.EOF {
+		bref, err = blob.RefFromHash(s1), nil
+	} else {
+		err = fmt.Errorf("error reading contents: %v", err)
+		return
+	}
+	if sz > constants.MaxBlobSize {
+		err = fmt.Errorf("blob size cannot be bigger than %d", constants.MaxBlobSize)
+	}
+	size = uint32(sz)
 	return
 }

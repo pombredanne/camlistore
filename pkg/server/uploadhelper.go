@@ -20,60 +20,59 @@ import (
 	"io"
 	"net/http"
 
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/schema"
 )
 
+// uploadHelperResponse is the response from serveUploadHelper.
+type uploadHelperResponse struct {
+	Got []*uploadHelperGotItem `json:"got"`
+}
+
+type uploadHelperGotItem struct {
+	FileName string   `json:"filename"`
+	FormName string   `json:"formname"`
+	FileRef  blob.Ref `json:"fileref"`
+}
+
 func (ui *UIHandler) serveUploadHelper(rw http.ResponseWriter, req *http.Request) {
-	rollSum := req.URL.Query().Get("rollsum") == "1"
-
-	ret := make(map[string]interface{})
-	defer httputil.ReturnJSON(rw, ret)
-
-	if ui.Storage == nil {
-		ret["error"] = "No BlobRoot configured"
-		ret["errorType"] = "server"
+	if ui.root.Storage == nil {
+		httputil.ServeJSONError(rw, httputil.ServerError("No BlobRoot configured"))
 		return
 	}
 
 	mr, err := req.MultipartReader()
 	if err != nil {
-		ret["error"] = "reading body: " + err.Error()
-		ret["errorType"] = "server"
+		httputil.ServeJSONError(rw, httputil.ServerError("reading body: "+err.Error()))
 		return
 	}
 
-	got := make([]map[string]interface{}, 0)
+	var got []*uploadHelperGotItem
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			ret["error"] = "reading body: " + err.Error()
-			ret["errorType"] = "server"
+			httputil.ServeJSONError(rw, httputil.ServerError("reading body: "+err.Error()))
 			break
 		}
 		fileName := part.FileName()
 		if fileName == "" {
 			continue
 		}
-		writeFn := schema.WriteFileFromReader
-		if rollSum {
-			writeFn = schema.WriteFileFromReaderRolling
-		}
-		br, err := writeFn(ui.Storage, fileName, part)
-
-		if err == nil {
-			got = append(got, map[string]interface{}{
-				"filename": part.FileName(),
-				"formname": part.FormName(),
-				"fileref":  br.String(),
-			})
-		} else {
-			ret["error"] = "writing to blobserver: " + err.Error()
+		br, err := schema.WriteFileFromReader(ui.root.Storage, fileName, part)
+		if err != nil {
+			httputil.ServeJSONError(rw, httputil.ServerError("writing to blobserver: "+err.Error()))
 			return
 		}
+		got = append(got, &uploadHelperGotItem{
+			FileName: part.FileName(),
+			FormName: part.FormName(),
+			FileRef:  br,
+		})
 	}
-	ret["got"] = got
+
+	httputil.ReturnJSON(rw, &uploadHelperResponse{Got: got})
 }

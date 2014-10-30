@@ -1,3 +1,5 @@
+// +build linux darwin
+
 /*
 Copyright 2011 Google Inc.
 
@@ -21,74 +23,222 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
 
-	"camlistore.org/pkg/blobref"
-	"camlistore.org/pkg/blobserver/localdisk" // used for the blob cache
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/cacher"
 	"camlistore.org/pkg/client"
 	"camlistore.org/pkg/fs"
-
-	"camlistore.org/third_party/code.google.com/p/rsc/fuse"
+	"camlistore.org/pkg/legal/legalprint"
+	"camlistore.org/pkg/osutil"
+	"camlistore.org/pkg/search"
+	"camlistore.org/third_party/bazil.org/fuse"
+	fusefs "camlistore.org/third_party/bazil.org/fuse/fs"
 )
 
+var (
+	debug = flag.Bool("debug", false, "print debugging messages.")
+	xterm = flag.Bool("xterm", false, "Run an xterm in the mounted directory. Shut down when xterm ends.")
+	term  = flag.Bool("term", false, "Open a terminal window. Doesn't shut down when exited. Mostly for demos.")
+	open  = flag.Bool("open", false, "Open a GUI window")
+)
+
+func usage() {
+	fmt.Fprint(os.Stderr, "usage: cammount [opts] [<mountpoint> [<root-blobref>|<share URL>|<root-name>]]\n")
+	flag.PrintDefaults()
+	os.Exit(2)
+}
+
 func main() {
+	var conn *fuse.Conn
+
 	// Scans the arg list and sets up flags
-	debug := flag.Bool("debug", false, "print debugging messages.")
 	client.AddFlags()
+	flag.Usage = usage
 	flag.Parse()
+
+	if legalprint.MaybePrint(os.Stderr) {
+		return
+	}
+
+	narg := flag.NArg()
+	if narg > 2 {
+		usage()
+	}
+
+	var mountPoint string
+	var err error
+	if narg > 0 {
+		mountPoint = flag.Arg(0)
+	} else {
+		mountPoint, err = ioutil.TempDir("", "cammount")
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("No mount point given. Using: %s", mountPoint)
+		defer os.Remove(mountPoint)
+	}
 
 	errorf := func(msg string, args ...interface{}) {
 		fmt.Fprintf(os.Stderr, msg, args...)
-		os.Exit(2)
+		fmt.Fprint(os.Stderr, "\n")
+		usage()
 	}
 
-	if n := flag.NArg(); n < 1 || n > 2 {
-		errorf("usage: cammount <mountpoint> [<root-blobref>]\n")
-	}
+	var (
+		cl    *client.Client
+		root  blob.Ref // nil if only one arg
+		camfs *fs.CamliFileSystem
+	)
+	if narg == 2 {
+		rootArg := flag.Arg(1)
+		// not trying very hard since NewFromShareRoot will do it better with a regex
+		if strings.HasPrefix(rootArg, "http://") ||
+			strings.HasPrefix(rootArg, "https://") {
+			if client.ExplicitServer() != "" {
+				errorf("Can't use an explicit blobserver with a share URL; the blobserver is implicit from the share URL.")
+			}
+			var err error
+			cl, root, err = client.NewFromShareRoot(rootArg)
+			if err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			cl = client.NewOrFail() // automatic from flags
+			cl.SetHTTPClient(&http.Client{Transport: cl.TransportForConfig(nil)})
 
-	mountPoint := flag.Arg(0)
+			var ok bool
+			root, ok = blob.Parse(rootArg)
 
-	client := client.NewOrFail() // automatic from flags
+			if !ok {
+				// not a blobref, check for root name instead
+				req := &search.WithAttrRequest{N: 1, Attr: "camliRoot", Value: rootArg}
+				wres, err := cl.GetPermanodesWithAttr(req)
 
-	cacheDir, err := ioutil.TempDir("", "camlicache")
-	if err != nil {
-		errorf("Error creating temp cache directory: %v\n", err)
-	}
-	defer os.RemoveAll(cacheDir)
-	diskcache, err := localdisk.New(cacheDir)
-	if err != nil {
-		errorf("Error setting up local disk cache: %v", err)
-	}
-	fetcher := cacher.NewCachingFetcher(diskcache, client)
+				if err != nil {
+					log.Fatal("could not query search")
+				}
 
-	var camfs *fs.CamliFileSystem
-	if flag.NArg() == 2 {
-		root := blobref.Parse(flag.Arg(1))
-		if root == nil {
-			errorf("Error parsing root blobref: %q\n", root)
-		}
-		var err error
-		camfs, err = fs.NewRootedCamliFileSystem(fetcher, root)
-		if err != nil {
-			errorf("Error creating root with %v: %v", root, err)
+				if wres.WithAttr != nil {
+					root = wres.WithAttr[0].Permanode
+				} else {
+					log.Fatalf("root specified is not a blobref or name of a root: %q\n", rootArg)
+				}
+			}
 		}
 	} else {
-		camfs = fs.NewCamliFileSystem(fetcher)
-		log.Printf("starting with fs %#v", camfs)
+		cl = client.NewOrFail() // automatic from flags
+		cl.SetHTTPClient(&http.Client{Transport: cl.TransportForConfig(nil)})
+	}
+
+	diskCacheFetcher, err := cacher.NewDiskCache(cl)
+	if err != nil {
+		log.Fatalf("Error setting up local disk cache: %v", err)
+	}
+	defer diskCacheFetcher.Clean()
+	if root.Valid() {
+		var err error
+		camfs, err = fs.NewRootedCamliFileSystem(cl, diskCacheFetcher, root)
+		if err != nil {
+			log.Fatalf("Error creating root with %v: %v", root, err)
+		}
+	} else {
+		camfs = fs.NewDefaultCamliFileSystem(cl, diskCacheFetcher)
 	}
 
 	if *debug {
+		fuse.Debug = func(msg interface{}) { log.Print(msg) }
 		// TODO: set fs's logger
 	}
 
-	conn, err := fuse.Mount(mountPoint)
+	// This doesn't appear to work on OS X:
+	sigc := make(chan os.Signal, 1)
+
+	conn, err = fuse.Mount(mountPoint)
 	if err != nil {
+		if err.Error() == "cannot find load_fusefs" && runtime.GOOS == "darwin" {
+			log.Fatal("FUSE not available; install from http://osxfuse.github.io/")
+		}
 		log.Fatalf("Mount: %v", err)
 	}
-	err = conn.Serve(camfs)
-	if err != nil {
-		log.Fatalf("Serve: %v", err)
+
+	xtermDone := make(chan bool, 1)
+	if *xterm {
+		cmd := exec.Command("xterm")
+		cmd.Dir = mountPoint
+		if err := cmd.Start(); err != nil {
+			log.Printf("Error starting xterm: %v", err)
+		} else {
+			go func() {
+				cmd.Wait()
+				xtermDone <- true
+			}()
+			defer cmd.Process.Kill()
+		}
 	}
-	log.Printf("fuse process ending.")
+	if *open {
+		if runtime.GOOS == "darwin" {
+			go exec.Command("open", mountPoint).Run()
+		}
+	}
+	if *term {
+		if runtime.GOOS == "darwin" {
+			if osutil.DirExists("/Applications/iTerm.app/") {
+				go exec.Command("open", "-a", "iTerm", mountPoint).Run()
+			} else {
+				log.Printf("TODO: iTerm not installed. Figure out how to open with Terminal.app instead.")
+			}
+		}
+	}
+
+	signal.Notify(sigc, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT)
+
+	doneServe := make(chan error, 1)
+	go func() {
+		doneServe <- fusefs.Serve(conn, camfs)
+	}()
+
+	quitKey := make(chan bool, 1)
+	go awaitQuitKey(quitKey)
+
+	select {
+	case err := <-doneServe:
+		log.Printf("conn.Serve returned %v", err)
+	case sig := <-sigc:
+		log.Printf("Signal %s received, shutting down.", sig)
+	case <-quitKey:
+		log.Printf("Quit key pressed. Shutting down.")
+	case <-xtermDone:
+		log.Printf("xterm done")
+	}
+
+	time.AfterFunc(2*time.Second, func() {
+		os.Exit(1)
+	})
+	log.Printf("Unmounting...")
+	err = fs.Unmount(mountPoint)
+	log.Printf("Unmount = %v", err)
+
+	log.Printf("cammount FUSE process ending.")
+}
+
+func awaitQuitKey(done chan<- bool) {
+	var buf [1]byte
+	for {
+		_, err := os.Stdin.Read(buf[:])
+		if err != nil {
+			return
+		}
+		if buf[0] == 'q' {
+			done <- true
+			return
+		}
+	}
 }

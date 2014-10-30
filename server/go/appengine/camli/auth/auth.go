@@ -1,1 +1,0 @@
-../../../../../lib/go/camli/auth/auth.go

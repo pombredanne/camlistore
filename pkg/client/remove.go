@@ -17,16 +17,14 @@ limitations under the License.
 package client
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
-	"camlistore.org/pkg/blobref"
-	"net/url"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/httputil"
 )
 
 type removeResponse struct {
@@ -35,13 +33,20 @@ type removeResponse struct {
 
 // Remove the list of blobs. An error is returned if the server failed to
 // remove a blob. Removing a non-existent blob isn't an error.
-func (c *Client) RemoveBlobs(blobs []*blobref.BlobRef) error {
-	url_ := fmt.Sprintf("%s/camli/remove", c.server)
+func (c *Client) RemoveBlobs(blobs []blob.Ref) error {
+	if c.sto != nil {
+		return c.sto.RemoveBlobs(blobs)
+	}
+	pfx, err := c.prefix()
+	if err != nil {
+		return err
+	}
+	url_ := fmt.Sprintf("%s/camli/remove", pfx)
 	params := make(url.Values)           // "blobN" -> BlobRefStr
 	needsDelete := make(map[string]bool) // BlobRefStr -> true
 	for n, b := range blobs {
-		if b == nil {
-			return errors.New("Cannot delete nil blobref")
+		if !b.Valid() {
+			return errors.New("Cannot delete invalid blobref")
 		}
 		key := fmt.Sprintf("blob%v", n+1)
 		params.Add(key, b.String())
@@ -55,39 +60,31 @@ func (c *Client) RemoveBlobs(blobs []*blobref.BlobRef) error {
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	c.authMode.AddAuthHeader(req)
 	resp, err := c.httpClient.Do(req)
-
 	if err != nil {
-		return errors.New(fmt.Sprintf("Got status code %d from blobserver for remove %s", resp.StatusCode, params.Encode()))
+		resp.Body.Close()
+		return fmt.Errorf("Got status code %d from blobserver for remove %s", resp.StatusCode, params.Encode())
 	}
-
-	// The only valid HTTP responses are 200.
 	if resp.StatusCode != 200 {
-		return errors.New(fmt.Sprintf("Invalid http response %d in remove response", resp.StatusCode))
+		resp.Body.Close()
+		return fmt.Errorf("Invalid http response %d in remove response", resp.StatusCode)
 	}
-
-	// TODO: LimitReader here for paranoia
-	buf := new(bytes.Buffer)
-	io.Copy(buf, resp.Body)
-	resp.Body.Close()
 	var remResp removeResponse
-	if jerr := json.Unmarshal(buf.Bytes(), &remResp); jerr != nil {
-		return errors.New(fmt.Sprintf("Failed to parse remove response %q: %s", buf.String(), jerr))
+	if err := httputil.DecodeJSON(resp, &remResp); err != nil {
+		return fmt.Errorf("Failed to parse remove response: %v", err)
 	}
 	for _, value := range remResp.Removed {
 		delete(needsDelete, value)
 	}
-
 	if len(needsDelete) > 0 {
-		return errors.New(fmt.Sprintf("Failed to remove blobs %s", strings.Join(stringKeys(needsDelete), ", ")))
+		return fmt.Errorf("Failed to remove blobs %s", strings.Join(stringKeys(needsDelete), ", "))
 	}
-
 	return nil
 }
 
 // Remove the single blob. An error is returned if the server failed to remove
 // the blob. Removing a non-existent blob isn't an error.
-func (c *Client) RemoveBlob(b *blobref.BlobRef) error {
-	return c.RemoveBlobs([]*blobref.BlobRef{b})
+func (c *Client) RemoveBlob(b blob.Ref) error {
+	return c.RemoveBlobs([]blob.Ref{b})
 }
 
 func stringKeys(m map[string]bool) (s []string) {

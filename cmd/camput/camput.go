@@ -21,146 +21,153 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
 
+	"camlistore.org/pkg/blobserver/dir"
 	"camlistore.org/pkg/client"
-	"camlistore.org/pkg/jsonsign"
+	"camlistore.org/pkg/cmdmain"
+	"camlistore.org/pkg/httputil"
+	"camlistore.org/pkg/syncutil"
 )
 
 const buffered = 16 // arbitrary
 
 var (
-	flagVerbose = flag.Bool("verbose", false, "extra debug logging")
+	flagProxyLocal = false
+	flagHTTP       = flag.Bool("verbose_http", false, "show HTTP request summaries")
+	flagHaveCache  = true
+	flagBlobDir    = flag.String("blobdir", "", "If non-empty, the local directory to put blobs, instead of sending them over the network. If the string \"discard\", no blobs are written or sent over the network anywhere.")
 )
 
-var ErrUsage = UsageError("invalid command usage")
+var (
+	uploaderOnce sync.Once
+	uploader     *Uploader // initialized by getUploader
+)
 
-type UsageError string
+var debugFlagOnce sync.Once
 
-func (ue UsageError) Error() string {
-	return "Usage error: " + string(ue)
+func registerDebugFlags() {
+	flag.BoolVar(&flagProxyLocal, "proxy_local", false, "If true, the HTTP_PROXY environment is also used for localhost requests. This can be helpful during debugging.")
+	flag.BoolVar(&flagHaveCache, "havecache", true, "Use the 'have cache', a cache keeping track of what blobs the remote server should already have from previous uploads.")
 }
 
-type CommandRunner interface {
-	Usage()
-	RunCommand(up *Uploader, args []string) error
-}
-
-type Exampler interface {
-	Examples() []string
-}
-
-var modeCommand = make(map[string]CommandRunner)
-var modeFlags = make(map[string]*flag.FlagSet)
-
-func RegisterCommand(mode string, makeCmd func(Flags *flag.FlagSet) CommandRunner) {
-	if _, dup := modeCommand[mode]; dup {
-		log.Fatalf("duplicate command %q registered", mode)
+func init() {
+	if debug, _ := strconv.ParseBool(os.Getenv("CAMLI_DEBUG")); debug {
+		debugFlagOnce.Do(registerDebugFlags)
 	}
-	flags := flag.NewFlagSet(mode+" options", flag.ContinueOnError)
-	flags.Usage = func() {}
-	modeFlags[mode] = flags
-	modeCommand[mode] = makeCmd(flags)
-}
-
-// wereErrors gets set to true if any error was encountered, which
-// changes the os.Exit value
-var wereErrors = false
-
-type namedMode struct {
-	Name    string
-	Command CommandRunner
-}
-
-func allModes(startModes []string) <-chan namedMode {
-	ch := make(chan namedMode)
-	go func() {
-		defer close(ch)
-		done := map[string]bool{}
-		for _, name := range startModes {
-			done[name] = true
-			cmd := modeCommand[name]
-			if cmd == nil {
-				panic("bogus mode: " + name)
-			}
-			ch <- namedMode{name, cmd}
-		}
-		for name, cmd := range modeCommand {
-			if !done[name] {
-				ch <- namedMode{name, cmd}
+	cmdmain.ExtraFlagRegistration = client.AddFlags
+	cmdmain.PreExit = func() {
+		if up := uploader; up != nil {
+			up.Close()
+			stats := up.Stats()
+			if *cmdmain.FlagVerbose {
+				log.Printf("Client stats: %s", stats.String())
+				if up.transport != nil {
+					log.Printf("  #HTTP reqs: %d", up.transport.Requests())
+				}
 			}
 		}
-	}()
-	return ch
-}
 
-func errf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, format, args...)
-}
-
-func usage(msg string) {
-	if msg != "" {
-		errf("Error: %v\n", msg)
+		// So multiple cmd/camput TestFoo funcs run, each with
+		// an fresh (and not previously closed) Uploader:
+		uploader = nil
+		uploaderOnce = sync.Once{}
 	}
-	errf(`
-Usage: camput [globalopts] <mode> [commandopts] [commandargs]
+}
 
-Examples:
-`)
-	order := []string{"init", "file", "permanode", "blob", "attr"}
-	for mode := range allModes(order) {
-		errf("\n")
-		if ex, ok := mode.Command.(Exampler); ok {
-			for _, example := range ex.Examples() {
-				errf("  camput %s %s\n", mode.Name, example)
-			}
+func getUploader() *Uploader {
+	uploaderOnce.Do(initUploader)
+	return uploader
+}
+
+func initUploader() {
+	up := newUploader()
+	if flagHaveCache && *flagBlobDir == "" {
+		gen, err := up.StorageGeneration()
+		if err != nil {
+			log.Printf("WARNING: not using local server inventory cache; failed to retrieve server's storage generation: %v", err)
 		} else {
-			errf("  camput %s ...\n", mode.Name)
+			up.haveCache = NewKvHaveCache(gen)
+			up.Client.SetHaveCache(up.haveCache)
 		}
 	}
-
-	// TODO(bradfitz): move these to Examples
-	/*
-	  camput share [opts] <blobref to share via haveref>
-
-	  camput blob <files>     (raw, without any metadata)
-	  camput blob -           (read from stdin)
-
-	  camput attr <permanode> <name> <value>         Set attribute
-	  camput attr --add <permanode> <name> <value>   Adds attribute (e.g. "tag")
-	  camput attr --del <permanode> <name> [<value>] Deletes named attribute [value]
-	*/
-
-	errf(`
-For mode-specific help:
-
-  camput <mode> -help
-
-Global options:
-`)
-	flag.PrintDefaults()
-	os.Exit(1)
+	uploader = up
 }
 
 func handleResult(what string, pr *client.PutResult, err error) error {
 	if err != nil {
 		log.Printf("Error putting %s: %s", what, err)
-		wereErrors = true
+		cmdmain.ExitWithFailure = true
 		return err
 	}
-	fmt.Println(pr.BlobRef.String())
+	fmt.Fprintln(cmdmain.Stdout, pr.BlobRef.String())
 	return nil
 }
 
+func getenvEitherCase(k string) string {
+	if v := os.Getenv(strings.ToUpper(k)); v != "" {
+		return v
+	}
+	return os.Getenv(strings.ToLower(k))
+}
+
+// proxyFromEnvironment is similar to http.ProxyFromEnvironment but it skips
+// $NO_PROXY blacklist so it proxies every requests, including localhost
+// requests.
+func proxyFromEnvironment(req *http.Request) (*url.URL, error) {
+	proxy := getenvEitherCase("HTTP_PROXY")
+	if proxy == "" {
+		return nil, nil
+	}
+	proxyURL, err := url.Parse(proxy)
+	if err != nil || proxyURL.Scheme == "" {
+		if u, err := url.Parse("http://" + proxy); err == nil {
+			proxyURL = u
+			err = nil
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy address %q: %v", proxy, err)
+	}
+	return proxyURL, nil
+}
+
 func newUploader() *Uploader {
-	cc := client.NewOrFail()
-	if !*flagVerbose {
+	var cc *client.Client
+	var httpStats *httputil.StatsTransport
+	if d := *flagBlobDir; d != "" {
+		ss, err := dir.New(d)
+		if err != nil && d == "discard" {
+			ss = discardStorage{}
+			err = nil
+		}
+		if err != nil {
+			log.Fatalf("Error using dir %s as storage: %v", d, err)
+		}
+		cc = client.NewStorageClient(ss)
+	} else {
+		cc = client.NewOrFail()
+		proxy := http.ProxyFromEnvironment
+		if flagProxyLocal {
+			proxy = proxyFromEnvironment
+		}
+		tr := cc.TransportForConfig(
+			&client.TransportConfig{
+				Proxy:   proxy,
+				Verbose: *flagHTTP,
+			})
+		httpStats, _ = tr.(*httputil.StatsTransport)
+		cc.SetHTTPClient(&http.Client{Transport: tr})
+	}
+	if *cmdmain.FlagVerbose {
+		cc.SetLogger(log.New(cmdmain.Stderr, "", log.LstdFlags))
+	} else {
 		cc.SetLogger(nil)
 	}
-
-	transport := new(tinkerTransport)
-	transport.transport = &http.Transport{DisableKeepAlives: false}
-	cc.SetHttpClient(&http.Client{Transport: transport})
 
 	pwd, err := os.Getwd()
 	if err != nil {
@@ -169,70 +176,12 @@ func newUploader() *Uploader {
 
 	return &Uploader{
 		Client:    cc,
-		transport: transport,
+		transport: httpStats,
 		pwd:       pwd,
-		entityFetcher: &jsonsign.CachingEntityFetcher{
-			Fetcher: &jsonsign.FileEntityFetcher{File: cc.SecretRingFile()},
-		},
+		fdGate:    syncutil.NewGate(100), // gate things that waste fds, assuming a low system limit
 	}
-}
-
-func hasFlags(flags *flag.FlagSet) bool {
-	any := false
-	flags.VisitAll(func(*flag.Flag) {
-		any = true
-	})
-	return any
 }
 
 func main() {
-	jsonsign.AddFlags()
-	client.AddFlags()
-	flag.Parse()
-
-	if flag.NArg() == 0 {
-		usage("No mode given.")
-	}
-
-	mode := flag.Arg(0)
-	cmd, ok := modeCommand[mode]
-	if !ok {
-		usage(fmt.Sprintf("Unknown mode %q", mode))
-	}
-
-	var up *Uploader
-	if mode != "init" {
-		up = newUploader()
-	}
-
-	cmdFlags := modeFlags[mode]
-	err := cmdFlags.Parse(flag.Args()[1:])
-	if err != nil {
-		err = ErrUsage
-	} else {
-		err = cmd.RunCommand(up, cmdFlags.Args())
-	}
-	if ue, isUsage := err.(UsageError); isUsage {
-		if isUsage {
-			errf("%s\n", ue)
-		}
-		cmd.Usage()
-		errf("\nGlobal options:\n")
-		flag.PrintDefaults()
-
-		if hasFlags(cmdFlags) {
-			errf("\nMode-specific options for mode %q:\n", mode)
-			cmdFlags.PrintDefaults()
-		}
-		os.Exit(1)
-	}
-	if *flagVerbose {
-		stats := up.Stats()
-		log.Printf("Client stats: %s", stats.String())
-		log.Printf("  #HTTP reqs: %d", up.transport.reqs)
-	}
-	if err != nil || wereErrors /* TODO: remove this part */ {
-		log.Printf("Error: %v", err)
-		os.Exit(2)
-	}
+	cmdmain.Main()
 }

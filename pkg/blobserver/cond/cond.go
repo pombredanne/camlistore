@@ -14,30 +14,51 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+/*
+Package cond registers the "cond" conditional blobserver storage type
+to select routing of get/put operations on blobs to other storage
+targets as a function of their content.
+
+Currently only the "isSchema" predicate is defined.
+
+Example usage:
+
+  "/bs-and-maybe-also-index/": {
+	"handler": "storage-cond",
+	"handlerArgs": {
+		"write": {
+			"if": "isSchema",
+			"then": "/bs-and-index/",
+			"else": "/bs/"
+		},
+		"read": "/bs/"
+	}
+  }
+*/
 package cond
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/context"
 	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/schema"
 )
 
 const buffered = 8
 
-type storageFunc func(src io.Reader) (dest blobserver.Storage, overRead []byte, err error)
+// A storageFunc selects a destination for a given blob. It may consume from src but must always return
+// a newSrc that is identical to the original src passed in.
+type storageFunc func(br blob.Ref, src io.Reader) (dest blobserver.Storage, newSrc io.Reader, err error)
 
 type condStorage struct {
-	*blobserver.SimpleBlobHubPartitionMap
-
 	storageForReceive storageFunc
 	read              blobserver.Storage
 	remove            blobserver.Storage
@@ -45,23 +66,23 @@ type condStorage struct {
 	ctx *http.Request // optional per-request context
 }
 
-var _ blobserver.ContextWrapper = (*condStorage)(nil)
-
-func (sto *condStorage) GetBlobHub() blobserver.BlobHub {
-	return sto.SimpleBlobHubPartitionMap.GetBlobHub()
+func (sto *condStorage) StorageGeneration() (initTime time.Time, random string, err error) {
+	if gener, ok := sto.read.(blobserver.Generationer); ok {
+		return gener.StorageGeneration()
+	}
+	err = blobserver.GenerationNotSupportedError(fmt.Sprintf("blobserver.Generationer not implemented on %T", sto.read))
+	return
 }
 
-func (sto *condStorage) WrapContext(req *http.Request) blobserver.Storage {
-	s2 := new(condStorage)
-	*s2 = *sto
-	s2.ctx = req
-	return s2
+func (sto *condStorage) ResetStorageGeneration() error {
+	if gener, ok := sto.read.(blobserver.Generationer); ok {
+		return gener.ResetStorageGeneration()
+	}
+	return blobserver.GenerationNotSupportedError(fmt.Sprintf("blobserver.Generationer not implemented on %T", sto.read))
 }
 
 func newFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (storage blobserver.Storage, err error) {
-	sto := &condStorage{
-		SimpleBlobHubPartitionMap: &blobserver.SimpleBlobHubPartitionMap{},
-	}
+	sto := &condStorage{}
 
 	receive := conf.OptionalStringOrObject("write")
 	read := conf.RequiredString("read")
@@ -98,8 +119,8 @@ func buildStorageForReceive(ld blobserver.Loader, confOrString interface{}) (sto
 		if err != nil {
 			return nil, err
 		}
-		f := func(io.Reader) (blobserver.Storage, []byte, error) {
-			return sto, nil, nil
+		f := func(br blob.Ref, src io.Reader) (blobserver.Storage, io.Reader, error) {
+			return sto, src, nil
 		}
 		return f, nil
 	}
@@ -132,66 +153,50 @@ func buildStorageForReceive(ld blobserver.Loader, confOrString interface{}) (sto
 }
 
 func isSchemaPicker(thenSto, elseSto blobserver.Storage) storageFunc {
-	return func(src io.Reader) (dest blobserver.Storage, overRead []byte, err error) {
+	return func(br blob.Ref, src io.Reader) (dest blobserver.Storage, newSrc io.Reader, err error) {
 		var buf bytes.Buffer
-		var ss schema.Superset
-		if err = json.NewDecoder(io.TeeReader(src, &buf)).Decode(&ss); err != nil {
-			return elseSto, buf.Bytes(), nil
+		blob, err := schema.BlobFromReader(br, io.TeeReader(src, &buf))
+		newSrc = io.MultiReader(bytes.NewReader(buf.Bytes()), src)
+		if err != nil || blob.Type() == "" {
+			return elseSto, newSrc, nil
 		}
-		if ss.Type == "" {
-			// json, but not schema, so use the else path.
-			return elseSto, buf.Bytes(), nil
-		}
-		return thenSto, buf.Bytes(), nil
+		return thenSto, newSrc, nil
 	}
 }
 
-func (sto *condStorage) ReceiveBlob(b *blobref.BlobRef, source io.Reader) (sb blobref.SizedBlobRef, err error) {
-	destSto, overRead, err := sto.storageForReceive(source)
+func (sto *condStorage) ReceiveBlob(br blob.Ref, src io.Reader) (sb blob.SizedRef, err error) {
+	destSto, src, err := sto.storageForReceive(br, src)
 	if err != nil {
 		return
 	}
-	if len(overRead) > 0 {
-		source = io.MultiReader(bytes.NewBuffer(overRead), source)
-	}
-	destSto = blobserver.MaybeWrapContext(destSto, sto.ctx)
-	return destSto.ReceiveBlob(b, source)
+	return blobserver.Receive(destSto, br, src)
 }
 
-func (sto *condStorage) RemoveBlobs(blobs []*blobref.BlobRef) error {
+func (sto *condStorage) RemoveBlobs(blobs []blob.Ref) error {
 	if sto.remove != nil {
-		rsto := blobserver.MaybeWrapContext(sto.remove, sto.ctx)
-		return rsto.RemoveBlobs(blobs)
+		return sto.remove.RemoveBlobs(blobs)
 	}
 	return errors.New("cond: Remove not configured")
 }
 
-func (sto *condStorage) IsFetcherASeeker() bool {
-	_, ok := sto.read.(blobref.SeekFetcher)
-	return ok
-}
-
-func (sto *condStorage) FetchStreaming(b *blobref.BlobRef) (file io.ReadCloser, size int64, err error) {
+func (sto *condStorage) Fetch(b blob.Ref) (file io.ReadCloser, size uint32, err error) {
 	if sto.read != nil {
-		rsto := blobserver.MaybeWrapContext(sto.read, sto.ctx)
-		return rsto.FetchStreaming(b)
+		return sto.read.Fetch(b)
 	}
 	err = errors.New("cond: Read not configured")
 	return
 }
 
-func (sto *condStorage) StatBlobs(dest chan<- blobref.SizedBlobRef, blobs []*blobref.BlobRef, wait time.Duration) error {
+func (sto *condStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
 	if sto.read != nil {
-		rsto := blobserver.MaybeWrapContext(sto.read, sto.ctx)
-		return rsto.StatBlobs(dest, blobs, wait)
+		return sto.read.StatBlobs(dest, blobs)
 	}
 	return errors.New("cond: Read not configured")
 }
 
-func (sto *condStorage) EnumerateBlobs(dest chan<- blobref.SizedBlobRef, after string, limit int, wait time.Duration) error {
+func (sto *condStorage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	if sto.read != nil {
-		rsto := blobserver.MaybeWrapContext(sto.read, sto.ctx)
-		return rsto.EnumerateBlobs(dest, after, limit, wait)
+		return sto.read.EnumerateBlobs(ctx, dest, after, limit)
 	}
 	return errors.New("cond: Read not configured")
 }

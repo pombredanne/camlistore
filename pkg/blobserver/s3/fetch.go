@@ -18,14 +18,23 @@ package s3
 
 import (
 	"io"
-	"log"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 )
 
-var _ = log.Printf
+func (sto *s3Storage) Fetch(blob blob.Ref) (file io.ReadCloser, size uint32, err error) {
+	if faultGet.FailErr(&err) {
+		return
+	}
+	if sto.cache != nil {
+		if file, size, err = sto.cache.Fetch(blob); err == nil {
+			return
+		}
+	}
+	file, sz, err := sto.s3Client.Get(sto.bucket, blob.String())
+	return file, uint32(sz), err
+}
 
-func (sto *s3Storage) FetchStreaming(blob *blobref.BlobRef) (file io.ReadCloser, size int64, reterr error) {
-	file, size, reterr = sto.s3Client.Get(sto.bucket, blob.String())
-	return
+func (sto *s3Storage) SubFetch(br blob.Ref, offset, length int64) (rc io.ReadCloser, err error) {
+	return sto.s3Client.GetPartial(sto.bucket, br.String(), offset, length)
 }

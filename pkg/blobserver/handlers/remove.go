@@ -17,27 +17,24 @@ limitations under the License.
 package handlers
 
 import (
-	"camlistore.org/pkg/blobref"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/httputil"
 	"fmt"
 	"log"
 	"net/http"
+
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/httputil"
 )
 
 const maxRemovesPerRequest = 1000
 
-func CreateRemoveHandler(storage blobserver.Storage) func(http.ResponseWriter, *http.Request) {
-	return func(conn http.ResponseWriter, req *http.Request) {
+func CreateRemoveHandler(storage blobserver.Storage) http.Handler {
+	return http.HandlerFunc(func(conn http.ResponseWriter, req *http.Request) {
 		handleRemove(conn, req, storage)
-	}
+	})
 }
 
 func handleRemove(conn http.ResponseWriter, req *http.Request, storage blobserver.Storage) {
-	if w, ok := storage.(blobserver.ContextWrapper); ok {
-		storage = w.WrapContext(req)
-	}
-
 	if req.Method != "POST" {
 		log.Fatalf("Invalid method; handlers misconfigured")
 	}
@@ -48,14 +45,14 @@ func handleRemove(conn http.ResponseWriter, req *http.Request, storage blobserve
 		fmt.Fprintf(conn, "Remove handler's blobserver.Storage isn't a blobserver.Configer; can't remove")
 		return
 	}
-	if !configer.Config().IsQueue {
+	if !configer.Config().Deletable {
 		conn.WriteHeader(http.StatusForbidden)
-		fmt.Fprintf(conn, "Can only remove blobs from a queue.\n")
+		fmt.Fprintf(conn, "storage does not permit deletes.\n")
 		return
 	}
 
 	n := 0
-	toRemove := make([]*blobref.BlobRef, 0)
+	toRemove := make([]blob.Ref, 0)
 	toRemoveStr := make([]string, 0)
 	for {
 		n++
@@ -69,8 +66,8 @@ func handleRemove(conn http.ResponseWriter, req *http.Request, storage blobserve
 		if value == "" {
 			break
 		}
-		ref := blobref.Parse(value)
-		if ref == nil {
+		ref, ok := blob.Parse(value)
+		if !ok {
 			httputil.BadRequestError(conn, "Bogus blobref for key "+key)
 			return
 		}

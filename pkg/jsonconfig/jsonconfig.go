@@ -21,6 +21,7 @@ package jsonconfig
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -28,7 +29,7 @@ import (
 type Obj map[string]interface{}
 
 // Reads json config data from the specified open file, expanding
-// all expressions 
+// all expressions
 func ReadFile(configPath string) (Obj, error) {
 	var c ConfigParser
 	return c.ReadFile(configPath)
@@ -57,7 +58,7 @@ func (jc Obj) obj(key string, optional bool) Obj {
 		jc.appendError(fmt.Errorf("Expected config key %q to be an object, not %T", key, ei))
 		return make(Obj)
 	}
-	return Obj(m)
+	return m
 }
 
 func (jc Obj) RequiredString(key string) string {
@@ -132,12 +133,19 @@ func (jc Obj) bool(key string, def *bool) bool {
 		jc.appendError(fmt.Errorf("Missing required config key %q (boolean)", key))
 		return false
 	}
-	b, ok := ei.(bool)
-	if !ok {
+	switch v := ei.(type) {
+	case bool:
+		return v
+	case string:
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			jc.appendError(fmt.Errorf("Config key %q has bad boolean format %q", key, v))
+		}
+		return b
+	default:
 		jc.appendError(fmt.Errorf("Expected config key %q to be a boolean", key))
 		return false
 	}
-	return b
 }
 
 func (jc Obj) RequiredInt(key string) int {
@@ -160,15 +168,36 @@ func (jc Obj) int(key string, def *int) int {
 	}
 	b, ok := ei.(float64)
 	if !ok {
-		// TODO(mpl): float or int? or both allowed? use a switch?
-		c, ok := ei.(int)
-		if !ok {
-			jc.appendError(fmt.Errorf("Expected config key %q to be a number", key))
-			return 0
-		}
-		return int(c)
+		jc.appendError(fmt.Errorf("Expected config key %q to be a number", key))
+		return 0
 	}
 	return int(b)
+}
+
+func (jc Obj) RequiredInt64(key string) int64 {
+	return jc.int64(key, nil)
+}
+
+func (jc Obj) OptionalInt64(key string, def int64) int64 {
+	return jc.int64(key, &def)
+}
+
+func (jc Obj) int64(key string, def *int64) int64 {
+	jc.noteKnownKey(key)
+	ei, ok := jc[key]
+	if !ok {
+		if def != nil {
+			return *def
+		}
+		jc.appendError(fmt.Errorf("Missing required config key %q (integer)", key))
+		return 0
+	}
+	b, ok := ei.(float64)
+	if !ok {
+		jc.appendError(fmt.Errorf("Expected config key %q to be a number", key))
+		return 0
+	}
+	return int64(b)
 }
 
 func (jc Obj) RequiredList(key string) []string {
@@ -222,7 +251,8 @@ func (jc Obj) appendError(err error) {
 	}
 }
 
-func (jc Obj) lookForUnknownKeys() {
+// UnknownKeys returns the keys from the config that have not yet been discovered by one of the RequiredT or OptionalT calls.
+func (jc Obj) UnknownKeys() []string {
 	ei, ok := jc["_knownkeys"]
 	var known map[string]bool
 	if ok {
@@ -241,13 +271,14 @@ func (jc Obj) lookForUnknownKeys() {
 		unknown = append(unknown, k)
 	}
 	sort.Strings(unknown)
-	for _, k := range unknown {
-		jc.appendError(fmt.Errorf("Unknown key %q", k))
-	}
+	return unknown
 }
 
 func (jc Obj) Validate() error {
-	jc.lookForUnknownKeys()
+	unknown := jc.UnknownKeys()
+	for _, k := range unknown {
+		jc.appendError(fmt.Errorf("Unknown key %q", k))
+	}
 
 	ei, ok := jc["_errors"]
 	if !ok {

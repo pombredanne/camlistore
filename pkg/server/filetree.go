@@ -20,18 +20,14 @@ import (
 	"log"
 	"net/http"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/schema"
 )
 
 type FileTreeHandler struct {
-	Fetcher blobref.StreamingFetcher
-	file    *blobref.BlobRef
-}
-
-func (fth *FileTreeHandler) storageSeekFetcher() (blobref.SeekFetcher, error) {
-	return blobref.SeekerFromStreamingFetcher(fth.Fetcher) // TODO: pass ih.Cache?
+	Fetcher blob.Fetcher
+	file    blob.Ref
 }
 
 func (fth *FileTreeHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -42,14 +38,12 @@ func (fth *FileTreeHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 	ret := make(map[string]interface{})
 	defer httputil.ReturnJSON(rw, ret)
 
-	fetchSeeker, err := fth.storageSeekFetcher()
+	de, err := schema.NewDirectoryEntryFromBlobRef(fth.Fetcher, fth.file)
 	if err != nil {
-		http.Error(rw, "No storageSeekFetcher", 500)
-		log.Printf("getting fetcher: %v\n", err)
+		http.Error(rw, "Error reading directory", 500)
+		log.Printf("Error reading directory from blobref %s: %v\n", fth.file, err)
 		return
 	}
-
-	de, err := schema.NewDirectoryEntryFromBlobRef(fetchSeeker, fth.file)
 	dir, err := de.Directory()
 	if err != nil {
 		http.Error(rw, "Error reading directory", 500)

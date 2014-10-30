@@ -17,21 +17,26 @@ limitations under the License.
 package s3
 
 import (
-	"log"
-
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/syncutil"
 )
 
-var _ = log.Printf
+var removeGate = syncutil.NewGate(20) // arbitrary
 
-func (sto *s3Storage) RemoveBlobs(blobs []*blobref.BlobRef) error {
-	// TODO: do these in parallel
-	var reterr error
-	for _, blob := range blobs {
-		if err := sto.s3Client.Delete(sto.bucket, blob.String()); err != nil {
-			reterr = err
-		}
+func (sto *s3Storage) RemoveBlobs(blobs []blob.Ref) error {
+	if sto.cache != nil {
+		sto.cache.RemoveBlobs(blobs)
 	}
-	return reterr
+	var wg syncutil.Group
+
+	for _, blob := range blobs {
+		blob := blob
+		removeGate.Start()
+		wg.Go(func() error {
+			defer removeGate.Done()
+			return sto.s3Client.Delete(sto.bucket, blob.String())
+		})
+	}
+	return wg.Err()
 
 }

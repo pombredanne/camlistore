@@ -19,34 +19,59 @@ package client
 import (
 	"errors"
 	"fmt"
+	"log"
+	"math"
 	"net/url"
 	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/context"
 )
 
+// EnumerateOpts are the options to Client.EnumerateBlobsOpts.
 type EnumerateOpts struct {
-	After      string
-	MaxWait    time.Duration // how long to poll for (second granularity), waiting for any blob, or 0 for no limit
-	Limit      int // if non-zero, the max blobs to return
+	After   string        // last blobref seen; start with ones greater than this
+	MaxWait time.Duration // how long to poll for (second granularity), waiting for any blob, or 0 for no limit
+	Limit   int           // if non-zero, the max blobs to return
 }
 
-// Note: closes ch.
-func (c *Client) EnumerateBlobs(ch chan<- blobref.SizedBlobRef) error {
-	return c.EnumerateBlobsOpts(ch, EnumerateOpts{})
+// SimpleEnumerateBlobs sends all blobs to the provided channel.
+// The channel will be closed, regardless of whether an error is returned.
+func (c *Client) SimpleEnumerateBlobs(ctx *context.Context, ch chan<- blob.SizedRef) error {
+	return c.EnumerateBlobsOpts(ctx, ch, EnumerateOpts{})
+}
+
+func (c *Client) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+	if c.sto != nil {
+		return c.sto.EnumerateBlobs(ctx, dest, after, limit)
+	}
+	if limit == 0 {
+		log.Printf("Warning: Client.EnumerateBlobs called with a limit of zero")
+		close(dest)
+		return nil
+	}
+	return c.EnumerateBlobsOpts(ctx, dest, EnumerateOpts{
+		After: after,
+		Limit: limit,
+	})
 }
 
 const enumerateBatchSize = 1000
 
-// Note: closes ch.
-func (c *Client) EnumerateBlobsOpts(ch chan<- blobref.SizedBlobRef, opts EnumerateOpts) error {
+// EnumerateBlobsOpts sends blobs to the provided channel, as directed by opts.
+// The channel will be closed, regardless of whether an error is returned.
+func (c *Client) EnumerateBlobsOpts(ctx *context.Context, ch chan<- blob.SizedRef, opts EnumerateOpts) error {
 	defer close(ch)
 	if opts.After != "" && opts.MaxWait != 0 {
 		return errors.New("client error: it's invalid to use enumerate After and MaxWaitSec together")
 	}
+	pfx, err := c.prefix()
+	if err != nil {
+		return err
+	}
 
 	error := func(msg string, e error) error {
-		err := errors.New(fmt.Sprintf("client enumerate error: %s: %v", msg, e))
+		err := fmt.Errorf("client enumerate error: %s: %v", msg, e)
 		c.log.Print(err.Error())
 		return err
 	}
@@ -65,40 +90,44 @@ func (c *Client) EnumerateBlobsOpts(ch chan<- blobref.SizedBlobRef, opts Enumera
 			}
 		}
 		url_ := fmt.Sprintf("%s/camli/enumerate-blobs?after=%s&limit=%d&maxwaitsec=%d",
-			c.server, url.QueryEscape(after), enumerateBatchSize, waitSec)
+			pfx, url.QueryEscape(after), enumerateBatchSize, waitSec)
 		req := c.newRequest("GET", url_)
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			return error("http request", err)
 		}
 
-		json, err := c.jsonFromResponse("enumerate-blobs", resp)
+		json, err := c.responseJSONMap("enumerate-blobs", resp)
 		if err != nil {
 			return error("stat json parse error", err)
 		}
 
-		blobs, ok := getJsonMapArray(json, "blobs")
+		blobs, ok := getJSONMapArray(json, "blobs")
 		if !ok {
 			return error("response JSON didn't contain 'blobs' array", nil)
 		}
 		for _, v := range blobs {
-			itemJson, ok := v.(map[string]interface{})
+			itemJSON, ok := v.(map[string]interface{})
 			if !ok {
 				return error("item in 'blobs' was malformed", nil)
 			}
-			blobrefStr, ok := getJsonMapString(itemJson, "blobRef")
+			blobrefStr, ok := getJSONMapString(itemJSON, "blobRef")
 			if !ok {
 				return error("item in 'blobs' was missing string 'blobRef'", nil)
 			}
-			size, ok := getJsonMapInt64(itemJson, "size")
+			size, ok := getJSONMapUint32(itemJSON, "size")
 			if !ok {
 				return error("item in 'blobs' was missing numeric 'size'", nil)
 			}
-			br := blobref.Parse(blobrefStr)
-			if br == nil {
+			br, ok := blob.Parse(blobrefStr)
+			if !ok {
 				return error("item in 'blobs' had invalid blobref.", nil)
 			}
-			ch <- blobref.SizedBlobRef{BlobRef: br, Size: size}
+			select {
+			case ch <- blob.SizedRef{Ref: br, Size: uint32(size)}:
+			case <-ctx.Done():
+				return context.ErrCanceled
+			}
 			nSent++
 			if opts.Limit == nSent {
 				// nSent can't be zero at this point, so opts.Limit being 0
@@ -107,12 +136,12 @@ func (c *Client) EnumerateBlobsOpts(ch chan<- blobref.SizedBlobRef, opts Enumera
 			}
 		}
 
-		after, keepGoing = getJsonMapString(json, "continueAfter")
+		after, keepGoing = getJSONMapString(json, "continueAfter")
 	}
 	return nil
 }
 
-func getJsonMapString(m map[string]interface{}, key string) (string, bool) {
+func getJSONMapString(m map[string]interface{}, key string) (string, bool) {
 	if v, ok := m[key]; ok {
 		if s, ok := v.(string); ok {
 			return s, true
@@ -121,7 +150,7 @@ func getJsonMapString(m map[string]interface{}, key string) (string, bool) {
 	return "", false
 }
 
-func getJsonMapInt64(m map[string]interface{}, key string) (int64, bool) {
+func getJSONMapInt64(m map[string]interface{}, key string) (int64, bool) {
 	if v, ok := m[key]; ok {
 		if n, ok := v.(float64); ok {
 			return int64(n), true
@@ -130,7 +159,18 @@ func getJsonMapInt64(m map[string]interface{}, key string) (int64, bool) {
 	return 0, false
 }
 
-func getJsonMapArray(m map[string]interface{}, key string) ([]interface{}, bool) {
+func getJSONMapUint32(m map[string]interface{}, key string) (uint32, bool) {
+	u, ok := getJSONMapInt64(m, key)
+	if !ok {
+		return 0, false
+	}
+	if u < 0 || u > math.MaxUint32 {
+		return 0, false
+	}
+	return uint32(u), true
+}
+
+func getJSONMapArray(m map[string]interface{}, key string) ([]interface{}, bool) {
 	if v, ok := m[key]; ok {
 		if a, ok := v.([]interface{}); ok {
 			return a, true

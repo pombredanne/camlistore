@@ -17,38 +17,29 @@ limitations under the License.
 package main
 
 import (
-	"errors"
-	"log"
 	"net/http"
-	"time"
+	"strings"
 
-	"camlistore.org/pkg/blobref"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/client"
-	"camlistore.org/pkg/jsonsign"
-	"camlistore.org/pkg/schema"
+	"camlistore.org/pkg/httputil"
+	"camlistore.org/pkg/syncutil"
 )
-
-// A HaveCache tracks whether a remove blobserver has a blob or not.
-// TODO(bradfitz): add a notion of a per-blobserver unique ID (reset on wipe/generation/config change).
-type HaveCache interface {
-	BlobExists(br *blobref.BlobRef) bool
-	NoteBlobExists(br *blobref.BlobRef)
-}
 
 type Uploader struct {
 	*client.Client
 
-	rollSplits bool // rolling checksum file splitting
+	// fdGate guards gates the creation of file descriptors.
+	fdGate *syncutil.Gate
+
+	fileOpts *fileOptions // per-file options; may be nil
 
 	// for debugging; normally nil, but overrides Client if set
 	// TODO(bradfitz): clean this up? embed a StatReceiver instead
 	// of a Client?
 	altStatReceiver blobserver.StatReceiver
 
-	entityFetcher jsonsign.EntityFetcher
-
-	transport *tinkerTransport // for HTTP statistics
+	transport *httputil.StatsTransport // for HTTP statistics
 	pwd       string
 	statCache UploadCache
 	haveCache HaveCache
@@ -56,71 +47,46 @@ type Uploader struct {
 	fs http.FileSystem // virtual filesystem to read from; nil means OS filesystem.
 }
 
-// sigTime optionally specifies the signature time.
-// If zero, the current time is used.
-func (up *Uploader) SignMap(m schema.Map, sigTime time.Time) (string, error) {
-	camliSigBlobref := up.Client.SignerPublicKeyBlobref()
-	if camliSigBlobref == nil {
-		// TODO: more helpful error message
-		return "", errors.New("No public key configured.")
-	}
-
-	m["camliSigner"] = camliSigBlobref.String()
-	unsigned, err := m.JSON()
-	if err != nil {
-		return "", err
-	}
-	sr := &jsonsign.SignRequest{
-		UnsignedJSON:  unsigned,
-		Fetcher:       up.Client.GetBlobFetcher(),
-		EntityFetcher: up.entityFetcher,
-		SignatureTime: sigTime,
-	}
-	return sr.Sign()
+// possible options when uploading a file
+type fileOptions struct {
+	permanode bool // create a content-based permanode for each uploaded file
+	// tag is an optional tag or comma-delimited tags to apply to
+	// the above permanode.
+	tag string
+	// perform for the client the actions needing gpg signing when uploading a file.
+	vivify   bool
+	exifTime bool // use the time in exif metadata as the modtime if possible.
+	capCtime bool // use mtime as ctime if ctime > mtime
 }
 
-func (up *Uploader) UploadMap(m schema.Map) (*client.PutResult, error) {
-	json, err := m.JSON()
-	if err != nil {
-		return nil, err
+func (o *fileOptions) tags() []string {
+	if o == nil || o.tag == "" {
+		return nil
 	}
-	return up.uploadString(json)
+	return strings.Split(o.tag, ",")
 }
 
-func (up *Uploader) UploadAndSignMap(m schema.Map) (*client.PutResult, error) {
-	signed, err := up.SignMap(m, time.Time{})
-	if err != nil {
-		return nil, err
-	}
-	return up.uploadString(signed)
+func (o *fileOptions) wantFilePermanode() bool {
+	return o != nil && o.permanode
+}
+
+func (o *fileOptions) wantVivify() bool {
+	return o != nil && o.vivify
+}
+
+func (o *fileOptions) wantCapCtime() bool {
+	return o != nil && o.capCtime
 }
 
 func (up *Uploader) uploadString(s string) (*client.PutResult, error) {
-	uh := client.NewUploadHandleFromString(s)
-	if c := up.haveCache; c != nil && c.BlobExists(uh.BlobRef) {
-		cachelog.Printf("HaveCache HIT for %s / %d", uh.BlobRef, uh.Size)
-		return &client.PutResult{BlobRef: uh.BlobRef, Size: uh.Size, Skipped: true}, nil
-	}
-	pr, err := up.Upload(uh)
-	if err == nil && up.haveCache != nil {
-		up.haveCache.NoteBlobExists(uh.BlobRef)
-	}
-	if pr == nil && err == nil {
-		log.Fatalf("Got nil/nil in uploadString while uploading %s", s)
-	}
-	return pr, err
+	return up.Upload(client.NewUploadHandleFromString(s))
 }
 
-func (up *Uploader) UploadNewPermanode() (*client.PutResult, error) {
-	unsigned := schema.NewUnsignedPermanode()
-	return up.UploadAndSignMap(unsigned)
-}
-
-func (up *Uploader) UploadPlannedPermanode(key string, sigTime time.Time) (*client.PutResult, error) {
-	unsigned := schema.NewPlannedPermanode(key)
-	signed, err := up.SignMap(unsigned, sigTime)
-	if err != nil {
-		return nil, err
+func (up *Uploader) Close() error {
+	var grp syncutil.Group
+	if up.haveCache != nil {
+		grp.Go(up.haveCache.Close)
 	}
-	return up.uploadString(signed)
+	grp.Go(up.Client.Close)
+	return grp.Err()
 }

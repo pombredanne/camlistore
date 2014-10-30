@@ -17,159 +17,73 @@ limitations under the License.
 package schema
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
+	"sync"
+	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/singleflight"
+	"camlistore.org/pkg/syncutil"
+	"camlistore.org/pkg/types"
 )
-
-var _ = log.Printf
 
 const closedIndex = -1
 
 var errClosed = errors.New("filereader is closed")
 
-// A DirReader reads the entries of a "directory" schema blob's
-// referenced "static-set" blob.
-type DirReader struct {
-	fetcher blobref.SeekFetcher
-	ss      *Superset
-
-	staticSet []*blobref.BlobRef
-	current   int
-}
-
-// NewDirReader creates a new directory reader and prepares to
-// fetch the static-set entries
-func NewDirReader(fetcher blobref.SeekFetcher, dirBlobRef *blobref.BlobRef) (*DirReader, error) {
-	ss := new(Superset)
-	err := ss.setFromBlobRef(fetcher, dirBlobRef)
-	if err != nil {
-		return nil, err
-	}
-	if ss.Type != "directory" {
-		return nil, fmt.Errorf("schema/filereader: expected \"directory\" schema blob for %s, got %q", dirBlobRef, ss.Type)
-	}
-	dr, err := ss.NewDirReader(fetcher)
-	if err != nil {
-		return nil, fmt.Errorf("schema/filereader: creating DirReader for %s: %v", dirBlobRef, err)
-	}
-	dr.current = 0
-	return dr, nil
-}
-
-func (ss *Superset) NewDirReader(fetcher blobref.SeekFetcher) (*DirReader, error) {
-	if ss.Type != "directory" {
-		return nil, fmt.Errorf("Superset not of type \"directory\"")
-	}
-	return &DirReader{fetcher: fetcher, ss: ss}, nil
-}
-
-func (ss *Superset) setFromBlobRef(fetcher blobref.SeekFetcher, blobRef *blobref.BlobRef) error {
-	if blobRef == nil {
-		return errors.New("schema/filereader: blobref was nil")
-	}
-	ss.BlobRef = blobRef
-	rsc, _, err := fetcher.Fetch(blobRef)
-	if err != nil {
-		return fmt.Errorf("schema/filereader: fetching schema blob %s: %v", blobRef, err)
-	}
-	if err = json.NewDecoder(rsc).Decode(ss); err != nil {
-		return fmt.Errorf("schema/filereader: decoding schema blob %s: %v", blobRef, err)
-	}
-	return nil
-}
-
-// StaticSet returns the whole of the static set members of that directory
-func (dr *DirReader) StaticSet() ([]*blobref.BlobRef, error) {
-	if dr.staticSet != nil {
-		return dr.staticSet, nil
-	}
-	staticSetBlobref := blobref.Parse(dr.ss.Entries)
-	if staticSetBlobref == nil {
-		return nil, fmt.Errorf("schema/filereader: Invalid blobref\n")
-	}
-	rsc, _, err := dr.fetcher.Fetch(staticSetBlobref)
-	if err != nil {
-		return nil, fmt.Errorf("schema/filereader: fetching schema blob %s: %v", staticSetBlobref, err)
-	}
-	ss := new(Superset)
-	if err = json.NewDecoder(rsc).Decode(ss); err != nil {
-		return nil, fmt.Errorf("schema/filereader: decoding schema blob %s: %v", staticSetBlobref, err)
-	}
-	if ss.Type != "static-set" {
-		return nil, fmt.Errorf("schema/filereader: expected \"static-set\" schema blob for %s, got %q", staticSetBlobref, ss.Type)
-	}
-	for _, s := range ss.Members {
-		member := blobref.Parse(s)
-		if member == nil {
-			return nil, fmt.Errorf("schema/filereader: invalid (static-set member) blobref\n")
-		}
-		dr.staticSet = append(dr.staticSet, member)
-	}
-	return dr.staticSet, nil
-}
-
-// Readdir implements the Directory interface.
-func (dr *DirReader) Readdir(n int) (entries []DirectoryEntry, err error) {
-	sts, err := dr.StaticSet()
-	if err != nil {
-		return nil, fmt.Errorf("schema/filereader: can't get StaticSet: %v\n", err)
-	}
-	up := dr.current + n
-	if n <= 0 {
-		dr.current = 0
-		up = len(sts)
-	} else {
-		if n > (len(sts) - dr.current) {
-			err = io.EOF
-			up = len(sts)
-		}
-	}
-	for _, entryBref := range sts[dr.current:up] {
-		entry, err := NewDirectoryEntryFromBlobRef(dr.fetcher, entryBref)
-		if err != nil {
-			return nil, fmt.Errorf("schema/filereader: can't create dirEntry: %v\n", err)
-		}
-		entries = append(entries, entry)
-	}
-	return entries, err
-}
-
+// A FileReader reads the bytes of "file" and "bytes" schema blobrefs.
 type FileReader struct {
-	fetcher blobref.SeekFetcher
-	ss      *Superset
+	// Immutable stuff:
+	*io.SectionReader             // provides Read, Seek, and Size.
+	parent            *FileReader // or nil. for sub-region readers to find the top.
+	rootOff           int64       // this FileReader's offset from the root
+	fetcher           blob.Fetcher
+	ss                *superset
+	size              int64 // total number of bytes
 
-	ci     int    // index into contentparts, or -1 on closed
-	ccon   uint64 // bytes into current chunk already consumed
-	remain int64  // bytes remaining
+	sfg singleflight.Group // for loading blobrefs for ssm
 
-	cr   blobref.ReadSeekCloser // cached reader (for blobref chunks)
-	crbr *blobref.BlobRef       // the blobref that cr is for
+	blobmu   sync.Mutex // guards lastBlob
+	lastBlob *blob.Blob // most recently fetched blob; cuts dup reads up to 85x
 
-	csubfr *FileReader // cached sub blobref reader (for subBlobRef chunks)
-	ccp    *BytesPart  // the content part that csubfr is cached for
+	ssmmu sync.Mutex             // guards ssm
+	ssm   map[blob.Ref]*superset // blobref -> superset
 }
 
-// TODO(bradfitz): make this take a blobref.FetcherAt instead?
-// TODO(bradfitz): rename this into bytes reader? but for now it's still
-//                 named FileReader, but can also read a "bytes" schema.
-func NewFileReader(fetcher blobref.SeekFetcher, fileBlobRef *blobref.BlobRef) (*FileReader, error) {
-	if fileBlobRef == nil {
-		return nil, errors.New("schema/filereader: NewFileReader blobref was nil")
+var _ interface {
+	io.Seeker
+	io.ReaderAt
+	io.Reader
+	io.Closer
+	Size() int64
+} = (*FileReader)(nil)
+
+// NewFileReader returns a new FileReader reading the contents of fileBlobRef,
+// fetching blobs from fetcher.  The fileBlobRef must be of a "bytes" or "file"
+// schema blob.
+//
+// The caller should call Close on the FileReader when done reading.
+func NewFileReader(fetcher blob.Fetcher, fileBlobRef blob.Ref) (*FileReader, error) {
+	// TODO(bradfitz): rename this into bytes reader? but for now it's still
+	//                 named FileReader, but can also read a "bytes" schema.
+	if !fileBlobRef.Valid() {
+		return nil, errors.New("schema/filereader: NewFileReader blobref invalid")
 	}
-	ss := new(Superset)
-	rsc, _, err := fetcher.Fetch(fileBlobRef)
+	rc, _, err := fetcher.Fetch(fileBlobRef)
 	if err != nil {
 		return nil, fmt.Errorf("schema/filereader: fetching file schema blob: %v", err)
 	}
-	if err = json.NewDecoder(rsc).Decode(ss); err != nil {
+	defer rc.Close()
+	ss, err := parseSuperset(rc)
+	if err != nil {
 		return nil, fmt.Errorf("schema/filereader: decoding file schema blob: %v", err)
 	}
+	ss.BlobRef = fileBlobRef
 	if ss.Type != "file" && ss.Type != "bytes" {
 		return nil, fmt.Errorf("schema/filereader: expected \"file\" or \"bytes\" schema blob, got %q", ss.Type)
 	}
@@ -180,187 +94,301 @@ func NewFileReader(fetcher blobref.SeekFetcher, fileBlobRef *blobref.BlobRef) (*
 	return fr, nil
 }
 
-func (ss *Superset) NewFileReader(fetcher blobref.SeekFetcher) (*FileReader, error) {
+func (b *Blob) NewFileReader(fetcher blob.Fetcher) (*FileReader, error) {
+	return b.ss.NewFileReader(fetcher)
+}
+
+// NewFileReader returns a new FileReader, reading bytes and blobs
+// from the provided fetcher.
+//
+// NewFileReader does no fetch operation on the fetcher itself.  The
+// fetcher is only used in subsequent read operations.
+//
+// An error is only returned if the type of the superset is not either
+// "file" or "bytes".
+func (ss *superset) NewFileReader(fetcher blob.Fetcher) (*FileReader, error) {
 	if ss.Type != "file" && ss.Type != "bytes" {
 		return nil, fmt.Errorf("schema/filereader: Superset not of type \"file\" or \"bytes\"")
 	}
-	return &FileReader{fetcher: fetcher, ss: ss, remain: int64(ss.SumPartsSize())}, nil
-}
-
-// FileSchema returns the reader's schema superset. Don't mutate it.
-func (fr *FileReader) FileSchema() *Superset {
-	return fr.ss
-}
-
-func (fr *FileReader) Close() error {
-	if fr.ci == closedIndex {
-		return errClosed
+	size := int64(ss.SumPartsSize())
+	fr := &FileReader{
+		fetcher: fetcher,
+		ss:      ss,
+		size:    size,
+		ssm:     make(map[blob.Ref]*superset),
 	}
-	fr.closeOpenBlobs()
-	fr.ci = closedIndex
+	fr.SectionReader = io.NewSectionReader(fr, 0, size)
+	return fr, nil
+}
+
+// LoadAllChunks starts a process of loading all chunks of this file
+// as quickly as possible. The contents are immediately discarded, so
+// it is assumed that the fetcher is a caching fetcher.
+func (fr *FileReader) LoadAllChunks() {
+	// TODO: ask the underlying blobserver to do this if it would
+	// prefer.  Some blobservers (like blobpacked) might not want
+	// to do this at all.
+	go fr.loadAllChunksSync()
+}
+
+func (fr *FileReader) loadAllChunksSync() {
+	gate := syncutil.NewGate(20) // num readahead chunk loads at a time
+	fr.ForeachChunk(func(_ []blob.Ref, p BytesPart) error {
+		if !p.BlobRef.Valid() {
+			return nil
+		}
+		gate.Start()
+		go func(br blob.Ref) {
+			defer gate.Done()
+			rc, _, err := fr.fetcher.Fetch(br)
+			if err == nil {
+				defer rc.Close()
+				var b [1]byte
+				rc.Read(b[:]) // fault in the blob
+			}
+		}(p.BlobRef)
+		return nil
+	})
+}
+
+// UnixMtime returns the file schema's UnixMtime field, or the zero value.
+func (fr *FileReader) UnixMtime() time.Time {
+	t, err := time.Parse(time.RFC3339, fr.ss.UnixMtime)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// FileName returns the file schema's filename, if any.
+func (fr *FileReader) FileName() string { return fr.ss.FileNameString() }
+
+func (fr *FileReader) ModTime() time.Time { return fr.ss.ModTime() }
+
+func (fr *FileReader) SchemaBlobRef() blob.Ref { return fr.ss.BlobRef }
+
+// Close currently does nothing.
+func (fr *FileReader) Close() error { return nil }
+
+func (fr *FileReader) ReadAt(p []byte, offset int64) (n int, err error) {
+	if offset < 0 {
+		return 0, errors.New("schema/filereader: negative offset")
+	}
+	if offset >= fr.Size() {
+		return 0, io.EOF
+	}
+	want := len(p)
+	for len(p) > 0 && err == nil {
+		rc, err := fr.readerForOffset(offset)
+		if err != nil {
+			return n, err
+		}
+		var n1 int
+		n1, err = io.ReadFull(rc, p)
+		rc.Close()
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			err = nil
+		}
+		if n1 == 0 {
+			break
+		}
+		p = p[n1:]
+		offset += int64(n1)
+		n += n1
+	}
+	if n < want && err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return n, err
+}
+
+// ForeachChunk calls fn for each chunk of fr, in order.
+//
+// The schemaPath argument will be the path from the "file" or "bytes"
+// schema blob down to possibly other "bytes" schema blobs, the final
+// one of which references the given BytesPart. The BytesPart will be
+// the actual chunk. The fn function will not be called with
+// BytesParts referencing a "BytesRef"; those are followed recursively
+// instead. The fn function must not retain or mutate schemaPath.
+//
+// If fn returns an error, iteration stops and that error is returned
+// from ForeachChunk. Other errors may be returned from ForeachChunk
+// if schema blob fetches fail.
+func (fr *FileReader) ForeachChunk(fn func(schemaPath []blob.Ref, p BytesPart) error) error {
+	return fr.foreachChunk(fn, nil)
+}
+
+func (fr *FileReader) foreachChunk(fn func([]blob.Ref, BytesPart) error, path []blob.Ref) error {
+	path = append(path, fr.ss.BlobRef)
+	for _, bp := range fr.ss.Parts {
+		if bp.BytesRef.Valid() && bp.BlobRef.Valid() {
+			return fmt.Errorf("part in %v illegally contained both a blobRef and bytesRef", fr.ss.BlobRef)
+		}
+		if bp.BytesRef.Valid() {
+			ss, err := fr.getSuperset(bp.BytesRef)
+			if err != nil {
+				return err
+			}
+			subfr, err := ss.NewFileReader(fr.fetcher)
+			if err != nil {
+				return err
+			}
+			subfr.parent = fr
+			if err := subfr.foreachChunk(fn, path); err != nil {
+				return err
+			}
+		} else {
+			if err := fn(path, *bp); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
-func (fr *FileReader) Skip(skipBytes uint64) uint64 {
-	if fr.ci == closedIndex {
-		return 0
+func (fr *FileReader) rootReader() *FileReader {
+	if fr.parent != nil {
+		return fr.parent.rootReader()
 	}
-
-	wantedSkipped := skipBytes
-
-	for skipBytes != 0 && fr.ci < len(fr.ss.Parts) {
-		cp := fr.ss.Parts[fr.ci]
-		thisChunkSkippable := cp.Size - fr.ccon
-		toSkip := minu64(skipBytes, thisChunkSkippable)
-		fr.ccon += toSkip
-		fr.remain -= int64(toSkip)
-		if fr.ccon == cp.Size {
-			fr.ci++
-			fr.ccon = 0
-		}
-		skipBytes -= toSkip
-	}
-
-	return wantedSkipped - skipBytes
+	return fr
 }
 
-func (fr *FileReader) closeOpenBlobs() {
-	if fr.cr != nil {
-		fr.cr.Close()
-		fr.cr = nil
-		fr.crbr = nil
+func (fr *FileReader) getBlob(br blob.Ref) (*blob.Blob, error) {
+	if root := fr.rootReader(); root != fr {
+		return root.getBlob(br)
 	}
-}
-
-func (fr *FileReader) readerFor(br *blobref.BlobRef, seekTo int64) (r io.Reader, err error) {
-	if fr.crbr == br {
-		return fr.cr, nil
+	fr.blobmu.Lock()
+	last := fr.lastBlob
+	fr.blobmu.Unlock()
+	if last != nil && last.Ref() == br {
+		return last, nil
 	}
-	fr.closeOpenBlobs()
-	var rsc blobref.ReadSeekCloser
-	if br != nil {
-		rsc, _, err = fr.fetcher.Fetch(br)
-		if err != nil {
-			return
-		}
-
-		_, serr := rsc.Seek(int64(seekTo), os.SEEK_SET)
-		if serr != nil {
-			return nil, fmt.Errorf("schema: FileReader.Read seek error on blob %s: %v", br, serr)
-		}
-
-	} else {
-		rsc = &zeroReader{}
-	}
-	fr.crbr = br
-	fr.cr = rsc
-	return rsc, nil
-}
-
-func (fr *FileReader) subBlobRefReader(cp *BytesPart) (io.Reader, error) {
-	if fr.ccp == cp {
-		return fr.csubfr, nil
-	}
-	subfr, err := NewFileReader(fr.fetcher, cp.BytesRef)
-	if err == nil {
-		subfr.Skip(cp.Offset)
-		fr.csubfr = subfr
-		fr.ccp = cp
-	}
-	return subfr, err
-}
-
-func (fr *FileReader) currentPart() (*BytesPart, error) {
-	for {
-		if fr.ci >= len(fr.ss.Parts) {
-			fr.closeOpenBlobs()
-			if fr.remain > 0 {
-				return nil, fmt.Errorf("schema: declared file schema size was larger than sum of content parts")
-			}
-			return nil, io.EOF
-		}
-		cp := fr.ss.Parts[fr.ci]
-		thisChunkReadable := cp.Size - fr.ccon
-		if thisChunkReadable == 0 {
-			fr.ci++
-			fr.ccon = 0
-			continue
-		}
-		return cp, nil
-	}
-	panic("unreachable")
-}
-
-func (fr *FileReader) Read(p []byte) (n int, err error) {
-	if fr.ci == closedIndex {
-		return 0, errClosed
-	}
-
-	cp, err := fr.currentPart()
+	blob, err := blob.FromFetcher(fr.fetcher, br)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	if cp.Size == 0 {
-		return 0, fmt.Errorf("blobref content part contained illegal size 0")
-	}
-
-	br := cp.BlobRef
-	sbr := cp.BytesRef
-	if br != nil && sbr != nil {
-		return 0, fmt.Errorf("content part index %d has both blobRef and subFileBlobRef", fr.ci)
-	}
-
-	var r io.Reader
-
-	if sbr != nil {
-		r, err = fr.subBlobRefReader(cp)
-		if err != nil {
-			return 0, fmt.Errorf("schema: FileReader.Read error fetching sub file %s: %v", sbr, err)
-		}
-	} else {
-		seekTo := cp.Offset + fr.ccon
-		r, err = fr.readerFor(br, int64(seekTo))
-		if err != nil {
-			return 0, fmt.Errorf("schema: FileReader.Read error fetching blob %s: %v", br, err)
-		}
-	}
-
-	readSize := cp.Size - fr.ccon
-	if readSize < uint64(len(p)) {
-		p = p[:int(readSize)]
-	}
-
-	n, err = r.Read(p)
-	fr.ccon += uint64(n)
-	fr.remain -= int64(n)
-	if fr.remain < 0 {
-		err = fmt.Errorf("schema: file schema was invalid; content parts sum to over declared size")
-	}
-	return
+	fr.blobmu.Lock()
+	fr.lastBlob = blob
+	fr.blobmu.Unlock()
+	return blob, nil
 }
 
-func minu64(a, b uint64) uint64 {
-	if a < b {
-		return a
+func (fr *FileReader) getSuperset(br blob.Ref) (*superset, error) {
+	if root := fr.rootReader(); root != fr {
+		return root.getSuperset(br)
 	}
-	return b
+	brStr := br.String()
+	ssi, err := fr.sfg.Do(brStr, func() (interface{}, error) {
+		fr.ssmmu.Lock()
+		ss, ok := fr.ssm[br]
+		fr.ssmmu.Unlock()
+		if ok {
+			return ss, nil
+		}
+		rc, _, err := fr.fetcher.Fetch(br)
+		if err != nil {
+			return nil, fmt.Errorf("schema/filereader: fetching file schema blob: %v", err)
+		}
+		defer rc.Close()
+		ss, err = parseSuperset(rc)
+		if err != nil {
+			return nil, err
+		}
+		ss.BlobRef = br
+		fr.ssmmu.Lock()
+		defer fr.ssmmu.Unlock()
+		fr.ssm[br] = ss
+		return ss, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ssi.(*superset), nil
+}
+
+var debug = os.Getenv("CAMLI_DEBUG") != ""
+
+// readerForOffset returns a ReadCloser that reads some number of bytes and then EOF
+// from the provided offset.  Seeing EOF doesn't mean the end of the whole file; just the
+// chunk at that offset.  The caller must close the ReadCloser when done reading.
+func (fr *FileReader) readerForOffset(off int64) (io.ReadCloser, error) {
+	if debug {
+		log.Printf("(%p) readerForOffset %d + %d = %d", fr, fr.rootOff, off, fr.rootOff+off)
+	}
+	if off < 0 {
+		panic("negative offset")
+	}
+	if off >= fr.size {
+		return types.EmptyBody, nil
+	}
+	offRemain := off
+	var skipped int64
+	parts := fr.ss.Parts
+	for len(parts) > 0 && parts[0].Size <= uint64(offRemain) {
+		offRemain -= int64(parts[0].Size)
+		skipped += int64(parts[0].Size)
+		parts = parts[1:]
+	}
+	if len(parts) == 0 {
+		return types.EmptyBody, nil
+	}
+	p0 := parts[0]
+	var rsc types.ReadSeekCloser
+	var err error
+	switch {
+	case p0.BlobRef.Valid() && p0.BytesRef.Valid():
+		return nil, fmt.Errorf("part illegally contained both a blobRef and bytesRef")
+	case !p0.BlobRef.Valid() && !p0.BytesRef.Valid():
+		return ioutil.NopCloser(
+			io.LimitReader(zeroReader{},
+				int64(p0.Size-uint64(offRemain)))), nil
+	case p0.BlobRef.Valid():
+		blob, err := fr.getBlob(p0.BlobRef)
+		if err != nil {
+			return nil, err
+		}
+		rsc = blob.Open()
+	case p0.BytesRef.Valid():
+		var ss *superset
+		ss, err = fr.getSuperset(p0.BytesRef)
+		if err != nil {
+			return nil, err
+		}
+		rsc, err = ss.NewFileReader(fr.fetcher)
+		if err == nil {
+			subFR := rsc.(*FileReader)
+			subFR.parent = fr.rootReader()
+			subFR.rootOff = fr.rootOff + skipped
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	offRemain += int64(p0.Offset)
+	if offRemain > 0 {
+		newPos, err := rsc.Seek(offRemain, os.SEEK_SET)
+		if err != nil {
+			return nil, err
+		}
+		if newPos != offRemain {
+			panic("Seek didn't work")
+		}
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{
+		io.LimitReader(rsc, int64(p0.Size)),
+		rsc,
+	}, nil
 }
 
 type zeroReader struct{}
 
-func (*zeroReader) Read(p []byte) (int, error) {
+func (zeroReader) Read(p []byte) (n int, err error) {
 	for i := range p {
 		p[i] = 0
 	}
 	return len(p), nil
-}
-
-func (*zeroReader) Close() error {
-	return nil
-}
-
-func (*zeroReader) Seek(offset int64, whence int) (newFilePos int64, err error) {
-	// Caller is ignoring our newFilePos return value.
-	return 0, nil
 }

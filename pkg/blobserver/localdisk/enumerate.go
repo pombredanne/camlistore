@@ -18,18 +18,19 @@ package localdisk
 
 import (
 	"fmt"
-	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/context"
 )
 
 type readBlobRequest struct {
-	ch      chan<- blobref.SizedBlobRef
+	done    <-chan struct{}
+	ch      chan<- blob.SizedRef
 	after   string
 	remain  *int // limit countdown
 	dirRoot string
@@ -47,25 +48,19 @@ func (ee *enumerateError) Error() string {
 	return fmt.Sprintf("Enumerate error: %s: %v", ee.msg, ee.err)
 }
 
-func readBlobs(opts readBlobRequest) error {
+func (ds *DiskStorage) readBlobs(opts readBlobRequest) error {
 	dirFullPath := filepath.Join(opts.dirRoot, opts.pathInto)
 	dir, err := os.Open(dirFullPath)
 	if err != nil {
 		return &enumerateError{"localdisk: opening directory " + dirFullPath, err}
 	}
-	defer dir.Close()
-	names, err := dir.Readdirnames(32768)
-	if err == io.EOF {
+	names, err := dir.Readdirnames(-1)
+	dir.Close()
+	if err == nil && len(names) == 0 {
 		// remove empty blob dir if we are in a queue but not the queue root itself
 		if strings.Contains(dirFullPath, "queue-") &&
 			!strings.Contains(filepath.Base(dirFullPath), "queue-") {
-			// Grab a lock on the directory (to make sure we're not deleting it as another
-			// blob is coming in and creating this directory), then try to delete it,
-			// but ignore any error, because it might just be a new file appearing here
-			// (in the case of the directory already existing, but not being newly made)
-			dirLock := deleteDirectoryLock(dirFullPath)
-			os.Remove(dirFullPath)
-			dirLock.Unlock()
+			go ds.tryRemoveDir(dirFullPath)
 		}
 		return nil
 	}
@@ -73,20 +68,55 @@ func readBlobs(opts readBlobRequest) error {
 		return &enumerateError{"localdisk: readdirnames of " + dirFullPath, err}
 	}
 	sort.Strings(names)
+	stat := make(map[string]chan interface{}) // gets sent error or os.FileInfo
+	for _, name := range names {
+		if skipDir(name) || isShardDir(name) {
+			continue
+		}
+		ch := make(chan interface{}, 1) // 1 in case it's not read
+		name := name
+		stat[name] = ch
+		go func() {
+			fi, err := os.Stat(filepath.Join(dirFullPath, name))
+			if err != nil {
+				ch <- err
+			} else {
+				ch <- fi
+			}
+		}()
+	}
+
 	for _, name := range names {
 		if *opts.remain == 0 {
 			return nil
 		}
-		if name == "partition" {
+		if skipDir(name) {
 			continue
 		}
-		fullPath := dirFullPath + "/" + name
-		fi, err := os.Stat(fullPath)
-		if err != nil {
-			return &enumerateError{"localdisk: stat of file " + fullPath, err}
+		var (
+			fi      os.FileInfo
+			err     error
+			didStat bool
+		)
+		stat := func() {
+			if didStat {
+				return
+			}
+			didStat = true
+			fiv := <-stat[name]
+			var ok bool
+			if err, ok = fiv.(error); ok {
+				err = &enumerateError{"localdisk: stat of file " + filepath.Join(dirFullPath, name), err}
+			} else {
+				fi = fiv.(os.FileInfo)
+			}
+		}
+		isDir := func() bool {
+			stat()
+			return fi != nil && fi.IsDir()
 		}
 
-		if fi.IsDir() {
+		if isShardDir(name) || isDir() {
 			var newBlobPrefix string
 			if opts.blobPrefix == "" {
 				newBlobPrefix = name + "-"
@@ -98,25 +128,35 @@ func readBlobs(opts readBlobRequest) error {
 				if len(opts.after) < compareLen {
 					compareLen = len(opts.after)
 				}
-				if newBlobPrefix[0:compareLen] < opts.after[0:compareLen] {
+				if newBlobPrefix[:compareLen] < opts.after[:compareLen] {
 					continue
 				}
 			}
 			ropts := opts
 			ropts.blobPrefix = newBlobPrefix
 			ropts.pathInto = opts.pathInto + "/" + name
-			readBlobs(ropts)
+			if err := ds.readBlobs(ropts); err != nil {
+				return err
+			}
 			continue
 		}
 
+		stat()
+		if err != nil {
+			return err
+		}
+
 		if !fi.IsDir() && strings.HasSuffix(name, ".dat") {
-			blobName := name[0 : len(name)-4]
+			blobName := strings.TrimSuffix(name, ".dat")
 			if blobName <= opts.after {
 				continue
 			}
-			blobRef := blobref.Parse(blobName)
-			if blobRef != nil {
-				opts.ch <- blobref.SizedBlobRef{BlobRef: blobRef, Size: fi.Size()}
+			if blobRef, ok := blob.Parse(blobName); ok {
+				select {
+				case opts.ch <- blob.SizedRef{Ref: blobRef, Size: uint32(fi.Size())}:
+				case <-opts.done:
+					return context.ErrCanceled
+				}
 				(*opts.remain)--
 			}
 			continue
@@ -126,45 +166,36 @@ func readBlobs(opts readBlobRequest) error {
 	return nil
 }
 
-func (ds *DiskStorage) EnumerateBlobs(dest chan<- blobref.SizedBlobRef, after string, limit int, wait time.Duration) error {
+func (ds *DiskStorage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	defer close(dest)
+	if limit == 0 {
+		log.Printf("Warning: localdisk.EnumerateBlobs called with a limit of 0")
+	}
 
-	dirRoot := ds.PartitionRoot(ds.partition)
 	limitMutable := limit
-	var err error
-	doScan := func() {
-		err = readBlobs(readBlobRequest{
-			ch:      dest,
-			dirRoot: dirRoot,
-			after:   after,
-			remain:  &limitMutable,
-		})
-	}
-	doScan()
+	return ds.readBlobs(readBlobRequest{
+		done:    ctx.Done(),
+		ch:      dest,
+		dirRoot: ds.root,
+		after:   after,
+		remain:  &limitMutable,
+	})
+}
 
-	// The not waiting case:
-	if err != nil || limitMutable != limit || wait == 0 {
-		return err
-	}
+func skipDir(name string) bool {
+	// The partition directory is old. (removed from codebase, but
+	// likely still on disk for some people)
+	// the "cache" directory is just a hack: it's used
+	// by the serverconfig/genconfig code, as a default
+	// location for most users to put their thumbnail
+	// cache.  For now we just also skip it here.
+	return name == "partition" || name == "cache"
+}
 
-	// The case where we have to wait for wait for any blob
-	// to possibly appear.
-	hub := ds.GetBlobHub()
-	ch := make(chan *blobref.BlobRef, 1)
-	hub.RegisterListener(ch)
-	defer hub.UnregisterListener(ch)
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		// Done waiting.
-		return nil
-	case <-ch:
-		// Don't actually care what it is, but _something_
-		// arrived.  We can just re-scan.
-		// TODO: might be better to just stat this one item
-		// so there's no race?  But this is easier:
-		doScan()
-	}
-	return err
+func isShardDir(name string) bool {
+	return len(name) == 2 && isHex(name[0]) && isHex(name[1])
+}
+
+func isHex(b byte) bool {
+	return ('0' <= b && b <= '9') || ('a' <= b && b <= 'f')
 }

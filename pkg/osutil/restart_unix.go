@@ -1,4 +1,5 @@
-// +build linux darwin freebsd netbsd openbsd
+// +build !appengine
+// +build linux darwin freebsd netbsd openbsd solaris
 
 /*
 Copyright 2012 The Camlistore Authors.
@@ -19,13 +20,48 @@ limitations under the License.
 package osutil
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"runtime"
 	"syscall"
 )
 
-// restartProcess returns an error if things couldn't be
+// if non-nil, osSelfPath is used from selfPath.
+var osSelfPath func() (string, error)
+
+// TODO(mpl): document the symlink behaviour in SelfPath for the BSDs when
+// I know for sure.
+
+// SelfPath returns the path of the executable for the currently running
+// process. At least on linux, the returned path is a symlink to the actual
+// executable.
+func SelfPath() (string, error) {
+	if f := osSelfPath; f != nil {
+		return f()
+	}
+	switch runtime.GOOS {
+	case "linux":
+		return "/proc/self/exe", nil
+	case "netbsd":
+		return "/proc/curproc/exe", nil
+	case "openbsd":
+		return "/proc/curproc/file", nil
+	case "darwin":
+		// TODO(mpl): maybe do the right thing for darwin too, but that may require changes to runtime.
+		// See https://codereview.appspot.com/6736069/
+		return os.Args[0], nil
+	}
+	return "", errors.New("SelfPath not implemented for " + runtime.GOOS)
+}
+
+// RestartProcess returns an error if things couldn't be
 // restarted.  On success, this function never returns
 // because the process becomes the new process.
 func RestartProcess() error {
-	return syscall.Exec(os.Args[0], os.Args, os.Environ())
+	path, err := SelfPath()
+	if err != nil {
+		return fmt.Errorf("RestartProcess failed: %v", err)
+	}
+	return syscall.Exec(path, os.Args, os.Environ())
 }

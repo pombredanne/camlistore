@@ -17,25 +17,21 @@ limitations under the License.
 package localdisk
 
 import (
-	"camlistore.org/pkg/blobref"
-
+	"path/filepath"
 	"testing"
+
+	"camlistore.org/pkg/blob"
 )
 
 func TestPaths(t *testing.T) {
-	br := blobref.Parse("digalg-abc")
+	br := blob.MustParse("digalg-abc")
 	ds := &DiskStorage{root: "/tmp/dir"}
 
-	if e, g := "/tmp/dir/digalg/abc/___", ds.blobDirectory("", br); e != g {
+	slash := filepath.ToSlash
+	if e, g := "/tmp/dir/digalg/ab/c_", slash(ds.blobDirectory(br)); e != g {
 		t.Errorf("short blobref dir; expected path %q; got %q", e, g)
 	}
-	if e, g := "/tmp/dir/digalg/abc/___/digalg-abc.dat", ds.blobPath("", br); e != g {
+	if e, g := "/tmp/dir/digalg/ab/c_/digalg-abc.dat", slash(ds.blobPath(br)); e != g {
 		t.Errorf("short blobref path; expected path %q; got %q", e, g)
 	}
-
-	br = blobref.Parse("sha1-c22b5f9178342609428d6f51b2c5af4c0bde6a42")
-	if e, g := "/tmp/dir/partition/foo/sha1/c22/b5f", ds.blobDirectory("foo", br); e != g {
-		t.Errorf("amazon queue dir; expected path %q; got %q", e, g)
-	}
-
 }

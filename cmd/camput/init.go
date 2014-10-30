@@ -18,163 +18,166 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
-	"os/exec"
-	"path"
+	"path/filepath"
 
-	"camlistore.org/pkg/blobref"
-	"camlistore.org/pkg/client"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/client/android"
+	"camlistore.org/pkg/cmdmain"
 	"camlistore.org/pkg/jsonsign"
 	"camlistore.org/pkg/osutil"
+	"camlistore.org/pkg/types/clientconfig"
 )
 
 type initCmd struct {
-	gpgkey string
+	newKey     bool   // whether to create a new GPG ring and key.
+	noconfig   bool   // whether to generate a client config file.
+	keyId      string // GPG key ID to use.
+	secretRing string // GPG secret ring file to use.
 }
 
 func init() {
-	RegisterCommand("init", func(flags *flag.FlagSet) CommandRunner {
+	cmdmain.RegisterCommand("init", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		cmd := new(initCmd)
-		flags.StringVar(&cmd.gpgkey, "gpgkey", "", "GPG key to use for signing (overrides $GPGKEY environment)")
+		flags.BoolVar(&cmd.newKey, "newkey", false,
+			"Automatically generate a new identity in a new secret ring at the default location (~/.config/camlistore/identity-secring.gpg on linux).")
+		flags.StringVar(&cmd.keyId, "gpgkey", "", "GPG key ID to use for signing (overrides $GPGKEY environment)")
+		flags.BoolVar(&cmd.noconfig, "noconfig", false, "Stop after creating the public key blob, and do not try and create a config file.")
 		return cmd
 	})
 }
 
+func (c *initCmd) Describe() string {
+	return "Initialize the camput configuration file. With no option, it tries to use the GPG key found in the default identity secret ring."
+}
+
 func (c *initCmd) Usage() {
-	fmt.Fprintf(os.Stderr, `Usage: camput init [opts]
-
-Initialize the camput configuration file.
-
-`)
+	fmt.Fprintf(cmdmain.Stderr, "Usage: camput init [opts]")
 }
 
 func (c *initCmd) Examples() []string {
 	return []string{
 		"",
 		"--gpgkey=XXXXX",
+		"--newkey Creates a new identity",
 	}
 }
 
-func (c *initCmd) keyId() (string, error) {
-	if k := c.gpgkey; k != "" {
-		return k, nil
+// initSecretRing sets c.secretRing. It tries, in this order, the --secret-keyring flag,
+// the CAMLI_SECRET_RING env var, then defaults to the operating system dependent location
+// otherwise.
+// It returns an error if the file does not exist.
+func (c *initCmd) initSecretRing() error {
+	if secretRing, ok := osutil.ExplicitSecretRingFile(); ok {
+		c.secretRing = secretRing
+	} else {
+		if android.OnAndroid() {
+			panic("on android, so CAMLI_SECRET_RING should have been defined, or --secret-keyring used.")
+		}
+		c.secretRing = osutil.SecretRingFile()
+	}
+	if _, err := os.Stat(c.secretRing); err != nil {
+		hint := "\nA GPG key is required, please use 'camput init --newkey'.\n\nOr if you know what you're doing, you can set the global camput flag --secret-keyring, or the CAMLI_SECRET_RING env var, to use your own GPG ring. And --gpgkey=<pubid> or GPGKEY to select which key ID to use."
+		return fmt.Errorf("Could not use secret ring file %v: %v.\n%v", c.secretRing, err, hint)
+	}
+	return nil
+}
+
+// initKeyId sets c.keyId. It checks, in this order, the --gpgkey flag, the GPGKEY env var,
+// and in the default identity secret ring.
+func (c *initCmd) initKeyId() error {
+	if k := c.keyId; k != "" {
+		return nil
 	}
 	if k := os.Getenv("GPGKEY"); k != "" {
-		return k, nil
+		c.keyId = k
+		return nil
 	}
 
-	// TODO: move camlistored.go's keyIdFromRing into
-	// pkg/jsonsign/keys.go and use that (which looks for an
-	// identify file with exactly one identity)
-
-	// TODO: run and parse gpg --list-secret-keys and see if there's just one and suggest that?  Or show
-	// a list of them?
-	return "", errors.New("Initialization requires your public GPG key.  Set --gpgkey=<pubid> or set $GPGKEY in your environment.  Run gpg --list-secret-keys to find their key IDs.")
-}
-
-func (c *initCmd) getPublicKeyArmoredFromFile(secretRingFileName, keyId string) (b []byte, err error) {
-	entity, err := jsonsign.EntityFromSecring(keyId, secretRingFileName)
-	if err == nil {
-		pubArmor, err := jsonsign.ArmoredPublicKey(entity)
-		if err == nil {
-			return []byte(pubArmor), nil
-		}
-	}
-	b, err = exec.Command("gpg", "--export", "--armor", keyId).Output()
+	k, err := jsonsign.KeyIdFromRing(c.secretRing)
 	if err != nil {
-		return nil, fmt.Errorf("Error running gpg to export public key %q: %v", keyId, err)
+		hint := "You can set --gpgkey=<pubid> or the GPGKEY env var to select which key ID to use.\n"
+		return fmt.Errorf("No suitable gpg key was found in %v: %v.\n%v", c.secretRing, err, hint)
 	}
-	if len(b) == 0 {
-		return nil, fmt.Errorf("gpg export of public key %q was empty.", keyId)
-	}
-	return b, nil
+	c.keyId = k
+	log.Printf("Re-using identity with keyId %q found in file %s", c.keyId, c.secretRing)
+	return nil
 }
 
-func (c *initCmd) getPublicKeyArmored(keyId string) (b []byte, err error) {
-	files := []string{osutil.IdentitySecretRing(), jsonsign.DefaultSecRingPath()}
-	for _, file := range files {
-		b, err = c.getPublicKeyArmoredFromFile(file, keyId)
-		if err == nil {
-			return b, nil
-		}
+func (c *initCmd) getPublicKeyArmored() ([]byte, error) {
+	entity, err := jsonsign.EntityFromSecring(c.keyId, c.secretRing)
+	if err != nil {
+		return nil, fmt.Errorf("Could not find keyId %v in ring %v: %v", c.keyId, c.secretRing, err)
 	}
-	return nil, fmt.Errorf("failed to export armored public key ID %q from locations: %q", keyId, files)
+	pubArmor, err := jsonsign.ArmoredPublicKey(entity)
+	if err != nil {
+		return nil, fmt.Errorf("failed to export armored public key ID %q from %v: %v", c.keyId, c.secretRing, err)
+	}
+	return []byte(pubArmor), nil
 }
 
-func (c *initCmd) RunCommand(_ *Uploader, args []string) error {
+func (c *initCmd) RunCommand(args []string) error {
 	if len(args) > 0 {
-		return ErrUsage
+		return cmdmain.ErrUsage
 	}
 
-	blobDir := path.Join(osutil.CamliConfigDir(), "keyblobs")
-	os.Mkdir(osutil.CamliConfigDir(), 0700)
-	os.Mkdir(blobDir, 0700)
+	if c.newKey && c.keyId != "" {
+		log.Fatal("--newkey and --gpgkey are mutually exclusive")
+	}
 
-	keyId, err := c.keyId()
+	var err error
+	if c.newKey {
+		c.secretRing = osutil.DefaultSecretRingFile()
+		c.keyId, err = jsonsign.GenerateNewSecRing(c.secretRing)
+		if err != nil {
+			return err
+		}
+	} else {
+		if err := c.initSecretRing(); err != nil {
+			return err
+		}
+		if err := c.initKeyId(); err != nil {
+			return err
+		}
+	}
+
+	pubArmor, err := c.getPublicKeyArmored()
 	if err != nil {
 		return err
 	}
 
-	if os.Getenv("GPG_AGENT_INFO") == "" {
-		log.Printf("No GPG_AGENT_INFO found in environment; you should setup gnupg-agent.  camput might be annoying otherwise, if your private key is encrypted.")
-	}
-
-	pubArmor, err := c.getPublicKeyArmored(keyId)
-	if err != nil {
-		return err
-	}
-
-	bref := blobref.SHA1FromString(string(pubArmor))
-
-	keyBlobPath := path.Join(blobDir, bref.String()+".camli")
-	if err = ioutil.WriteFile(keyBlobPath, pubArmor, 0644); err != nil {
-		log.Fatalf("Error writing public key blob to %q: %v", keyBlobPath, err)
-	}
-
-	if ok, err := jsonsign.VerifyPublicKeyFile(keyBlobPath, keyId); !ok {
-		log.Fatalf("Error verifying public key at %q: %v", keyBlobPath, err)
-	}
+	bref := blob.SHA1FromString(string(pubArmor))
 
 	log.Printf("Your Camlistore identity (your GPG public key's blobref) is: %s", bref.String())
 
-	_, err = os.Stat(client.ConfigFilePath())
-	if err == nil {
-		log.Fatalf("Config file %q already exists; quitting without touching it.", client.ConfigFilePath())
+	if c.noconfig {
+		return nil
 	}
 
-	if f, err := os.OpenFile(client.ConfigFilePath(), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600); err == nil {
+	configFilePath := osutil.UserClientConfigPath()
+	_, err = os.Stat(configFilePath)
+	if err == nil {
+		log.Fatalf("Config file %q already exists; quitting without touching it.", configFilePath)
+	}
+	if err := os.MkdirAll(filepath.Dir(configFilePath), 0700); err != nil {
+		return err
+	}
+	if f, err := os.OpenFile(configFilePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600); err == nil {
 		defer f.Close()
-		m := make(map[string]interface{})
-		m["keyId"] = keyId                    // TODO(bradfitz): make this 'identity' to match server config?
-		m["publicKeyBlobref"] = bref.String() // TODO(bradfitz): not used anymore?
-		m["blobServer"] = "http://localhost:3179/"
-		m["selfPubKeyDir"] = blobDir
-		m["auth"] = "none"
-
-		blobPut := make([]map[string]string, 1)
-		blobPut[0] = map[string]string{
-			"alias":    "local",
-			"host":     "http://localhost:3179/",
-			"password": "",
+		m := &clientconfig.Config{
+			Servers: map[string]*clientconfig.Server{
+				"localhost": {
+					Server:    "http://localhost:3179",
+					IsDefault: true,
+					Auth:      "localhost",
+				},
+			},
+			Identity:     c.keyId,
+			IgnoredFiles: []string{".DS_Store"},
 		}
-		m["blobPut"] = blobPut
-
-		blobGet := make([]map[string]string, 2)
-		blobGet[0] = map[string]string{
-			"alias": "keyblobs",
-			"path":  blobDir,
-		}
-		blobGet[1] = map[string]string{
-			"alias":    "local",
-			"host":     "http://localhost:3179/",
-			"password": "",
-		}
-		m["blobGet"] = blobGet
 
 		jsonBytes, err := json.MarshalIndent(m, "", "  ")
 		if err != nil {
@@ -182,9 +185,11 @@ func (c *initCmd) RunCommand(_ *Uploader, args []string) error {
 		}
 		_, err = f.Write(jsonBytes)
 		if err != nil {
-			log.Fatalf("Error writing to %q: %v", client.ConfigFilePath(), err)
+			log.Fatalf("Error writing to %q: %v", configFilePath, err)
 		}
-		log.Printf("Wrote %q; modify as necessary.", client.ConfigFilePath())
+		log.Printf("Wrote %q; modify as necessary.", configFilePath)
+	} else {
+		return fmt.Errorf("could not write client config file %v: %v", configFilePath, err)
 	}
 	return nil
 }

@@ -24,20 +24,21 @@ import (
 	"time"
 
 	"camlistore.org/pkg/client"
+	"camlistore.org/pkg/cmdmain"
 	"camlistore.org/pkg/schema"
 )
 
 type permanodeCmd struct {
-	name    string
+	title   string
 	tag     string
 	key     string // else random
 	sigTime string
 }
 
 func init() {
-	RegisterCommand("permanode", func(flags *flag.FlagSet) CommandRunner {
+	cmdmain.RegisterCommand("permanode", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		cmd := new(permanodeCmd)
-		flags.StringVar(&cmd.name, "name", "", "Optional name attribute to set on new permanode")
+		flags.StringVar(&cmd.title, "title", "", "Optional 'title' attribute to set on new permanode")
 		flags.StringVar(&cmd.tag, "tag", "", "Optional tag(s) to set on new permanode; comma separated.")
 		flags.StringVar(&cmd.key, "key", "", "Optional key to create deterministic ('planned') permanodes. Must also use --sigtime.")
 		flags.StringVar(&cmd.sigTime, "sigtime", "", "Optional time to put in the OpenPGP signature packet instead of the current time. Required when producing a deterministic permanode (with --key). In format YYYY-MM-DD HH:MM:SS")
@@ -45,8 +46,12 @@ func init() {
 	})
 }
 
+func (c *permanodeCmd) Describe() string {
+	return "Create and upload a permanode."
+}
+
 func (c *permanodeCmd) Usage() {
-	errf("Usage: camput [globalopts] permanode [permanodeopts]\n")
+	cmdmain.Errorf("Usage: camput [globalopts] permanode [permanodeopts]\n")
 }
 
 func (c *permanodeCmd) Examples() []string {
@@ -56,7 +61,7 @@ func (c *permanodeCmd) Examples() []string {
 	}
 }
 
-func (c *permanodeCmd) RunCommand(up *Uploader, args []string) error {
+func (c *permanodeCmd) RunCommand(args []string) error {
 	if len(args) > 0 {
 		return errors.New("Permanode command doesn't take any additional arguments")
 	}
@@ -64,6 +69,7 @@ func (c *permanodeCmd) RunCommand(up *Uploader, args []string) error {
 	var (
 		permaNode *client.PutResult
 		err       error
+		up        = getUploader()
 	)
 	if (c.key != "") != (c.sigTime != "") {
 		return errors.New("Both --key and --sigtime must be used to produce deterministic permanodes.")
@@ -83,8 +89,8 @@ func (c *permanodeCmd) RunCommand(up *Uploader, args []string) error {
 		return err
 	}
 
-	if c.name != "" {
-		put, err := up.UploadAndSignMap(schema.NewSetAttributeClaim(permaNode.BlobRef, "title", c.name))
+	if c.title != "" {
+		put, err := up.UploadAndSignBlob(schema.NewSetAttributeClaim(permaNode.BlobRef, "title", c.title))
 		handleResult("claim-permanode-title", put, err)
 	}
 	if c.tag != "" {
@@ -92,7 +98,7 @@ func (c *permanodeCmd) RunCommand(up *Uploader, args []string) error {
 		m := schema.NewSetAttributeClaim(permaNode.BlobRef, "tag", tags[0])
 		for _, tag := range tags {
 			m = schema.NewAddAttributeClaim(permaNode.BlobRef, "tag", tag)
-			put, err := up.UploadAndSignMap(m)
+			put, err := up.UploadAndSignBlob(m)
 			handleResult("claim-permanode-tag", put, err)
 		}
 	}

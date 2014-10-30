@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package sqlindex implements the sorted.KeyValue interface using an *sql.DB.
 package sqlindex
 
 import (
@@ -21,44 +22,97 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strconv"
+	"regexp"
+	"sync"
 
-	"camlistore.org/pkg/index"
+	"camlistore.org/pkg/leak"
+	"camlistore.org/pkg/sorted"
 )
 
+// Storage implements the sorted.KeyValue interface using an *sql.DB.
 type Storage struct {
 	DB *sql.DB
+
+	// SetFunc is an optional func to use when REPLACE INTO does not exist
+	SetFunc      func(*sql.DB, string, string) error
+	BatchSetFunc func(*sql.Tx, string, string) error
+
+	// PlaceHolderFunc optionally replaces ? placeholders with the right ones for the rdbms
+	// in use
+	PlaceHolderFunc func(string) string
+
+	// Serial determines whether a Go-level mutex protects DB from
+	// concurrent access.  This isn't perfect and exists just for
+	// SQLite, whose driver likes to return "the database is
+	// locked" (camlistore.org/issue/114), so this keeps some
+	// pressure off. But we still trust SQLite to deal with
+	// concurrency in most cases.
+	Serial bool
+
+	mu sync.Mutex // the mutex used, if Serial is set
+}
+
+func (s *Storage) sql(v string) string {
+	if f := s.PlaceHolderFunc; f != nil {
+		return f(v)
+	}
+	return v
 }
 
 type batchTx struct {
 	tx  *sql.Tx
 	err error // sticky
+
+	// SetFunc is an optional func to use when REPLACE INTO does not exist
+	SetFunc func(*sql.Tx, string, string) error
+
+	// PlaceHolderFunc optionally replaces ? placeholders with the right ones for the rdbms
+	// in use
+	PlaceHolderFunc func(string) string
+}
+
+func (b *batchTx) sql(v string) string {
+	if f := b.PlaceHolderFunc; f != nil {
+		return f(v)
+	}
+	return v
 }
 
 func (b *batchTx) Set(key, value string) {
 	if b.err != nil {
 		return
 	}
-	_, b.err = b.tx.Exec("REPLACE INTO rows (k, v) VALUES (?, ?)", key, value)
+	if b.SetFunc != nil {
+		b.err = b.SetFunc(b.tx, key, value)
+		return
+	}
+	_, b.err = b.tx.Exec(b.sql("REPLACE INTO rows (k, v) VALUES (?, ?)"), key, value)
 }
 
 func (b *batchTx) Delete(key string) {
 	if b.err != nil {
 		return
 	}
-	_, b.err = b.tx.Exec("DELETE FROM rows WHERE k=?", key)
+	_, b.err = b.tx.Exec(b.sql("DELETE FROM rows WHERE k=?"), key)
 }
 
-func (s *Storage) BeginBatch() index.BatchMutation {
-
+func (s *Storage) BeginBatch() sorted.BatchMutation {
+	if s.Serial {
+		s.mu.Lock()
+	}
 	tx, err := s.DB.Begin()
 	return &batchTx{
-		tx:  tx,
-		err: err,
+		tx:              tx,
+		err:             err,
+		SetFunc:         s.BatchSetFunc,
+		PlaceHolderFunc: s.PlaceHolderFunc,
 	}
 }
 
-func (s *Storage) CommitBatch(b index.BatchMutation) error {
+func (s *Storage) CommitBatch(b sorted.BatchMutation) error {
+	if s.Serial {
+		defer s.mu.Unlock()
+	}
 	bt, ok := b.(*batchTx)
 	if !ok {
 		return fmt.Errorf("wrong BatchMutation type %T", b)
@@ -70,55 +124,109 @@ func (s *Storage) CommitBatch(b index.BatchMutation) error {
 }
 
 func (s *Storage) Get(key string) (value string, err error) {
-	err = s.DB.QueryRow("SELECT v FROM rows WHERE k=?", key).Scan(&value)
+	if s.Serial {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+	}
+	err = s.DB.QueryRow(s.sql("SELECT v FROM rows WHERE k=?"), key).Scan(&value)
 	if err == sql.ErrNoRows {
-		err = index.ErrNotFound
+		err = sorted.ErrNotFound
 	}
 	return
 }
 
 func (s *Storage) Set(key, value string) error {
-	_, err := s.DB.Exec("REPLACE INTO rows (k, v) VALUES (?, ?)", key, value)
+	if s.Serial {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+	}
+	if s.SetFunc != nil {
+		return s.SetFunc(s.DB, key, value)
+	}
+	_, err := s.DB.Exec(s.sql("REPLACE INTO rows (k, v) VALUES (?, ?)"), key, value)
 	return err
 }
 
 func (s *Storage) Delete(key string) error {
-	_, err := s.DB.Exec("DELETE FROM rows WHERE k=?", key)
+	if s.Serial {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+	}
+	_, err := s.DB.Exec(s.sql("DELETE FROM rows WHERE k=?"), key)
 	return err
 }
 
-func (s *Storage) Find(key string) index.Iterator {
-	return &iter{
-		s:   s,
-		low: key,
-		op:  ">=",
+func (s *Storage) Close() error { return s.DB.Close() }
+
+func (s *Storage) Find(start, end string) sorted.Iterator {
+	if s.Serial {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 	}
+	var rows *sql.Rows
+	var err error
+	if end == "" {
+		rows, err = s.DB.Query(s.sql("SELECT k, v FROM rows WHERE k >= ? ORDER BY k "), start)
+	} else {
+		rows, err = s.DB.Query(s.sql("SELECT k, v FROM rows WHERE k >= ? AND k < ? ORDER BY k "), start, end)
+	}
+	if err != nil {
+		log.Printf("unexpected query error: %v", err)
+		return &iter{err: err}
+	}
+
+	it := &iter{
+		s:          s,
+		rows:       rows,
+		closeCheck: leak.NewChecker(),
+	}
+	return it
 }
+
+var wordThenPunct = regexp.MustCompile(`^\w+\W$`)
 
 // iter is a iterator over sorted key/value pairs in rows.
 type iter struct {
 	s   *Storage
-	low string
-	op  string // ">=" initially, then ">"
+	end string // optional end bound
 	err error  // accumulated error, returned at Close
+
+	closeCheck *leak.Checker
 
 	rows *sql.Rows // if non-nil, the rows we're reading from
 
-	batchSize int // how big our LIMIT query was
-	seen      int // how many rows we've seen this query
-
-	key   string
-	value string
+	key        sql.RawBytes
+	val        sql.RawBytes
+	skey, sval *string // if non-nil, it's been stringified
 }
 
-var errClosed = errors.New("mysqlindexer: Iterator already closed")
+var errClosed = errors.New("sqlkv: Iterator already closed")
 
-func (t *iter) Key() string   { return t.key }
-func (t *iter) Value() string { return t.value }
+func (t *iter) KeyBytes() []byte { return t.key }
+func (t *iter) Key() string {
+	if t.skey != nil {
+		return *t.skey
+	}
+	str := string(t.key)
+	t.skey = &str
+	return str
+}
+
+func (t *iter) ValueBytes() []byte { return t.val }
+func (t *iter) Value() string {
+	if t.sval != nil {
+		return *t.sval
+	}
+	str := string(t.val)
+	t.sval = &str
+	return str
+}
 
 func (t *iter) Close() error {
+	t.closeCheck.Close()
 	if t.rows != nil {
 		t.rows.Close()
+		t.rows = nil
 	}
 	err := t.err
 	t.err = errClosed
@@ -129,32 +237,14 @@ func (t *iter) Next() bool {
 	if t.err != nil {
 		return false
 	}
-	if t.rows == nil {
-		const batchSize = 50
-		t.batchSize = batchSize
-		t.rows, t.err = t.s.DB.Query(
-			"SELECT k, v FROM rows WHERE k "+t.op+" ? ORDER BY k LIMIT "+strconv.Itoa(batchSize),
-			t.low)
-		if t.err != nil {
-			log.Printf("unexpected query error: %v", t.err)
-			return false
-		}
-		t.seen = 0
-		t.op = ">"
-	}
+	t.skey, t.sval = nil, nil
 	if !t.rows.Next() {
-		if t.seen == t.batchSize {
-			t.rows = nil
-			return t.Next()
-		}
 		return false
 	}
-	t.err = t.rows.Scan(&t.key, &t.value)
+	t.err = t.rows.Scan(&t.key, &t.val)
 	if t.err != nil {
 		log.Printf("unexpected Scan error: %v", t.err)
 		return false
 	}
-	t.low = t.key
-	t.seen++
 	return true
 }

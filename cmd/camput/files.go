@@ -17,7 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"bufio"
 	"crypto/sha1"
+	"errors"
 	"flag"
 	"fmt"
 	"hash"
@@ -28,96 +30,147 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/remote"
+	statspkg "camlistore.org/pkg/blobserver/stats"
 	"camlistore.org/pkg/client"
+	"camlistore.org/pkg/client/android"
+	"camlistore.org/pkg/cmdmain"
 	"camlistore.org/pkg/schema"
-
-	"camlistore.org/third_party/github.com/mpl/histo"
 )
 
 type fileCmd struct {
-	name string
-	tag  string
+	title string
+	tag   string
 
-	makePermanode  bool // make new, unique permanode of the root (dir or file)
-	filePermanodes bool // make planned permanodes for each file (based on their digest)
-	rollSplits     bool
-	diskUsage      bool // show "du" disk usage only (dry run mode), don't actually upload
+	makePermanode     bool // make new, unique permanode of the root (dir or file)
+	filePermanodes    bool // make planned permanodes for each file (based on their digest)
+	vivify            bool
+	exifTime          bool // use metadata (such as in EXIF) to find the creation time of the file
+	capCtime          bool // use mtime as creation time of the file, if it would be bigger than modification time
+	diskUsage         bool // show "du" disk usage only (dry run mode), don't actually upload
+	argsFromInput     bool // Android mode: filenames piped into stdin, one at a time.
+	deleteAfterUpload bool // with fileNodes, deletes the input file once uploaded
 
-	havecache, statcache bool
+	statcache bool
 
 	// Go into in-memory stats mode only; doesn't actually upload.
 	memstats bool
 	histo    string // optional histogram output filename
 }
 
+var flagUseSQLiteChildCache bool // Use sqlite for the statcache and havecache.
+
+var (
+	uploadWorkers    = 5 // concurrent upload workers (negative means unbounded: memory hog)
+	dirUploadWorkers = 3 // concurrent directory uploading workers
+	statCacheWorkers = 5 // concurrent statcache workers
+)
+
 func init() {
-	RegisterCommand("file", func(flags *flag.FlagSet) CommandRunner {
+	cmdmain.RegisterCommand("file", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		cmd := new(fileCmd)
 		flags.BoolVar(&cmd.makePermanode, "permanode", false, "Create an associate a new permanode for the uploaded file or directory.")
 		flags.BoolVar(&cmd.filePermanodes, "filenodes", false, "Create (if necessary) content-based permanodes for each uploaded file.")
-		flags.StringVar(&cmd.name, "name", "", "Optional name attribute to set on permanode when using -permanode.")
-		flags.StringVar(&cmd.tag, "tag", "", "Optional tag(s) to set on permanode when using -permanode. Single value or comma separated.")
+		flags.BoolVar(&cmd.deleteAfterUpload, "delete_after_upload", false, "If using -filenodes, deletes files once they're uploaded, of if they've already been uploaded.")
+		flags.BoolVar(&cmd.vivify, "vivify", false,
+			"If true, ask the server to create and sign permanode(s) associated with each uploaded"+
+				" file. This permits the server to have your signing key. Used mostly with untrusted"+
+				" or at-risk clients, such as phones.")
+		flags.BoolVar(&cmd.exifTime, "exiftime", false, "Try to use metadata (such as EXIF) to get a stable creation time. If found, used as the replacement for the modtime. Mainly useful with vivify or filenodes.")
+		flags.StringVar(&cmd.title, "title", "", "Optional title attribute to set on permanode when using -permanode.")
+		flags.StringVar(&cmd.tag, "tag", "", "Optional tag(s) to set on permanode when using -permanode or -filenodes. Single value or comma separated.")
 
-		flags.BoolVar(&cmd.statcache, "statcache", false, "Use the stat cache, assuming unchanged files already uploaded in the past are still there. Fast, but potentially dangerous.")
-		flags.BoolVar(&cmd.havecache, "havecache", false, "Use the 'have cache', a cache keeping track of what blobs the remote server should already have from previous uploads.")
-		flags.BoolVar(&cmd.rollSplits, "rolling", false, "Use rolling checksum file splits.")
-		flags.BoolVar(&cmd.memstats, "debug-memstats", false, "Enter debug in-memory mode; collecting stats only. Doesn't upload anything.")
 		flags.BoolVar(&cmd.diskUsage, "du", false, "Dry run mode: only show disk usage information, without upload or statting dest. Used for testing skipDirs configs, mostly.")
-		flags.StringVar(&cmd.histo, "debug-histogram-file", "", "File where to print the histogram of the blob sizes. Requires debug-memstats.")
 
+		if debug, _ := strconv.ParseBool(os.Getenv("CAMLI_DEBUG")); debug {
+			flags.BoolVar(&cmd.statcache, "statcache", true, "Use the stat cache, assuming unchanged files already uploaded in the past are still there. Fast, but potentially dangerous.")
+			flags.BoolVar(&cmd.memstats, "debug-memstats", false, "Enter debug in-memory mode; collecting stats only. Doesn't upload anything.")
+			flags.StringVar(&cmd.histo, "debug-histogram-file", "", "Optional file to create and write the blob size for each file uploaded.  For use with GNU R and hist(read.table(\"filename\")$V1). Requires debug-memstats.")
+			flags.BoolVar(&cmd.capCtime, "capctime", false, "For file blobs use file modification time as creation time if it would be bigger (newer) than modification time. For stable filenode creation (you can forge mtime, but can't forge ctime).")
+			flags.BoolVar(&flagUseSQLiteChildCache, "sqlitecache", false, "Use sqlite for the statcache and havecache instead of a flat cache.")
+		} else {
+			cmd.statcache = true
+		}
+		if android.IsChild() {
+			flags.BoolVar(&cmd.argsFromInput, "stdinargs", false, "If true, filenames to upload are sent one-per-line on stdin. EOF means to quit the process with exit status 0.")
+			// limit number of goroutines to limit memory
+			uploadWorkers = 2
+			dirUploadWorkers = 2
+			statCacheWorkers = 2
+		}
 		flagCacheLog = flags.Bool("logcache", false, "log caching details")
 
 		return cmd
 	})
 }
 
+func (c *fileCmd) Describe() string {
+	return "Upload file(s)."
+}
+
 func (c *fileCmd) Usage() {
-	fmt.Fprintf(os.Stderr, "Usage: camput [globalopts] file [fileopts] <file/director(ies)>\n")
+	fmt.Fprintf(cmdmain.Stderr, "Usage: camput [globalopts] file [fileopts] <file/director(ies)>\n")
 }
 
 func (c *fileCmd) Examples() []string {
 	return []string{
 		"[opts] <file(s)/director(ies)",
-		"--permanode --name='Homedir backup' --tag=backup,homedir $HOME",
+		"--permanode --title='Homedir backup' --tag=backup,homedir $HOME",
+		"--filenodes /mnt/camera/DCIM",
 	}
 }
 
-func (c *fileCmd) RunCommand(up *Uploader, args []string) error {
-	if len(args) == 0 {
-		return UsageError("No files or directories given.")
+func (c *fileCmd) RunCommand(args []string) error {
+	if c.vivify {
+		if c.makePermanode || c.filePermanodes || c.tag != "" || c.title != "" {
+			return cmdmain.UsageError("--vivify excludes any other option")
+		}
 	}
-	if c.name != "" && !c.makePermanode {
-		return UsageError("Can't set name without using --permanode")
+	if c.title != "" && !c.makePermanode {
+		return cmdmain.UsageError("Can't set title without using --permanode")
 	}
-	if c.tag != "" && !c.makePermanode {
-		return UsageError("Can't set tag without using --permanode")
+	if c.tag != "" && !c.makePermanode && !c.filePermanodes {
+		return cmdmain.UsageError("Can't set tag without using --permanode or --filenodes")
 	}
 	if c.histo != "" && !c.memstats {
-		return UsageError("Can't use histo without memstats")
+		return cmdmain.UsageError("Can't use histo without memstats")
 	}
+	if c.deleteAfterUpload && !c.filePermanodes {
+		return cmdmain.UsageError("Can't set use --delete_after_upload without --filenodes")
+	}
+	// TODO(mpl): do it for other modes too. Or even better, do it once for all modes.
+	if *cmdmain.FlagVerbose {
+		log.SetOutput(cmdmain.Stderr)
+	} else {
+		log.SetOutput(ioutil.Discard)
+	}
+	up := getUploader()
 	if c.memstats {
-		sr := new(statsStatReceiver)
-		if c.histo != "" {
-			num := 100
-			sr.histo = histo.NewHisto(num)
-		}
+		sr := new(statspkg.Receiver)
 		up.altStatReceiver = sr
-		defer func() { sr.DumpStats(c.histo) }()
+		defer func() { DumpStats(sr, c.histo) }()
 	}
-	if c.statcache {
-		cache := NewFlatStatCache()
-		up.statCache = cache
+	c.initCaches(up)
+
+	if c.makePermanode || c.filePermanodes {
+		testSigBlobRef := up.Client.SignerPublicKeyBlobref()
+		if !testSigBlobRef.Valid() {
+			return cmdmain.UsageError("A GPG key is needed to create permanodes; configure one or use vivify mode.")
+		}
 	}
-	if c.havecache {
-		cache := NewFlatHaveCache()
-		up.haveCache = cache
+	up.fileOpts = &fileOptions{
+		permanode: c.filePermanodes,
+		tag:       c.tag,
+		vivify:    c.vivify,
+		exifTime:  c.exifTime,
+		capCtime:  c.capCtime,
 	}
 
 	var (
@@ -148,7 +201,6 @@ func (c *fileCmd) RunCommand(up *Uploader, args []string) error {
 		}
 		t := up.NewTreeUpload(dir)
 		t.DiskUsageMode = true
-		t.FilePermanodes = c.filePermanodes
 		t.Start()
 		pr, err := t.Wait()
 		if err != nil {
@@ -157,43 +209,82 @@ func (c *fileCmd) RunCommand(up *Uploader, args []string) error {
 		handleResult("tree-upload", pr, err)
 		return nil
 	}
-	if c.rollSplits {
-		up.rollSplits = true
+	if c.argsFromInput {
+		if len(args) > 0 {
+			return errors.New("args not supported with -argsfrominput")
+		}
+		tu := up.NewRootlessTreeUpload()
+		tu.Start()
+		br := bufio.NewReader(os.Stdin)
+		for {
+			path, err := br.ReadString('\n')
+			if path = strings.TrimSpace(path); path != "" {
+				tu.Enqueue(path)
+			}
+			if err == io.EOF {
+				android.PreExit()
+				os.Exit(0)
+			}
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
 	}
 
+	if len(args) == 0 {
+		return cmdmain.UsageError("No files or directories given.")
+	}
+	if up.statCache != nil {
+		defer up.statCache.Close()
+	}
 	for _, filename := range args {
 		fi, err := os.Stat(filename)
 		if err != nil {
 			return err
 		}
+		// Skip ignored files or base directories.  Failing to skip the
+		// latter results in a panic.
+		if up.Client.IsIgnoredFile(filename) {
+			log.Printf("Client configured to ignore %s; skipping.", filename)
+			continue
+		}
 		if fi.IsDir() {
+			if up.fileOpts.wantVivify() {
+				vlog.Printf("Directories not supported in vivify mode; skipping %v\n", filename)
+				continue
+			}
 			t := up.NewTreeUpload(filename)
-			t.FilePermanodes = c.filePermanodes
 			t.Start()
 			lastPut, err = t.Wait()
 		} else {
 			lastPut, err = up.UploadFile(filename)
+			if err == nil && c.deleteAfterUpload {
+				if err := os.Remove(filename); err != nil {
+					log.Printf("Error deleting %v: %v", filename, err)
+				} else {
+					log.Printf("Deleted %v", filename)
+				}
+			}
 		}
 		if handleResult("file", lastPut, err) != nil {
 			return err
 		}
 	}
 
-	if permaNode != nil {
-		put, err := up.UploadAndSignMap(schema.NewSetAttributeClaim(permaNode.BlobRef, "camliContent", lastPut.BlobRef.String()))
+	if permaNode != nil && lastPut != nil {
+		put, err := up.UploadAndSignBlob(schema.NewSetAttributeClaim(permaNode.BlobRef, "camliContent", lastPut.BlobRef.String()))
 		if handleResult("claim-permanode-content", put, err) != nil {
 			return err
 		}
-		if c.name != "" {
-			put, err := up.UploadAndSignMap(schema.NewSetAttributeClaim(permaNode.BlobRef, "name", c.name))
-			handleResult("claim-permanode-name", put, err)
+		if c.title != "" {
+			put, err := up.UploadAndSignBlob(schema.NewSetAttributeClaim(permaNode.BlobRef, "title", c.title))
+			handleResult("claim-permanode-title", put, err)
 		}
 		if c.tag != "" {
 			tags := strings.Split(c.tag, ",")
-			m := schema.NewSetAttributeClaim(permaNode.BlobRef, "tag", tags[0])
 			for _, tag := range tags {
-				m = schema.NewAddAttributeClaim(permaNode.BlobRef, "tag", tag)
-				put, err := up.UploadAndSignMap(m)
+				m := schema.NewAddAttributeClaim(permaNode.BlobRef, "tag", tag)
+				put, err := up.UploadAndSignBlob(m)
 				handleResult("claim-permanode-tag", put, err)
 			}
 		}
@@ -202,73 +293,40 @@ func (c *fileCmd) RunCommand(up *Uploader, args []string) error {
 	return nil
 }
 
-// statsStatReceiver is a dummy blobserver.StatReceiver that doesn't store anything;
-// it just collects statistics.
-type statsStatReceiver struct {
-	mu    sync.Mutex
-	have  map[string]int64
-	histo *histo.Histo
-}
-
-func (sr *statsStatReceiver) lock() {
-	sr.mu.Lock()
-	if sr.have == nil {
-		sr.have = make(map[string]int64)
+func (c *fileCmd) initCaches(up *Uploader) {
+	if !c.statcache || *flagBlobDir != "" {
+		return
 	}
-}
-
-func (sr *statsStatReceiver) ReceiveBlob(blob *blobref.BlobRef, source io.Reader) (sb blobref.SizedBlobRef, err error) {
-	n, err := io.Copy(ioutil.Discard, source)
+	gen, err := up.StorageGeneration()
 	if err != nil {
+		log.Printf("WARNING: not using local caches; failed to retrieve server's storage generation: %v", err)
 		return
 	}
-	sr.lock()
-	defer sr.mu.Unlock()
-	sr.have[blob.String()] = n
-	if sr.histo != nil {
-		sr.histo.Add(n)
-	}
-	return blobref.SizedBlobRef{blob, n}, nil
-}
-
-func (sr *statsStatReceiver) StatBlobs(dest chan<- blobref.SizedBlobRef, blobs []*blobref.BlobRef, _ time.Duration) error {
-	sr.lock()
-	defer sr.mu.Unlock()
-	for _, br := range blobs {
-		if size, ok := sr.have[br.String()]; ok {
-			dest <- blobref.SizedBlobRef{br, size}
-		}
-	}
-	return nil
-}
-
-func (sr *statsStatReceiver) DumpStats(histo string) {
-	sr.lock()
-	defer sr.mu.Unlock()
-
-	var sum int64
-	for _, size := range sr.have {
-		sum += size
-	}
-	fmt.Printf("In-memory blob stats: %d blobs, %d bytes\n", len(sr.have), sum)
-	if histo != "" {
-		sr.bsHisto(histo)
+	if c.statcache {
+		up.statCache = NewKvStatCache(gen)
 	}
 }
 
-func (sr *statsStatReceiver) bsHisto(file string) {
-	bars := sr.histo.Bars()
-	if bars == nil {
-		return
-	}
-	f, err := os.Create(file)
+// DumpStats creates the destFile and writes a line per received blob,
+// with its blob size.
+func DumpStats(sr *statspkg.Receiver, destFile string) {
+	sr.Lock()
+	defer sr.Unlock()
+
+	f, err := os.Create(destFile)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
 
-	for _, hb := range bars {
-		fmt.Fprintf(f, "%d	%d\n", hb.Value, hb.Count)
+	var sum int64
+	for _, size := range sr.Have {
+		fmt.Fprintf(f, "%d\n", size)
+	}
+	fmt.Printf("In-memory blob stats: %d blobs, %d bytes\n", len(sr.Have), sum)
+
+	err = f.Close()
+	if err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -281,15 +339,6 @@ func (s *stats) incr(n *node) {
 	if !n.fi.IsDir() {
 		s.bytes += n.fi.Size()
 	}
-}
-
-// UploadCache is the "stat cache" for regular files.  Given a current
-// working directory, possibly relative filename, and stat info,
-// returns what the ultimate put result (the top-level "file" schema
-// blob) for that regular file was.
-type UploadCache interface {
-	CachedPutResult(pwd, filename string, fi os.FileInfo) (*client.PutResult, error)
-	AddCachedPutResult(pwd, filename string, fi os.FileInfo, pr *client.PutResult)
 }
 
 func (up *Uploader) lstat(path string) (os.FileInfo, error) {
@@ -316,13 +365,25 @@ func (up *Uploader) open(path string) (http.File, error) {
 	return up.fs.Open(path)
 }
 
+func (n *node) directoryStaticSet() (*schema.StaticSet, error) {
+	ss := new(schema.StaticSet)
+	for _, c := range n.children {
+		pr, err := c.PutResult()
+		if err != nil {
+			return nil, fmt.Errorf("Error populating directory static set for child %q: %v", c.fullPath, err)
+		}
+		ss.Add(pr.BlobRef)
+	}
+	return ss, nil
+}
+
 func (up *Uploader) uploadNode(n *node) (*client.PutResult, error) {
 	fi := n.fi
 	mode := fi.Mode()
 	if mode&os.ModeType == 0 {
 		return up.uploadNodeRegularFile(n)
 	}
-	m := schema.NewCommonFileMap(n.fullPath, fi)
+	bb := schema.NewCommonFileMap(n.fullPath, fi)
 	switch {
 	case mode&os.ModeSymlink != 0:
 		// TODO(bradfitz): use VFS here; not os.Readlink
@@ -330,94 +391,260 @@ func (up *Uploader) uploadNode(n *node) (*client.PutResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		m.SetSymlinkTarget(target)
+		bb.SetSymlinkTarget(target)
 	case mode&os.ModeDevice != 0:
 		// including mode & os.ModeCharDevice
 		fallthrough
 	case mode&os.ModeSocket != 0:
-		fallthrough
-	case mode&os.ModeNamedPipe != 0: // FIFO
-		fallthrough
+		bb.SetType("socket")
+	case mode&os.ModeNamedPipe != 0: // fifo
+		bb.SetType("fifo")
 	default:
-		return nil, schema.ErrUnimplemented
+		return nil, fmt.Errorf("camput.files: unsupported file type %v for file %v", mode, n.fullPath)
 	case fi.IsDir():
-		ss := new(schema.StaticSet)
-		for _, c := range n.children {
-			pr, err := c.PutResult()
-			if err != nil {
-				return nil, fmt.Errorf("Error populating directory static set for child %q: %v", c.fullPath, err)
-			}
-			ss.Add(pr.BlobRef)
-		}
-		sspr, err := up.UploadMap(ss.Map())
+		ss, err := n.directoryStaticSet()
 		if err != nil {
 			return nil, err
 		}
-		schema.PopulateDirectoryMap(m, sspr.BlobRef)
+		sspr, err := up.UploadBlob(ss)
+		if err != nil {
+			return nil, err
+		}
+		bb.PopulateDirectoryMap(sspr.BlobRef)
 	}
 
-	mappr, err := up.UploadMap(m)
+	mappr, err := up.UploadBlob(bb)
 	if err == nil {
 		if !mappr.Skipped {
-			vlog.Printf("Uploaded %q, %s for %s", m["camliType"], mappr.BlobRef, n.fullPath)
+			vlog.Printf("Uploaded %q, %s for %s", bb.Type(), mappr.BlobRef, n.fullPath)
 		}
 	} else {
-		vlog.Printf("Error uploading map %v: %v", m, err)
+		vlog.Printf("Error uploading map for %s (%s, %s): %v", n.fullPath, bb.Type(), bb.Blob().BlobRef(), err)
 	}
 	return mappr, err
 
 }
 
 // statReceiver returns the StatReceiver used for checking for and uploading blobs.
-func (up *Uploader) statReceiver() blobserver.StatReceiver {
+//
+// The optional provided node is only used for conditionally printing out status info to stdout.
+func (up *Uploader) statReceiver(n *node) blobserver.StatReceiver {
 	statReceiver := up.altStatReceiver
 	if statReceiver == nil {
-		// TODO(bradfitz): just make Client be a
-		// StatReceiver? move remote's ReceiveBlob ->
-		// Upload wrapper into Client itself?
-		statReceiver = remote.NewFromClient(up.Client)
+		// TODO(mpl): simplify the altStatReceiver situation as well,
+		// see TODO in cmd/camput/uploader.go
+		statReceiver = up.Client
+	}
+	if android.IsChild() && n != nil && n.fi.Mode()&os.ModeType == 0 {
+		return android.StatusReceiver{Sr: statReceiver, Path: n.fullPath}
 	}
 	return statReceiver
 }
 
-// fileWriterFunc returns the file chunking algorithm to use.
-func (up *Uploader) fileWriterFunc() func(blobserver.StatReceiver, schema.Map, io.Reader) (*blobref.BlobRef, error) {
-	if up.rollSplits {
-		return schema.WriteFileMapRolling
+func (up *Uploader) noStatReceiver(r blobserver.BlobReceiver) blobserver.StatReceiver {
+	return noStatReceiver{r}
+}
+
+// A haveCacheStatReceiver relays Receive calls to the embedded
+// BlobReceiver and treats all Stat calls like the blob doesn't exist.
+//
+// This is used by the client once it's already asked the server that
+// it doesn't have the whole file in some chunk layout already, so we
+// know we're just writing new stuff. For resuming in the middle of
+// larger uploads, it turns out that the pkg/client.Client.Upload
+// already checks the have cache anyway, so going right to mid-chunk
+// receives is fine.
+//
+// TODO(bradfitz): this probabaly all needs an audit/rationalization/tests
+// to make sure all the players are agreeing on the responsibilities.
+// And maybe the Android stats are wrong, too. (see pkg/client/android's
+// StatReceiver)
+type noStatReceiver struct {
+	blobserver.BlobReceiver
+}
+
+func (noStatReceiver) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
+	return nil
+}
+
+var atomicDigestOps int64 // number of files digested
+
+// wholeFileDigest returns the sha1 digest of the regular file's absolute
+// path given in fullPath.
+func (up *Uploader) wholeFileDigest(fullPath string) (blob.Ref, error) {
+	// TODO(bradfitz): cache this.
+	file, err := up.open(fullPath)
+	if err != nil {
+		return blob.Ref{}, err
 	}
-	return schema.WriteFileMap
+	defer file.Close()
+	td := &trackDigestReader{r: file}
+	_, err = io.Copy(ioutil.Discard, td)
+	atomic.AddInt64(&atomicDigestOps, 1)
+	if err != nil {
+		return blob.Ref{}, err
+	}
+	return blob.MustParse(td.Sum()), nil
+}
+
+var noDupSearch, _ = strconv.ParseBool(os.Getenv("CAMLI_NO_FILE_DUP_SEARCH"))
+
+// fileMapFromDuplicate queries the server's search interface for an
+// existing file with an entire contents of sum (a blobref string).
+// If the server has it, it's validated, and then fileMap (which must
+// already be partially populated) has its "parts" field populated,
+// and then fileMap is uploaded (if necessary) and a PutResult with
+// its blobref is returned. If there's any problem, or a dup doesn't
+// exist, ok is false.
+// If required, Vivify is also done here.
+func (up *Uploader) fileMapFromDuplicate(bs blobserver.StatReceiver, fileMap *schema.Builder, sum string) (pr *client.PutResult, ok bool) {
+	if noDupSearch {
+		return
+	}
+	_, err := up.Client.SearchRoot()
+	if err != nil {
+		return
+	}
+	dupFileRef, err := up.Client.SearchExistingFileSchema(blob.MustParse(sum))
+	if err != nil {
+		log.Printf("Warning: error searching for already-uploaded copy of %s: %v", sum, err)
+		return nil, false
+	}
+	if !dupFileRef.Valid() {
+		return nil, false
+	}
+	if *cmdmain.FlagVerbose {
+		log.Printf("Found dup of contents %s in file schema %s", sum, dupFileRef)
+	}
+	dupMap, err := up.Client.FetchSchemaBlob(dupFileRef)
+	if err != nil {
+		log.Printf("Warning: error fetching %v: %v", dupFileRef, err)
+		return nil, false
+	}
+
+	fileMap.PopulateParts(dupMap.PartsSize(), dupMap.ByteParts())
+
+	json, err := fileMap.JSON()
+	if err != nil {
+		return nil, false
+	}
+	uh := client.NewUploadHandleFromString(json)
+	if up.fileOpts.wantVivify() {
+		uh.Vivify = true
+	}
+	if !uh.Vivify && uh.BlobRef == dupFileRef {
+		// Unchanged (same filename, modtime, JSON serialization, etc)
+		return &client.PutResult{BlobRef: dupFileRef, Size: uint32(len(json)), Skipped: true}, true
+	}
+	pr, err = up.Upload(uh)
+	if err != nil {
+		log.Printf("Warning: error uploading file map after finding server dup of %v: %v", sum, err)
+		return nil, false
+	}
+	return pr, true
 }
 
 func (up *Uploader) uploadNodeRegularFile(n *node) (*client.PutResult, error) {
-	m := schema.NewCommonFileMap(n.fullPath, n.fi)
-	m["camliType"] = "file"
+	filebb := schema.NewCommonFileMap(n.fullPath, n.fi)
+	filebb.SetType("file")
+
+	up.fdGate.Start()
+	defer up.fdGate.Done()
+
 	file, err := up.open(n.fullPath)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-
-	var fileContents io.Reader = io.LimitReader(file, n.fi.Size())
-	if n.wantFilePermanode() {
-		fileContents = &trackDigestReader{r: fileContents}
-	}
-	blobref, err := up.fileWriterFunc()(up.statReceiver(), m, fileContents)
-	if err != nil {
-		return nil, err
-	}
-
-	if n.wantFilePermanode() {
-		sum := fileContents.(*trackDigestReader).Sum()
-		// Use a fixed time value for signing; not using modtime
-		// so two identical files don't have different modtimes?
-		// TODO(bradfitz): consider this more?
-		permaNodeSigTime := time.Unix(0, 0)
-		permaNode, err := up.UploadPlannedPermanode(sum, permaNodeSigTime)
-		if err != nil {
-			return nil, fmt.Errorf("Error uploading permanode for node %v: %v", n, err)
+	if up.fileOpts.exifTime {
+		ra, ok := file.(io.ReaderAt)
+		if !ok {
+			return nil, errors.New("Error asserting local file to io.ReaderAt")
 		}
-		handleResult("node-permanode", permaNode, nil)
+		modtime, err := schema.FileTime(ra)
+		if err != nil {
+			log.Printf("warning: getting time from EXIF failed for %v: %v", n.fullPath, err)
+		} else {
+			filebb.SetModTime(modtime)
+		}
+	}
+	if up.fileOpts.capCtime {
+		filebb.CapCreationTime()
+	}
 
+	var (
+		size                           = n.fi.Size()
+		fileContents io.Reader         = io.LimitReader(file, size)
+		br           blob.Ref          // of file schemaref
+		sum          string            // sha1 hashsum of the file to upload
+		pr           *client.PutResult // of the final "file" schema blob
+	)
+
+	const dupCheckThreshold = 256 << 10
+	if size > dupCheckThreshold {
+		sumRef, err := up.wholeFileDigest(n.fullPath)
+		if err == nil {
+			sum = sumRef.String()
+			ok := false
+			pr, ok = up.fileMapFromDuplicate(up.statReceiver(n), filebb, sum)
+			if ok {
+				br = pr.BlobRef
+				android.NoteFileUploaded(n.fullPath, !pr.Skipped)
+				if up.fileOpts.wantVivify() {
+					// we can return early in that case, because the other options
+					// are disallowed in the vivify case.
+					return pr, nil
+				}
+			}
+		}
+	}
+
+	if up.fileOpts.wantVivify() {
+		// If vivify wasn't already done in fileMapFromDuplicate.
+		err := schema.WriteFileChunks(up.noStatReceiver(up.statReceiver(n)), filebb, fileContents)
+		if err != nil {
+			return nil, err
+		}
+		json, err := filebb.JSON()
+		if err != nil {
+			return nil, err
+		}
+		br = blob.SHA1FromString(json)
+		h := &client.UploadHandle{
+			BlobRef:  br,
+			Size:     uint32(len(json)),
+			Contents: strings.NewReader(json),
+			Vivify:   true,
+		}
+		pr, err = up.Upload(h)
+		if err != nil {
+			return nil, err
+		}
+		android.NoteFileUploaded(n.fullPath, true)
+		return pr, nil
+	}
+
+	if !br.Valid() {
+		// br still zero means fileMapFromDuplicate did not find the file on the server,
+		// and the file has not just been uploaded subsequently to a vivify request.
+		// So we do the full file + file schema upload here.
+		if sum == "" && up.fileOpts.wantFilePermanode() {
+			fileContents = &trackDigestReader{r: fileContents}
+		}
+		br, err = schema.WriteFileMap(up.noStatReceiver(up.statReceiver(n)), filebb, fileContents)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// The work for those planned permanodes (and the claims) is redone
+	// everytime we get here (i.e past the stat cache). However, they're
+	// caught by the have cache, so they won't be reuploaded for nothing
+	// at least.
+	if up.fileOpts.wantFilePermanode() {
+		if td, ok := fileContents.(*trackDigestReader); ok {
+			sum = td.Sum()
+		}
 		// claimTime is both the time of the "claimDate" in the
 		// JSON claim, as well as the date in the OpenPGP
 		// header.
@@ -425,19 +652,14 @@ func (up *Uploader) uploadNodeRegularFile(n *node) (*client.PutResult, error) {
 		// There should probably be a method on *Uploader to do this
 		// from an unsigned schema map. Maybe ditch the schema.Claimer
 		// type and just have the Uploader override the claimDate.
-		claimTime := n.fi.ModTime()
-
-		contentAttr := schema.NewSetAttributeClaim(permaNode.BlobRef, "camliContent", blobref.String())
-		contentAttr.SetClaimDate(claimTime)
-		signed, err := up.SignMap(contentAttr, claimTime)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to sign content claim for node %v: %v", n, err)
+		claimTime, ok := filebb.ModTime()
+		if !ok {
+			return nil, fmt.Errorf("couldn't get modtime for file %v", n.fullPath)
 		}
-		put, err := up.uploadString(signed)
+		err = up.uploadFilePermanode(sum, br, claimTime)
 		if err != nil {
-			return nil, fmt.Errorf("Error uploading permanode's attribute for node %v: %v", n, err)
+			return nil, fmt.Errorf("Error uploading permanode for node %v: %v", n, err)
 		}
-		handleResult("node-permanode-contentattr", put, nil)
 	}
 
 	// TODO(bradfitz): faking a PutResult here to return
@@ -445,13 +667,80 @@ func (up *Uploader) uploadNodeRegularFile(n *node) (*client.PutResult, error) {
 	// blobserver.Storage wrapper type (wrapping
 	// statReceiver) that can track some of this?  or make
 	// schemaWriteFileMap return it?
-	json, _ := m.JSON()
-	pr := &client.PutResult{BlobRef: blobref, Size: int64(len(json)), Skipped: false}
+	json, _ := filebb.JSON()
+	pr = &client.PutResult{BlobRef: br, Size: uint32(len(json)), Skipped: false}
 	return pr, nil
 }
 
-func (up *Uploader) UploadFile(filename string) (respr *client.PutResult, outerr error) {
-	fi, err := up.lstat(filename)
+// uploadFilePermanode creates and uploads the planned permanode (with sum as a
+// fixed key) associated with the file blobref fileRef.
+// It also sets the optional tags for this permanode.
+func (up *Uploader) uploadFilePermanode(sum string, fileRef blob.Ref, claimTime time.Time) error {
+	// Use a fixed time value for signing; not using modtime
+	// so two identical files don't have different modtimes?
+	// TODO(bradfitz): consider this more?
+	permaNodeSigTime := time.Unix(0, 0)
+	permaNode, err := up.UploadPlannedPermanode(sum, permaNodeSigTime)
+	if err != nil {
+		return fmt.Errorf("Error uploading planned permanode: %v", err)
+	}
+	handleResult("node-permanode", permaNode, nil)
+
+	contentAttr := schema.NewSetAttributeClaim(permaNode.BlobRef, "camliContent", fileRef.String())
+	contentAttr.SetClaimDate(claimTime)
+	signer, err := up.Signer()
+	if err != nil {
+		return err
+	}
+	signed, err := contentAttr.SignAt(signer, claimTime)
+	if err != nil {
+		return fmt.Errorf("Failed to sign content claim: %v", err)
+	}
+	put, err := up.uploadString(signed)
+	if err != nil {
+		return fmt.Errorf("Error uploading permanode's attribute: %v", err)
+	}
+
+	handleResult("node-permanode-contentattr", put, nil)
+	if tags := up.fileOpts.tags(); len(tags) > 0 {
+		errch := make(chan error)
+		for _, tag := range tags {
+			go func(tag string) {
+				m := schema.NewAddAttributeClaim(permaNode.BlobRef, "tag", tag)
+				m.SetClaimDate(claimTime)
+				signed, err := m.SignAt(signer, claimTime)
+				if err != nil {
+					errch <- fmt.Errorf("Failed to sign tag claim: %v", err)
+					return
+				}
+				put, err := up.uploadString(signed)
+				if err != nil {
+					errch <- fmt.Errorf("Error uploading permanode's tag attribute %v: %v", tag, err)
+					return
+				}
+				handleResult("node-permanode-tag", put, nil)
+				errch <- nil
+			}(tag)
+		}
+
+		for _ = range tags {
+			if e := <-errch; e != nil && err == nil {
+				err = e
+			}
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (up *Uploader) UploadFile(filename string) (*client.PutResult, error) {
+	fullPath, err := filepath.Abs(filename)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := up.lstat(fullPath)
 	if err != nil {
 		return nil, err
 	}
@@ -460,16 +749,43 @@ func (up *Uploader) UploadFile(filename string) (respr *client.PutResult, outerr
 		panic("must use UploadTree now for directories")
 	}
 	n := &node{
-		fullPath: filename, // TODO(bradfitz): resolve this to an abspath
+		fullPath: fullPath,
 		fi:       fi,
 	}
-	return up.uploadNode(n)
+
+	withPermanode := up.fileOpts.wantFilePermanode()
+	if up.statCache != nil && !up.fileOpts.wantVivify() {
+		// Note: ignoring cache hits if wantVivify, otherwise
+		// a non-vivify put followed by a vivify one wouldn't
+		// end up doing the vivify.
+		if cachedRes, err := up.statCache.CachedPutResult(
+			up.pwd, n.fullPath, n.fi, withPermanode); err == nil {
+			return cachedRes, nil
+		}
+	}
+
+	pr, err := up.uploadNode(n)
+	if err == nil && up.statCache != nil {
+		up.statCache.AddCachedPutResult(
+			up.pwd, n.fullPath, n.fi, pr, withPermanode)
+	}
+
+	return pr, err
 }
 
-// StartTreeUpload begins uploading dir and all its children.
+// NewTreeUpload returns a TreeUpload. It doesn't begin uploading any files until a
+// call to Start
 func (up *Uploader) NewTreeUpload(dir string) *TreeUpload {
+	tu := up.NewRootlessTreeUpload()
+	tu.rootless = false
+	tu.base = dir
+	return tu
+}
+
+func (up *Uploader) NewRootlessTreeUpload() *TreeUpload {
 	return &TreeUpload{
-		base:     dir,
+		rootless: true,
+		base:     "",
 		up:       up,
 		donec:    make(chan bool, 1),
 		errc:     make(chan error, 1),
@@ -496,10 +812,6 @@ type node struct {
 	sumBytes int64 // cached value, if non-zero. also guarded by mu.
 }
 
-func (n *node) wantFilePermanode() bool {
-	return n.tu != nil && n.tu.FilePermanodes
-}
-
 func (n *node) String() string {
 	if n == nil {
 		return "<nil *node>"
@@ -510,6 +822,12 @@ func (n *node) String() string {
 func (n *node) SetPutResult(res *client.PutResult, err error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if res == nil && err == nil {
+		panic("SetPutResult called with (nil, nil)")
+	}
+	if n.res != nil || n.err != nil {
+		panic("SetPutResult called twice on node " + n.fullPath)
+	}
 	n.res, n.err = res, err
 	n.cond.Signal()
 }
@@ -569,11 +887,8 @@ type TreeUpload struct {
 	// command.
 	DiskUsageMode bool
 
-	// If FilePermanodes is set true before Start, each
-	// file gets its own content-based planned permanode.
-	FilePermanodes bool
-
 	// Immutable:
+	rootless bool   // if true, "base" will be empty.
 	base     string // base directory
 	up       *Uploader
 	stattedc chan *node // from stat-the-world goroutine to run()
@@ -590,6 +905,11 @@ type TreeUpload struct {
 	finalPutRes *client.PutResult // set after run() returns
 }
 
+// Enqueue starts uploading path (a file, directory, etc).
+func (t *TreeUpload) Enqueue(path string) {
+	t.statPath(path, nil)
+}
+
 // fi is optional (will be statted if nil)
 func (t *TreeUpload) statPath(fullPath string, fi os.FileInfo) (nod *node, err error) {
 	defer func() {
@@ -597,6 +917,9 @@ func (t *TreeUpload) statPath(fullPath string, fi os.FileInfo) (nod *node, err e
 			t.stattedc <- nod
 		}
 	}()
+	if t.up.Client.IsIgnoredFile(fullPath) {
+		return nil, nil
+	}
 	if fi == nil {
 		fi, err = t.up.lstat(fullPath)
 		if err != nil {
@@ -622,18 +945,21 @@ func (t *TreeUpload) statPath(fullPath string, fi os.FileInfo) (nod *node, err e
 	if err != nil {
 		return nil, err
 	}
-	sort.Sort(byFileName(fis))
+	sort.Sort(byTypeAndName(fis))
 	for _, fi := range fis {
 		depn, err := t.statPath(filepath.Join(fullPath, filepath.Base(fi.Name())), fi)
 		if err != nil {
 			return nil, err
 		}
-		n.children = append(n.children, depn)
+		if depn != nil {
+			n.children = append(n.children, depn)
+		}
 	}
 	return n, nil
 }
 
-const uploadWorkers = 5
+// testHookStatCache, if non-nil, runs first in the checkStatCache worker.
+var testHookStatCache func(n *node, ok bool)
 
 func (t *TreeUpload) run() {
 	defer close(t.donec)
@@ -642,26 +968,34 @@ func (t *TreeUpload) run() {
 	// node (which references all its children).
 	var root *node // nil until received and set in loop below.
 	rootc := make(chan *node, 1)
-	go func() {
-		n, err := t.statPath(t.base, nil)
-		if err != nil {
-			log.Fatalf("Error scanning files under %s: %v", t.base, err)
-		}
-		close(t.stattedc)
-		rootc <- n
-	}()
+	if !t.rootless {
+		go func() {
+			n, err := t.statPath(t.base, nil)
+			if err != nil {
+				log.Fatalf("Error scanning files under %s: %v", t.base, err)
+			}
+			close(t.stattedc)
+			rootc <- n
+		}()
+	}
 
 	var lastStat, lastUpload string
 	dumpStats := func() {
+		if android.IsChild() {
+			printAndroidCamputStatus(t)
+			return
+		}
 		statStatus := ""
 		if root == nil {
 			statStatus = fmt.Sprintf("last stat: %s", lastStat)
 		}
 		blobStats := t.up.Stats()
-		log.Printf("FILES: Total: %+v Skipped: %+v Uploaded: %+v %s last upload: %s BLOBS: %s",
+		log.Printf("FILES: Total: %+v Skipped: %+v Uploaded: %+v %s BLOBS: %s Digested: %d last upload: %s",
 			t.total, t.skipped, t.uploaded,
-			statStatus, lastUpload,
-			blobStats.String())
+			statStatus,
+			blobStats.String(),
+			atomic.LoadInt64(&atomicDigestOps),
+			lastUpload)
 	}
 
 	// Channels for stats & progress bars. These are never closed:
@@ -670,6 +1004,7 @@ func (t *TreeUpload) run() {
 
 	uploadsdonec := make(chan bool)
 	var upload chan<- *node
+	withPermanode := t.up.fileOpts.wantFilePermanode()
 	if t.DiskUsageMode {
 		upload = NewNodeWorker(1, func(n *node, ok bool) {
 			if !ok {
@@ -681,9 +1016,9 @@ func (t *TreeUpload) run() {
 			}
 		})
 	} else {
-		upload = NewNodeWorker(uploadWorkers, func(n *node, ok bool) {
+		dirUpload := NewNodeWorker(dirUploadWorkers, func(n *node, ok bool) {
 			if !ok {
-				log.Printf("done with all uploads.")
+				log.Printf("done uploading directories - done with all uploads.")
 				uploadsdonec <- true
 				return
 			}
@@ -692,14 +1027,36 @@ func (t *TreeUpload) run() {
 				log.Fatalf("Error uploading %s: %v", n.fullPath, err)
 			}
 			n.SetPutResult(put, nil)
-			if c := t.up.statCache; c != nil && !n.fi.IsDir() {
-				c.AddCachedPutResult(t.up.pwd, n.fullPath, n.fi, put)
+			uploadedc <- n
+		})
+
+		upload = NewNodeWorker(uploadWorkers, func(n *node, ok bool) {
+			if !ok {
+				log.Printf("done with all uploads.")
+				close(dirUpload)
+				return
+			}
+			if n.fi.IsDir() {
+				dirUpload <- n
+				return
+			}
+			put, err := t.up.uploadNode(n)
+			if err != nil {
+				log.Fatalf("Error uploading %s: %v", n.fullPath, err)
+			}
+			n.SetPutResult(put, nil)
+			if c := t.up.statCache; c != nil {
+				c.AddCachedPutResult(
+					t.up.pwd, n.fullPath, n.fi, put, withPermanode)
 			}
 			uploadedc <- n
 		})
 	}
 
-	checkStatCache := NewNodeWorker(10, func(n *node, ok bool) {
+	checkStatCache := NewNodeWorker(statCacheWorkers, func(n *node, ok bool) {
+		if hook := testHookStatCache; hook != nil {
+			hook(n, ok)
+		}
 		if !ok {
 			if t.up.statCache != nil {
 				log.Printf("done checking stat cache")
@@ -712,10 +1069,12 @@ func (t *TreeUpload) run() {
 			return
 		}
 		if !n.fi.IsDir() {
-			cachedRes, err := t.up.statCache.CachedPutResult(t.up.pwd, n.fullPath, n.fi)
+			cachedRes, err := t.up.statCache.CachedPutResult(
+				t.up.pwd, n.fullPath, n.fi, withPermanode)
 			if err == nil {
 				n.SetPutResult(cachedRes, nil)
 				cachelog.Printf("Cache HIT on %q -> %v", n.fullPath, cachedRes)
+				android.NoteFileUploaded(n.fullPath, false)
 				skippedc <- n
 				return
 			}
@@ -741,7 +1100,7 @@ Loop:
 			t.skipped.incr(n)
 		case n, ok := <-stattedc:
 			if !ok {
-				log.Printf("done stattting:")
+				log.Printf("done statting:")
 				dumpStats()
 				close(checkStatCache)
 				stattedc = nil
@@ -785,11 +1144,21 @@ func (t *TreeUpload) Wait() (*client.PutResult, error) {
 	return t.finalPutRes, t.err
 }
 
-type byFileName []os.FileInfo
+type byTypeAndName []os.FileInfo
 
-func (s byFileName) Len() int           { return len(s) }
-func (s byFileName) Less(i, j int) bool { return s[i].Name() < s[j].Name() }
-func (s byFileName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s byTypeAndName) Len() int { return len(s) }
+func (s byTypeAndName) Less(i, j int) bool {
+	// files go before directories
+	if s[i].IsDir() {
+		if !s[j].IsDir() {
+			return false
+		}
+	} else if s[j].IsDir() {
+		return true
+	}
+	return s[i].Name() < s[j].Name()
+}
+func (s byTypeAndName) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
 // trackDigestReader is an io.Reader wrapper which records the digest of what it reads.
 type trackDigestReader struct {
@@ -807,5 +1176,5 @@ func (t *trackDigestReader) Read(p []byte) (n int, err error) {
 }
 
 func (t *trackDigestReader) Sum() string {
-	return fmt.Sprintf("%x", t.h.Sum(nil))
+	return fmt.Sprintf("sha1-%x", t.h.Sum(nil))
 }

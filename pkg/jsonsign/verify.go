@@ -23,14 +23,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/camerrors"
 	"camlistore.org/third_party/code.google.com/p/go.crypto/openpgp/armor"
 	"camlistore.org/third_party/code.google.com/p/go.crypto/openpgp/packet"
 )
-
-var _ = log.Printf
 
 const sigSeparator = `,"camliSig":"`
 
@@ -60,14 +60,14 @@ func reArmor(line string) string {
 // See doc/json-signing/* for background and details
 // on these variable names.
 type VerifyRequest struct {
-	fetcher blobref.StreamingFetcher // fetcher used to find public key blob
+	fetcher blob.Fetcher // fetcher used to find public key blob
 
 	ba  []byte // "bytes all"
 	bp  []byte // "bytes payload" (the part that is signed)
 	bpj []byte // "bytes payload, JSON" (BP + "}")
 	bs  []byte // "bytes signature", "{" + separator + camliSig, valid JSON
 
-	CamliSigner     *blobref.BlobRef
+	CamliSigner     blob.Ref
 	CamliSig        string
 	PublicKeyPacket *packet.PublicKey
 
@@ -128,17 +128,24 @@ func (vr *VerifyRequest) ParsePayloadMap() bool {
 		return vr.fail("invalid 'camliSigner' in the JSON payload")
 	}
 
-	vr.CamliSigner = blobref.Parse(signer.(string))
-	if vr.CamliSigner == nil {
+	var ok bool
+	vr.CamliSigner, ok = blob.Parse(signer.(string))
+	if !ok {
 		return vr.fail("malformed 'camliSigner' blobref in the JSON payload")
 	}
 	return true
 }
 
 func (vr *VerifyRequest) FindAndParsePublicKeyBlob() bool {
-	reader, _, err := vr.fetcher.FetchStreaming(vr.CamliSigner)
+	reader, _, err := vr.fetcher.Fetch(vr.CamliSigner)
+	if err == os.ErrNotExist {
+		vr.Err = camerrors.ErrMissingKeyBlob
+		return false
+	}
 	if err != nil {
-		return vr.fail(fmt.Sprintf("error fetching public key blob: %v", err))
+		log.Printf("error fetching public key blob %v: %v", vr.CamliSigner, err)
+		vr.Err = err
+		return false
 	}
 	defer reader.Close()
 	pk, err := openArmoredPublicKeyFile(reader)
@@ -181,7 +188,7 @@ func (vr *VerifyRequest) VerifySignature() bool {
 	return true
 }
 
-func NewVerificationRequest(sjson string, fetcher blobref.StreamingFetcher) (vr *VerifyRequest) {
+func NewVerificationRequest(sjson string, fetcher blob.Fetcher) (vr *VerifyRequest) {
 	if fetcher == nil {
 		panic("NewVerificationRequest fetcher is nil")
 	}

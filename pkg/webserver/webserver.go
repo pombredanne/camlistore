@@ -14,43 +14,69 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package webserver implements a superset wrapper of http.Server.
+//
+// Among other things, it can throttle its connections, inherit its
+// listening socket from a file descriptor in the environment, and
+// log all activity.
 package webserver
 
 import (
 	"bufio"
 	"crypto/rand"
 	"crypto/tls"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"camlistore.org/pkg/throttle"
+	"camlistore.org/pkg/wkfs"
 	"camlistore.org/third_party/github.com/bradfitz/runsit/listen"
 )
 
-var Listen = flag.String("listen", "", "host:port to listen on, or :0 to auto-select")
-
-type HandlerPicker func(req *http.Request) (http.HandlerFunc, bool)
-
 type Server struct {
-	premux   []HandlerPicker
 	mux      *http.ServeMux
 	listener net.Listener
+	verbose  bool // log HTTP requests and response codes
+
+	Logger *log.Logger // or nil.
 
 	enableTLS               bool
 	tlsCertFile, tlsKeyFile string
+
+	mu   sync.Mutex
+	reqs int64
 }
 
 func New() *Server {
+	verbose, _ := strconv.ParseBool(os.Getenv("CAMLI_HTTP_DEBUG"))
 	return &Server{
-		premux: make([]HandlerPicker, 0),
-		mux:    http.NewServeMux(),
+		mux:     http.NewServeMux(),
+		verbose: verbose,
 	}
+}
+
+func (s *Server) printf(format string, v ...interface{}) {
+	if s.Logger != nil {
+		s.Logger.Printf(format, v...)
+		return
+	}
+	log.Printf(format, v...)
+}
+
+func (s *Server) fatalf(format string, v ...interface{}) {
+	if s.Logger != nil {
+		s.Logger.Fatalf(format, v...)
+		return
+	}
+	log.Fatalf(format, v...)
 }
 
 func (s *Server) SetTLS(certFile, keyFile string) {
@@ -59,25 +85,20 @@ func (s *Server) SetTLS(certFile, keyFile string) {
 	s.tlsKeyFile = keyFile
 }
 
-func (s *Server) BaseURL() string {
+func (s *Server) ListenURL() string {
 	scheme := "http"
 	if s.enableTLS {
 		scheme = "https"
 	}
 	if s.listener != nil {
-		return scheme + "://" + s.listener.Addr().String()
+		if taddr, ok := s.listener.Addr().(*net.TCPAddr); ok {
+			if taddr.IP.IsUnspecified() {
+				return fmt.Sprintf("%s://localhost:%d", scheme, taddr.Port)
+			}
+			return fmt.Sprintf("%s://%s", scheme, s.listener.Addr())
+		}
 	}
-	if strings.HasPrefix(*Listen, ":") {
-		return scheme + "://localhost" + *Listen
-	}
-	return scheme + "://" + strings.Replace(*Listen, "0.0.0.0:", "localhost:", 1)
-}
-
-// Register conditional handler-picker functions which get run before
-// HandleFunc or Handle.  The HandlerPicker should return false if
-// it's not interested in a request.
-func (s *Server) RegisterPreMux(hp HandlerPicker) {
-	s.premux = append(s.premux, hp)
+	return ""
 }
 
 func (s *Server) HandleFunc(pattern string, fn func(http.ResponseWriter, *http.Request)) {
@@ -89,18 +110,42 @@ func (s *Server) Handle(pattern string, handler http.Handler) {
 }
 
 func (s *Server) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	for _, hp := range s.premux {
-		handler, ok := hp(req)
-		if ok {
-			handler(rw, req)
-			return
-		}
+	var n int64
+	if s.verbose {
+		s.mu.Lock()
+		s.reqs++
+		n = s.reqs
+		s.mu.Unlock()
+		s.printf("Request #%d: %s %s (from %s) ...", n, req.Method, req.RequestURI, req.RemoteAddr)
+		rw = &trackResponseWriter{ResponseWriter: rw}
 	}
 	s.mux.ServeHTTP(rw, req)
+	if s.verbose {
+		tw := rw.(*trackResponseWriter)
+		s.printf("Request #%d: %s %s = code %d, %d bytes", n, req.Method, req.RequestURI, tw.code, tw.resSize)
+	}
 }
 
-// Listen starts listening on the given host:port string.
-// If listen is empty the *Listen flag will be used instead.
+type trackResponseWriter struct {
+	http.ResponseWriter
+	code    int
+	resSize int64
+}
+
+func (tw *trackResponseWriter) WriteHeader(code int) {
+	tw.code = code
+	tw.ResponseWriter.WriteHeader(code)
+}
+
+func (tw *trackResponseWriter) Write(p []byte) (int, error) {
+	if tw.code == 0 {
+		tw.code = 200
+	}
+	tw.resSize += int64(len(p))
+	return tw.ResponseWriter.Write(p)
+}
+
+// Listen starts listening on the given host:port addr.
 func (s *Server) Listen(addr string) error {
 	if s.listener != nil {
 		return nil
@@ -108,24 +153,17 @@ func (s *Server) Listen(addr string) error {
 
 	doLog := os.Getenv("TESTING_PORT_WRITE_FD") == "" // Don't make noise during unit tests
 	if addr == "" {
-		if *Listen == "" {
-			return fmt.Errorf("Cannot start listening: host:port needs to be provided with the -listen flag")
-		}
-		addr = *Listen
+		return fmt.Errorf("<host>:<port> needs to be provided to start listening")
 	}
 
-	var laddr listen.Addr
-	err := laddr.Set(addr)
+	var err error
+	s.listener, err = listen.Listen(addr)
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed to listen on %s: %v", addr, err)
 	}
-	s.listener, err = laddr.Listen()
-	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", addr, err)
-	}
-	base := s.BaseURL()
+	base := s.ListenURL()
 	if doLog {
-		log.Printf("Starting to listen on %s\n", base)
+		s.printf("Starting to listen on %s\n", base)
 	}
 
 	if s.enableTLS {
@@ -135,28 +173,46 @@ func (s *Server) Listen(addr string) error {
 			NextProtos: []string{"http/1.1"},
 		}
 		config.Certificates = make([]tls.Certificate, 1)
-		config.Certificates[0], err = tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
+
+		config.Certificates[0], err = loadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
 		if err != nil {
-			log.Fatalf("Failed to load TLS cert: %v", err)
+			return fmt.Errorf("Failed to load TLS cert: %v", err)
 		}
 		s.listener = tls.NewListener(s.listener, config)
 	}
 
 	if doLog && strings.HasSuffix(base, ":0") {
-		log.Printf("Now listening on %s\n", s.BaseURL())
+		s.printf("Now listening on %s\n", s.ListenURL())
 	}
 
 	return nil
 }
 
+func (s *Server) throttleListener() net.Listener {
+	kBps, _ := strconv.Atoi(os.Getenv("DEV_THROTTLE_KBPS"))
+	ms, _ := strconv.Atoi(os.Getenv("DEV_THROTTLE_LATENCY_MS"))
+	if kBps == 0 && ms == 0 {
+		return s.listener
+	}
+	rate := throttle.Rate{
+		KBps:    kBps,
+		Latency: time.Duration(ms) * time.Millisecond,
+	}
+	return &throttle.Listener{
+		Listener: s.listener,
+		Down:     rate,
+		Up:       rate, // TODO: separate rates?
+	}
+}
+
 func (s *Server) Serve() {
 	if err := s.Listen(""); err != nil {
-		log.Fatalf("Listen error: %v", err)
+		s.fatalf("Listen error: %v", err)
 	}
 	go runTestHarnessIntegration(s.listener)
-	err := http.Serve(s.listener, s)
+	err := http.Serve(s.throttleListener(), s)
 	if err != nil {
-		log.Printf("Error in http server: %v\n", err)
+		s.printf("Error in http server: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -185,4 +241,17 @@ func runTestHarnessIntegration(listener net.Listener) {
 			return
 		}
 	}
+}
+
+// loadX509KeyPair is a copy of tls.LoadX509KeyPair but using wkfs.
+func loadX509KeyPair(certFile, keyFile string) (cert tls.Certificate, err error) {
+	certPEMBlock, err := wkfs.ReadFile(certFile)
+	if err != nil {
+		return
+	}
+	keyPEMBlock, err := wkfs.ReadFile(keyFile)
+	if err != nil {
+		return
+	}
+	return tls.X509KeyPair(certPEMBlock, keyPEMBlock)
 }

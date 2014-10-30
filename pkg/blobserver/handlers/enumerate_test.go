@@ -17,21 +17,19 @@ limitations under the License.
 package handlers
 
 import (
-	. "camlistore.org/pkg/test/asserts"
-	"camlistore.org/pkg/blobref"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
+
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/context"
+	. "camlistore.org/pkg/test/asserts"
 )
 
 type emptyEnumerator struct {
 }
 
-func (ee *emptyEnumerator) EnumerateBlobs(dest chan<- blobref.SizedBlobRef,
-	after string,
-	limit int,
-	wait time.Duration) error {
+func (ee *emptyEnumerator) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	close(dest)
 	return nil
 }

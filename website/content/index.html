@@ -1,38 +1,40 @@
-<h1 class='bustTitleRegexp'>What is Camlistore?</h1>
+<h1 class="rootHeading">Camlistore is <em>your personal storage system for life</em>.</h1>
 
-<p>Camlistore is:</p>
+<p>Camlistore is a set of open source formats, protocols, and software for modeling, storing, searching, sharing and synchronizing data in the post-PC era. Data may be files or objects, tweets or 5TB videos, and you can access it via a phone, browser or FUSE filesystem.</p>
+
+<p>Camlistore (Content-Addressable Multi-Layer Indexed Storage) is under active development. If you're a programmer or fairly technical, you can probably get it up and running and get some utility out of it. Many bits and pieces are actively being developed, so be prepared for bugs and unfinished features.</p>
+
+<p>Join <a href="/community">the community</a>, consider <a href="/docs/contributing">contributing</a>, or <a href="http://code.google.com/p/camlistore/issues/list">file a bug</a>.</p>
+
+<p>Things Camlistore believes:</p>
 <ul>
-  <li>a way to store, sync, share, model and back up content</li>
-  <li>a <a href="/docs/status">work in progress</a></li>
-  <li>Open Source (Apache licensed)</li>
-  <li>an acronym for <i>"Content-Addressable Multi-Layer Indexed Storage"</i>, hinting that Camlistore is about:
-      <ul>
-        <li>content-addressable storage</li>
-        <li>separate interoperable parts (<a href="/docs/arch">storage</a>, <a href="/docs/terms#graphsync">sync</a>, <a href="/docs/sharing">sharing</a>,
-        <a href="/docs/schema">modeling</a>), with well-defined protocols and roles</li>
-      </ul></li>
-  <li>your "home directory for the web"</li>
-  <li>pro-JSON (yet aggressively format agnostic)</li>
-  <li>pro-OpenPGP (for <a href="/docs/json-signing">signing claims</a>)</li>
-  <li>pro-paranoia and privacy</li>
-  <li><a href="/docs/uses">ambitious</a>, but ...</li>
-  <li>simple!</li>
-  <li>programming language-agnostic (parts and different implementations in <a href="http://golang.org/">Go</a>, Python, Java, Perl, Bash, ... the language doesn't matter.)  What matters is well-defined, simple HTTP interfaces.</li>
-  <li>neither "Cloud" nor "Local".  happily both.</li>
-  <li>a "20% project" from a few Google employees, but not Google-centric nor endorsed by Google (other than them letting us open source our side project)</li>
-  <li>ready for developers (at least those without strong <a href="http://bikeshed.org/">color preferences</a>)</li>
+  <li>Your data is entirely under your control</li>
+  <li>Open Source</li>
+  <li>Paranoid about privacy, everything private by default</li>
+  <li>No SPOF: don't rely on any single party (including yourself)</li>
+  <li>Your data should be alive in 80 years, especially if you are</li>
 </ul>
 
-<p>but, is...</p>
-<ul>
-  <li style="margin-top: 1em">not yet ready for users</li>
-  <li>not a typical peer-to-peer system or DHT</li>
-  <li>not (yet?) a "MySQL alternative"</li>
-  <li>not necessarily a product in itself (e.g., not Drupal)</li>
-  <li>not necessarily a replacement for S3-like storage</li>
-</ul>
+<h2>Latest Release</h2>
 
-<h2>Recent presentation</h2>
+<p>The latest release is <a href="docs/release/0.8">0.8 ("Tokyo")</a>, released 2014-08-03.</p>
+<p>Follow the <a href="/download">download and getting started instructions</a> to set up Camlistore.</p>
 
-<p>See <a href="/talks/2011-05-07-Camlistore-Sao-Paolo/">http://camlistore.org/talks/2011-05-07-Camlistore-Sao-Paolo/</a>.</p>
-<p>There's also this <a href="https://docs.google.com/present/view?id=dgks53wm_2j86hwnhs">older presentation</a>.</p>
+<h2>Video Demo</h2>
+
+<p>FOSDEM 2014 <a href="https://www.youtube.com/watch?v=kBCQq5hfsug">Camlistore presentation</a>:</p>
+
+<center><iframe width="640" height="360" src="//www.youtube.com/embed/kBCQq5hfsug" frameborder="0" allowfullscreen></iframe></center>
+
+<p>Or see the <a href="/docs/#presentations">older presentations</a>.</p>
+
+<h2>Contribute</h2>
+
+<p>In addition to user feedback, bug reports, and <a href="/code#contributing">code contributions</a>, we also accept Bitcoin:</p>
+
+<center>
+<table width='200'>
+<tr><td><a class="coinbase-button" data-code="59e6aa9eff5ed27f5fb1fc6705bd8e56" data-button-style="donation_large" href="https://coinbase.com/checkouts/59e6aa9eff5ed27f5fb1fc6705bd8e56">Donate Bitcoins</a><script src="https://coinbase.com/assets/button.js" type="text/javascript"></script></td></tr>
+<tr><td>All donations help fund full-time Camlistore developers (but not Brad or other Google employees)</td></tr>
+</table>
+</center>

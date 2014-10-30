@@ -18,16 +18,20 @@ package jsonconfig
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
+	"strings"
 
 	"camlistore.org/pkg/errorutil"
 	"camlistore.org/pkg/osutil"
+	"camlistore.org/pkg/wkfs"
 )
 
 type stringVector struct {
@@ -67,7 +71,7 @@ type ConfigParser struct {
 
 func (c *ConfigParser) open(filename string) (File, error) {
 	if c.Open == nil {
-		return os.Open(filename)
+		return wkfs.Open(filename)
 	}
 	return c.Open(filename)
 }
@@ -75,7 +79,12 @@ func (c *ConfigParser) open(filename string) (File, error) {
 // Validates variable names for config _env expresssions
 var envPattern = regexp.MustCompile(`\$\{[A-Za-z0-9_]+\}`)
 
+// ReadFile parses the provided path and returns the config file.
+// If path is empty, the c.Open function must be defined.
 func (c *ConfigParser) ReadFile(path string) (m map[string]interface{}, err error) {
+	if path == "" && c.Open == nil {
+		return nil, errors.New("ReadFile of empty string but Open hook not defined")
+	}
 	c.touchedFiles = make(map[string]bool)
 	c.rootJSON, err = c.recursiveReadJSON(path)
 	return c.rootJSON, err
@@ -83,19 +92,20 @@ func (c *ConfigParser) ReadFile(path string) (m map[string]interface{}, err erro
 
 // Decodes and evaluates a json config file, watching for include cycles.
 func (c *ConfigParser) recursiveReadJSON(configPath string) (decodedObject map[string]interface{}, err error) {
+	if configPath != "" {
+		absConfigPath, err := filepath.Abs(configPath)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to expand absolute path for %s", configPath)
+		}
+		if c.touchedFiles[absConfigPath] {
+			return nil, fmt.Errorf("ConfigParser include cycle detected reading config: %v",
+				absConfigPath)
+		}
+		c.touchedFiles[absConfigPath] = true
 
-	configPath, err = filepath.Abs(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to expand absolute path for %s", configPath)
+		c.includeStack.Push(absConfigPath)
+		defer c.includeStack.Pop()
 	}
-	if c.touchedFiles[configPath] {
-		return nil, fmt.Errorf("ConfigParser include cycle detected reading config: %v",
-			configPath)
-	}
-	c.touchedFiles[configPath] = true
-
-	c.includeStack.Push(configPath)
-	defer c.includeStack.Pop()
 
 	var f File
 	if f, err = c.open(configPath); err != nil {
@@ -119,7 +129,7 @@ func (c *ConfigParser) recursiveReadJSON(configPath string) (decodedObject map[s
 			f.Name(), extra, err)
 	}
 
-	if err = c.evaluateExpressions(decodedObject); err != nil {
+	if err = c.evaluateExpressions(decodedObject, nil, false); err != nil {
 		return nil, fmt.Errorf("error expanding JSON config expressions in %s:\n%v",
 			f.Name(), err)
 	}
@@ -127,16 +137,32 @@ func (c *ConfigParser) recursiveReadJSON(configPath string) (decodedObject map[s
 	return decodedObject, nil
 }
 
+var regFunc = map[string]expanderFunc{}
+
+// RegisterFunc registers a new function that may be called from JSON
+// configs using an array of the form ["_name", arg0, argN...].
+// The provided name must begin with an underscore.
+func RegisterFunc(name string, fn func(c *ConfigParser, v []interface{}) (interface{}, error)) {
+	if len(name) < 2 || !strings.HasPrefix(name, "_") {
+		panic("illegal name")
+	}
+	if _, dup := regFunc[name]; dup {
+		panic("duplicate registration of " + name)
+	}
+	regFunc[name] = fn
+}
+
 type expanderFunc func(c *ConfigParser, v []interface{}) (interface{}, error)
 
-func namedExpander(name string) (expanderFunc, bool) {
+func namedExpander(name string) (fn expanderFunc, ok bool) {
 	switch name {
 	case "_env":
-		return expanderFunc((*ConfigParser).expandEnv), true
+		return (*ConfigParser).expandEnv, true
 	case "_fileobj":
-		return expanderFunc((*ConfigParser).expandFile), true
+		return (*ConfigParser).expandFile, true
 	}
-	return nil, false
+	fn, ok = regFunc[name]
+	return
 }
 
 func (c *ConfigParser) evalValue(v interface{}) (interface{}, error) {
@@ -163,30 +189,37 @@ func (c *ConfigParser) evalValue(v interface{}) (interface{}, error) {
 	return v, nil
 }
 
-func (c *ConfigParser) evaluateExpressions(m map[string]interface{}) error {
+// CheckTypes parses m and returns an error if it encounters a type or value
+// that is not supported by this package.
+func (c *ConfigParser) CheckTypes(m map[string]interface{}) error {
+	return c.evaluateExpressions(m, nil, true)
+}
+
+// evaluateExpressions parses recursively m, populating it with the values
+// that are found, unless testOnly is true.
+func (c *ConfigParser) evaluateExpressions(m map[string]interface{}, seenKeys []string, testOnly bool) error {
 	for k, ei := range m {
+		thisPath := append(seenKeys, k)
 		switch subval := ei.(type) {
-		case string:
-			continue
-		case bool:
-			continue
-		case float64:
+		case string, bool, float64, nil:
 			continue
 		case []interface{}:
 			if len(subval) == 0 {
 				continue
 			}
-			var err error
-			m[k], err = c.evalValue(subval)
+			evaled, err := c.evalValue(subval)
 			if err != nil {
-				return err
+				return fmt.Errorf("%s: value error %v", strings.Join(thisPath, "."), err)
+			}
+			if !testOnly {
+				m[k] = evaled
 			}
 		case map[string]interface{}:
-			if err := c.evaluateExpressions(subval); err != nil {
+			if err := c.evaluateExpressions(subval, thisPath, testOnly); err != nil {
 				return err
 			}
 		default:
-			return fmt.Errorf("Unhandled type %T", ei)
+			return fmt.Errorf("%s: unhandled type %T", strings.Join(thisPath, "."), ei)
 		}
 	}
 	return nil
@@ -222,6 +255,10 @@ func (c *ConfigParser) expandEnv(v []interface{}) (interface{}, error) {
 	expanded := envPattern.ReplaceAllStringFunc(s, func(match string) string {
 		envVar := match[2 : len(match)-1]
 		val := os.Getenv(envVar)
+		// Special case:
+		if val == "" && envVar == "USER" && runtime.GOOS == "windows" {
+			val = os.Getenv("USERNAME")
+		}
 		if val == "" {
 			if hasDefault {
 				return def

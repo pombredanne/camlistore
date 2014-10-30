@@ -1,7 +1,7 @@
 // +build windows
 
 /*
-Copyright 2012 The Camlistore Authors.
+Copyright 2014 The Camlistore Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,12 +20,35 @@ package osutil
 
 import (
 	"log"
+	"syscall"
+	"unicode/utf16"
+	"unsafe"
 )
 
-// restartProcess returns an error if things couldn't be
+// SelfPath returns the path of the executable for the currently running
+// process.
+func SelfPath() (string, error) {
+	kernel32, err := syscall.LoadDLL("kernel32.dll")
+	if err != nil {
+		return "", err
+	}
+	sysproc, err := kernel32.FindProc("GetModuleFileNameW")
+	if err != nil {
+		return "", err
+	}
+	b := make([]uint16, syscall.MAX_PATH)
+	r, _, err := sysproc.Call(0, uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
+	n := uint32(r)
+	if n == 0 {
+		return "", err
+	}
+	return string(utf16.Decode(b[0:n])), nil
+}
+
+// RestartProcess returns an error if things couldn't be
 // restarted.  On success, this function never returns
 // because the process becomes the new process.
 func RestartProcess() error {
-	log.Print("RestartProcess not implemented on windows")
+	log.Print("RestartProcess not implemented on this platform.")
 	return nil
 }

@@ -19,103 +19,33 @@ package s3
 import (
 	"bytes"
 	"crypto/md5"
-	"hash"
 	"io"
-	"io/ioutil"
-	"log"
-	"os"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
-	//"camli/misc/amazon/s3"
 )
 
-var _ = log.Printf
+func (sto *s3Storage) ReceiveBlob(b blob.Ref, source io.Reader) (sr blob.SizedRef, err error) {
+	var buf bytes.Buffer
+	md5h := md5.New()
 
-const maxInMemorySlurp = 4 << 20 // 4MB.  *shrug*
-
-// amazonSlurper slurps up a blob to memory (or spilling to disk if
-// over maxInMemorySlurp) to verify its digest (and also gets its MD5
-// for Amazon's Content-MD5 header, even if the original blobref
-// is e.g. sha1-xxxx)
-type amazonSlurper struct {
-	blob    *blobref.BlobRef // only used for tempfile's prefix
-	buf     *bytes.Buffer
-	md5     hash.Hash
-	file    *os.File // nil until allocated
-	reading bool     // transitions at most once from false -> true
-}
-
-func newAmazonSlurper(blob *blobref.BlobRef) *amazonSlurper {
-	return &amazonSlurper{
-		blob: blob,
-		buf:  new(bytes.Buffer),
-		md5:  md5.New(),
+	size, err := io.Copy(io.MultiWriter(&buf, md5h), source)
+	if err != nil {
+		return sr, err
 	}
-}
 
-func (as *amazonSlurper) Read(p []byte) (n int, err error) {
-	if !as.reading {
-		as.reading = true
-		if as.file != nil {
-			as.file.Seek(0, 0)
-		}
-	}
-	if as.file != nil {
-		return as.file.Read(p)
-	}
-	return as.buf.Read(p)
-}
-
-func (as *amazonSlurper) Write(p []byte) (n int, err error) {
-	if as.reading {
-		panic("write after read")
-	}
-	as.md5.Write(p)
-	if as.file != nil {
-		n, err = as.file.Write(p)
+	if faultReceive.FailErr(&err) {
 		return
 	}
 
-	if as.buf.Len()+len(p) > maxInMemorySlurp {
-		as.file, err = ioutil.TempFile("", as.blob.String())
-		if err != nil {
-			return
-		}
-		_, err = io.Copy(as.file, as.buf)
-		if err != nil {
-			return
-		}
-		as.buf = nil
-		n, err = as.file.Write(p)
-		return
-	}
-
-	return as.buf.Write(p)
-}
-
-func (as *amazonSlurper) Cleanup() {
-	if as.file != nil {
-		os.Remove(as.file.Name())
-	}
-}
-
-func (sto *s3Storage) ReceiveBlob(blob *blobref.BlobRef, source io.Reader) (outsb blobref.SizedBlobRef, outerr error) {
-	zero := outsb
-	slurper := newAmazonSlurper(blob)
-	defer slurper.Cleanup()
-
-	hash := blob.Hash()
-	size, err := io.Copy(io.MultiWriter(hash, slurper), source)
+	err = sto.s3Client.PutObject(b.String(), sto.bucket, md5h, size, &buf)
 	if err != nil {
-		return zero, err
+		return sr, err
 	}
-	if !blob.HashMatches(hash) {
-		return zero, blobserver.ErrCorruptBlob
+	if sto.cache != nil {
+		// NoHash because it's already verified if we read it
+		// without errors on the io.Copy above.
+		blobserver.ReceiveNoHash(sto.cache, b, bytes.NewReader(buf.Bytes()))
 	}
-	err = sto.s3Client.PutObject(blob.String(), sto.bucket, slurper.md5, size, slurper)
-	if err != nil {
-		return zero, err
-	}
-	return blobref.SizedBlobRef{BlobRef: blob, Size: size}, nil
+	return blob.SizedRef{Ref: b, Size: uint32(size)}, nil
 }

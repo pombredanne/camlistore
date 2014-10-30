@@ -18,28 +18,61 @@ package s3
 
 import (
 	"log"
-	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/context"
 )
 
-var _ = log.Printf
+var _ blobserver.MaxEnumerateConfig = (*s3Storage)(nil)
 
-func (sto *s3Storage) MaxEnumerate() uint { return 1000 }
+func (sto *s3Storage) MaxEnumerate() int { return 1000 }
 
-func (sto *s3Storage) EnumerateBlobs(dest chan<- blobref.SizedBlobRef, after string, limit int, wait time.Duration) error {
+// marker returns the string lexically greater than the provided s
+// with the same length as s.
+func nextStr(s string) string {
+	if s == "" {
+		return s
+	}
+	b := []byte(s)
+	i := len(b)
+	for i > 0 {
+		i--
+		b[i]++
+		if b[i] != 0 {
+			break
+		}
+	}
+	return string(b)
+}
+
+func (sto *s3Storage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) (err error) {
 	defer close(dest)
-	objs, err := sto.s3Client.ListBucket(sto.bucket, after, limit)
+	if faultEnumerate.FailErr(&err) {
+		return
+	}
+	startAt := after
+	if _, ok := blob.Parse(after); ok {
+		startAt = nextStr(after)
+	}
+	objs, err := sto.s3Client.ListBucket(sto.bucket, startAt, limit)
 	if err != nil {
 		log.Printf("s3 ListBucket: %v", err)
 		return err
 	}
 	for _, obj := range objs {
-		br := blobref.Parse(obj.Key)
-		if br == nil {
+		if obj.Key == after {
 			continue
 		}
-		dest <- blobref.SizedBlobRef{BlobRef: br, Size: obj.Size}
+		br, ok := blob.Parse(obj.Key)
+		if !ok {
+			continue
+		}
+		select {
+		case dest <- blob.SizedRef{Ref: br, Size: uint32(obj.Size)}:
+		case <-ctx.Done():
+			return context.ErrCanceled
+		}
 	}
 	return nil
 }

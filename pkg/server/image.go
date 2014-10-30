@@ -19,34 +19,52 @@ package server
 import (
 	"bytes"
 	"errors"
+	"expvar"
 	"fmt"
 	"image"
-	"image/jpeg"
 	"image/png"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/constants"
+	"camlistore.org/pkg/httputil"
+	"camlistore.org/pkg/images"
 	"camlistore.org/pkg/magic"
-	"camlistore.org/pkg/misc/resize"
 	"camlistore.org/pkg/schema"
+	"camlistore.org/pkg/search"
+	"camlistore.org/pkg/singleflight"
+	"camlistore.org/pkg/syncutil"
+	"camlistore.org/pkg/types"
 
-	_ "image/gif"
+	_ "camlistore.org/third_party/github.com/nf/cr2"
+	"camlistore.org/third_party/go/pkg/image/jpeg"
+)
+
+const imageDebug = false
+
+var (
+	imageBytesServedVar  = expvar.NewInt("image-bytes-served")
+	imageBytesFetchedVar = expvar.NewInt("image-bytes-fetched")
+	thumbCacheMiss       = expvar.NewInt("thumbcache-miss")
+	thumbCacheHitFull    = expvar.NewInt("thumbcache-hit-full")
+	thumbCacheHitFile    = expvar.NewInt("thumbcache-hit-file")
+	thumbCacheHeader304  = expvar.NewInt("thumbcache-header-304")
 )
 
 type ImageHandler struct {
-	Fetcher             blobref.StreamingFetcher
+	Fetcher             blob.Fetcher
 	Cache               blobserver.Storage // optional
 	MaxWidth, MaxHeight int
 	Square              bool
-	sc                  ScaledImage // optional cache for scaled images
-}
-
-func (ih *ImageHandler) storageSeekFetcher() (blobref.SeekFetcher, error) {
-	return blobref.SeekerFromStreamingFetcher(ih.Fetcher) // TODO: pass ih.Cache?
+	ThumbMeta           *ThumbMeta    // optional cache index for scaled images
+	ResizeSem           *syncutil.Sem // Limit peak RAM used by concurrent image thumbnail calls.
 }
 
 type subImager interface {
@@ -73,203 +91,299 @@ func squareImage(i image.Image) image.Image {
 	return si.SubImage(newB)
 }
 
-func (ih *ImageHandler) cache(tr io.Reader, name string) (*blobref.BlobRef, error) {
-	br, err := schema.WriteFileFromReaderRolling(ih.Cache, name, tr)
+func writeToCache(cache blobserver.Storage, thumbBytes []byte, name string) (br blob.Ref, err error) {
+	tr := bytes.NewReader(thumbBytes)
+	if len(thumbBytes) < constants.MaxBlobSize {
+		br = blob.SHA1FromBytes(thumbBytes)
+		_, err = blobserver.Receive(cache, br, tr)
+	} else {
+		// TODO: don't use rolling checksums when writing this. Tell
+		// the filewriter to use 16 MB chunks instead.
+		br, err = schema.WriteFileFromReader(cache, name, tr)
+	}
 	if err != nil {
 		return br, errors.New("failed to cache " + name + ": " + err.Error())
 	}
-	log.Printf("Image Cache: saved as %v\n", br)
+	if imageDebug {
+		log.Printf("Image Cache: saved as %v\n", br)
+	}
 	return br, nil
 }
 
-// CacheScaled saves in the image handler's cache the scaled image read 
-// from tr, and puts its blobref in the scaledImage under the key name.
-func (ih *ImageHandler) cacheScaled(tr io.Reader, name string) error {
-	br, err := ih.cache(tr, name)
+// cacheScaled saves in the image handler's cache the scaled image bytes
+// in thumbBytes, and puts its blobref in the scaledImage under the key name.
+func (ih *ImageHandler) cacheScaled(thumbBytes []byte, name string) error {
+	br, err := writeToCache(ih.Cache, thumbBytes, name)
 	if err != nil {
 		return err
 	}
-	ih.sc.Put(name, br)
+	ih.ThumbMeta.Put(name, br)
 	return nil
 }
 
-func (ih *ImageHandler) cached(br *blobref.BlobRef) (fr *schema.FileReader, err error) {
-	fetchSeeker, err := blobref.SeekerFromStreamingFetcher(ih.Cache)
+// cached returns a FileReader for the given blobref, which may
+// point to either a blob representing the entire thumbnail (max
+// 16MB) or a file schema blob.
+//
+// The ReadCloser should be closed when done reading.
+func (ih *ImageHandler) cached(br blob.Ref) (io.ReadCloser, error) {
+	rsc, _, err := ih.Cache.Fetch(br)
 	if err != nil {
 		return nil, err
+	}
+	slurp, err := ioutil.ReadAll(rsc)
+	rsc.Close()
+	if err != nil {
+		return nil, err
+	}
+	// In the common case, when the scaled image itself is less than 16 MB, it's
+	// all together in one blob.
+	if strings.HasPrefix(magic.MIMEType(slurp), "image/") {
+		thumbCacheHitFull.Add(1)
+		if imageDebug {
+			log.Printf("Image Cache: hit: %v\n", br)
+		}
+		return ioutil.NopCloser(bytes.NewReader(slurp)), nil
 	}
 
-	fr, err = schema.NewFileReader(fetchSeeker, br)
+	// For large scaled images, the cached blob is a file schema blob referencing
+	// the sub-chunks.
+	fileBlob, err := schema.BlobFromReader(br, bytes.NewReader(slurp))
 	if err != nil {
+		log.Printf("Failed to parse non-image thumbnail cache blob %v: %v", br, err)
 		return nil, err
 	}
-	log.Printf("Image Cache: hit: %v\n", br)
+	fr, err := fileBlob.NewFileReader(ih.Cache)
+	if err != nil {
+		log.Printf("cached(%d) NewFileReader = %v", br, err)
+		return nil, err
+	}
+	thumbCacheHitFile.Add(1)
+	if imageDebug {
+		log.Printf("Image Cache: fileref hit: %v\n", br)
+	}
 	return fr, nil
 }
 
 // Key format: "scaled:" + bref + ":" + width "x" + height
 // where bref is the blobref of the unscaled image.
 func cacheKey(bref string, width int, height int) string {
-	return fmt.Sprintf("scaled:%v:%dx%d", bref, width, height)
+	return fmt.Sprintf("scaled:%v:%dx%d:tv%v", bref, width, height, images.ThumbnailVersion())
 }
 
 // ScaledCached reads the scaled version of the image in file,
-// if it is in cache. On success, the image format is returned.
-func (ih *ImageHandler) scaledCached(buf *bytes.Buffer, file *blobref.BlobRef) (format string, err error) {
-	name := cacheKey(file.String(), ih.MaxWidth, ih.MaxHeight)
-	br, err := ih.sc.Get(name)
+// if it is in cache and writes it to buf.
+//
+// On successful read and population of buf, the returned format is non-empty.
+// Almost all errors are not interesting. Real errors will be logged.
+func (ih *ImageHandler) scaledCached(buf *bytes.Buffer, file blob.Ref) (format string) {
+	key := cacheKey(file.String(), ih.MaxWidth, ih.MaxHeight)
+	br, err := ih.ThumbMeta.Get(key)
+	if err == errCacheMiss {
+		return
+	}
 	if err != nil {
-		return format, fmt.Errorf("%v: %v", name, err)
+		log.Printf("Warning: thumbnail cachekey(%q)->meta lookup error: %v", key, err)
+		return
 	}
 	fr, err := ih.cached(br)
 	if err != nil {
-		return format, fmt.Errorf("No cache hit for %v: %v", br, err)
+		if imageDebug {
+			log.Printf("Could not get cached image %v: %v\n", br, err)
+		}
+		return
 	}
+	defer fr.Close()
 	_, err = io.Copy(buf, fr)
 	if err != nil {
-		return format, fmt.Errorf("error reading cached thumbnail %v: %v", name, err)
+		return
 	}
-	mime := magic.MimeType(buf.Bytes())
-	if mime == "" {
-		return format, fmt.Errorf("error with cached thumbnail %v: unknown mime type", name)
+	mime := magic.MIMEType(buf.Bytes())
+	if format = strings.TrimPrefix(mime, "image/"); format == mime {
+		log.Printf("Warning: unescaped MIME type %q of %v file for thumbnail %q", mime, br, key)
+		return
 	}
-	pieces := strings.Split(mime, "/")
-	if len(pieces) < 2 {
-		return format, fmt.Errorf("error with cached thumbnail %v: bogus mime type", name)
-	}
-	if pieces[0] != "image" {
-		return format, fmt.Errorf("error with cached thumbnail %v: not an image", name)
-	}
-	return pieces[1], nil
+	return format
 }
 
-func (ih *ImageHandler) scaleImage(buf *bytes.Buffer, file *blobref.BlobRef) (format string, err error) {
-	mw, mh := ih.MaxWidth, ih.MaxHeight
+// Gate the number of concurrent image resizes to limit RAM & CPU use.
 
-	fetchSeeker, err := ih.storageSeekFetcher()
+type formatAndImage struct {
+	format string
+	image  []byte
+}
+
+// imageConfigFromReader calls image.DecodeConfig on r. It returns an
+// io.Reader that is the concatentation of the bytes read and the remaining r,
+// the image configuration, and the error from image.DecodeConfig.
+func imageConfigFromReader(r io.Reader) (io.Reader, image.Config, error) {
+	header := new(bytes.Buffer)
+	tr := io.TeeReader(r, header)
+	// We just need width & height for memory considerations, so we use the
+	// standard library's DecodeConfig, skipping the EXIF parsing and
+	// orientation correction for images.DecodeConfig.
+	conf, _, err := image.DecodeConfig(tr)
+	return io.MultiReader(header, r), conf, err
+}
+
+func (ih *ImageHandler) scaleImage(fileRef blob.Ref) (*formatAndImage, error) {
+	fr, err := schema.NewFileReader(ih.Fetcher, fileRef)
 	if err != nil {
-		return format, err
+		return nil, err
+	}
+	defer fr.Close()
+
+	sr := types.NewStatsReader(imageBytesFetchedVar, fr)
+	sr, conf, err := imageConfigFromReader(sr)
+	if err != nil {
+		return nil, err
 	}
 
-	fr, err := schema.NewFileReader(fetchSeeker, file)
-	if err != nil {
-		return format, err
-	}
+	// TODO(wathiede): build a size table keyed by conf.ColorModel for
+	// common color models for a more exact size estimate.
 
-	_, err = io.Copy(buf, fr)
-	if err != nil {
-		return format, fmt.Errorf("image resize: error reading image %s: %v", file, err)
+	// This value is an estimate of the memory required to decode an image.
+	// PNGs range from 1-64 bits per pixel (not all of which are supported by
+	// the Go standard parser). JPEGs encoded in YCbCr 4:4:4 are 3 byte/pixel.
+	// For all other JPEGs this is an overestimate.  For GIFs it is 3x larger
+	// than needed.  How accurate this estimate is depends on the mix of
+	// images being resized concurrently.
+	ramSize := int64(conf.Width) * int64(conf.Height) * 3
+
+	if err = ih.ResizeSem.Acquire(ramSize); err != nil {
+		return nil, err
 	}
-	i, format, err := image.Decode(bytes.NewBuffer(buf.Bytes()))
+	defer ih.ResizeSem.Release(ramSize)
+
+	i, imConfig, err := images.Decode(sr, &images.DecodeOpts{
+		MaxWidth:  ih.MaxWidth,
+		MaxHeight: ih.MaxHeight,
+	})
 	if err != nil {
-		return format, err
+		return nil, err
 	}
 	b := i.Bounds()
-
-	useBytesUnchanged := true
+	format := imConfig.Format
 
 	isSquare := b.Dx() == b.Dy()
 	if ih.Square && !isSquare {
-		useBytesUnchanged = false
 		i = squareImage(i)
 		b = i.Bounds()
 	}
 
-	// only do downscaling, otherwise just serve the original image
-	if mw < b.Dx() || mh < b.Dy() {
-		useBytesUnchanged = false
-
-		const huge = 2400
-		// If it's gigantic, it's more efficient to downsample first
-		// and then resize; resizing will smooth out the roughness.
-		// (trusting the moustachio guys on that one).
-		if b.Dx() > huge || b.Dy() > huge {
-			w, h := mw*2, mh*2
-			if b.Dx() > b.Dy() {
-				w = b.Dx() * h / b.Dy()
-			} else {
-				h = b.Dy() * w / b.Dx()
-			}
-			i = resize.Resample(i, i.Bounds(), w, h)
-			b = i.Bounds()
-		}
-		// conserve proportions. use the smallest of the two as the decisive one.
-		if mw > mh {
-			mw = b.Dx() * mh / b.Dy()
-		} else {
-			mh = b.Dy() * mw / b.Dx()
-		}
+	// Encode as a new image
+	var buf bytes.Buffer
+	switch format {
+	case "png":
+		err = png.Encode(&buf, i)
+	case "cr2":
+		// Recompress CR2 files as JPEG
+		format = "jpeg"
+		fallthrough
+	default:
+		err = jpeg.Encode(&buf, i, &jpeg.Options{
+			Quality: 90,
+		})
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	if !useBytesUnchanged {
-		i = resize.Resize(i, b, mw, mh)
-		// Encode as a new image
-		buf.Reset()
-		switch format {
-		case "jpeg":
-			err = jpeg.Encode(buf, i, nil)
-		default:
-			err = png.Encode(buf, i)
-		}
-		if err != nil {
-			return format, err
-		}
-	}
-	return format, nil
+	return &formatAndImage{format: format, image: buf.Bytes()}, nil
 }
 
-func (ih *ImageHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, file *blobref.BlobRef) {
-	if req.Method != "GET" && req.Method != "HEAD" {
+// singleResize prevents generating the same thumbnail at once from
+// two different requests.  (e.g. sending out a link to a new photo
+// gallery to a big audience)
+var singleResize singleflight.Group
+
+func (ih *ImageHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, file blob.Ref) {
+	if !httputil.IsGet(req) {
 		http.Error(rw, "Invalid method", 400)
 		return
 	}
 	mw, mh := ih.MaxWidth, ih.MaxHeight
-	if mw == 0 || mh == 0 || mw > 2000 || mh > 2000 {
+	if mw == 0 || mh == 0 || mw > search.MaxImageSize || mh > search.MaxImageSize {
 		http.Error(rw, "bogus dimensions", 400)
 		return
 	}
 
-	var buf bytes.Buffer
-	var err error
+	key := cacheKey(file.String(), mw, mh)
+	etag := blob.SHA1FromString(key).String()[5:]
+	inm := req.Header.Get("If-None-Match")
+	if inm != "" {
+		if strings.Trim(inm, `"`) == etag {
+			thumbCacheHeader304.Add(1)
+			rw.WriteHeader(http.StatusNotModified)
+			return
+		}
+	} else {
+		if !disableThumbCache && req.Header.Get("If-Modified-Since") != "" {
+			thumbCacheHeader304.Add(1)
+			rw.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+
+	var imageData []byte
 	format := ""
 	cacheHit := false
-	if ih.sc != nil {
-		format, err = ih.scaledCached(&buf, file)
-		if err != nil {
-			log.Printf("image resize: %v", err)
-		} else {
+	if ih.ThumbMeta != nil && !disableThumbCache {
+		var buf bytes.Buffer
+		format = ih.scaledCached(&buf, file)
+		if format != "" {
 			cacheHit = true
+			imageData = buf.Bytes()
 		}
 	}
 
 	if !cacheHit {
-		format, err = ih.scaleImage(&buf, file)
+		thumbCacheMiss.Add(1)
+		imi, err := singleResize.Do(key, func() (interface{}, error) {
+			return ih.scaleImage(file)
+		})
 		if err != nil {
 			http.Error(rw, err.Error(), 500)
 			return
 		}
-		if ih.sc != nil {
-			name := cacheKey(file.String(), mw, mh)
-			bufcopy := buf.Bytes()
-			err = ih.cacheScaled(bytes.NewBuffer(bufcopy), name)
+		im := imi.(*formatAndImage)
+		imageData = im.image
+		format = im.format
+		if ih.ThumbMeta != nil {
+			err := ih.cacheScaled(imageData, key)
 			if err != nil {
 				log.Printf("image resize: %v", err)
 			}
 		}
 	}
 
-	rw.Header().Set("Content-Type", imageContentTypeOfFormat(format))
-	size := buf.Len()
-	rw.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-	n, err := io.Copy(rw, &buf)
-	if err != nil {
-		log.Printf("error serving thumbnail of file schema %s: %v", file, err)
-		return
+	h := rw.Header()
+	if !disableThumbCache {
+		h.Set("Expires", time.Now().Add(oneYear).Format(http.TimeFormat))
+		h.Set("Last-Modified", time.Now().Format(http.TimeFormat))
+		h.Set("Etag", strconv.Quote(etag))
 	}
-	if n != int64(size) {
-		log.Printf("error serving thumbnail of file schema %s: sent %d, expected size of %d",
-			file, n, size)
-		return
+	h.Set("Content-Type", imageContentTypeOfFormat(format))
+	size := len(imageData)
+	h.Set("Content-Length", fmt.Sprint(size))
+	imageBytesServedVar.Add(int64(size))
+
+	if req.Method == "GET" {
+		n, err := rw.Write(imageData)
+		if err != nil {
+			if strings.Contains(err.Error(), "broken pipe") {
+				// boring.
+				return
+			}
+			// TODO: vlog this:
+			log.Printf("error serving thumbnail of file schema %s: %v", file, err)
+			return
+		}
+		if n != size {
+			log.Printf("error serving thumbnail of file schema %s: sent %d, expected size of %d",
+				file, n, size)
+			return
+		}
 	}
 }
 

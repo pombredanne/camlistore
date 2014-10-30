@@ -17,24 +17,37 @@ limitations under the License.
 package s3
 
 import (
-	"log"
-	"time"
+	"fmt"
+	"os"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/syncutil"
 )
 
-var _ = log.Printf
+var statGate = syncutil.NewGate(20) // arbitrary
 
-func (sto *s3Storage) StatBlobs(dest chan<- blobref.SizedBlobRef, blobs []*blobref.BlobRef, wait time.Duration) error {
-	// TODO: do n stats in parallel
-	for _, br := range blobs {
-		size, err := sto.s3Client.Stat(br.String(), sto.bucket)
-		log.Printf("stat of %s: %d, %v", br.String(), size, err)
-		if err == nil {
-			dest <- blobref.SizedBlobRef{BlobRef: br, Size: size}
-		} else {
-			// TODO: handle
-		}
+func (sto *s3Storage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) (err error) {
+	if faultStat.FailErr(&err) {
+		return
 	}
-	return nil
+	// TODO: use sto.cache
+	var wg syncutil.Group
+	for _, br := range blobs {
+		br := br
+		statGate.Start()
+		wg.Go(func() error {
+			defer statGate.Done()
+
+			size, err := sto.s3Client.Stat(br.String(), sto.bucket)
+			if err == nil {
+				dest <- blob.SizedRef{Ref: br, Size: uint32(size)}
+				return nil
+			}
+			if err == os.ErrNotExist {
+				return nil
+			}
+			return fmt.Errorf("error statting %v: %v", br, err)
+		})
+	}
+	return wg.Err()
 }

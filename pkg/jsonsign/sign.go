@@ -20,32 +20,18 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
-	"io"
-	"log"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
-	"camlistore.org/pkg/blobref"
-	"camlistore.org/pkg/misc/gpgagent"
-	"camlistore.org/pkg/misc/pinentry"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/osutil"
+	"camlistore.org/pkg/wkfs"
 	"camlistore.org/third_party/code.google.com/p/go.crypto/openpgp"
+	"camlistore.org/third_party/code.google.com/p/go.crypto/openpgp/packet"
 )
-
-var _ = log.Printf
-
-var flagSecretRing = ""
-
-func AddFlags() {
-	defSecRing := filepath.Join(os.Getenv("HOME"), ".gnupg", "secring.gpg")
-	flag.StringVar(&flagSecretRing, "secret-keyring", defSecRing,
-		"GnuPG secret keyring file to use.")
-}
 
 type EntityFetcher interface {
 	FetchEntity(keyId string) (*openpgp.Entity, error)
@@ -56,7 +42,7 @@ type FileEntityFetcher struct {
 }
 
 func FlagEntityFetcher() *FileEntityFetcher {
-	return &FileEntityFetcher{File: flagSecretRing}
+	return &FileEntityFetcher{File: osutil.SecretRingFile()}
 }
 
 type CachingEntityFetcher struct {
@@ -91,7 +77,7 @@ func (ce *CachingEntityFetcher) FetchEntity(keyId string) (*openpgp.Entity, erro
 }
 
 func (fe *FileEntityFetcher) FetchEntity(keyId string) (*openpgp.Entity, error) {
-	f, err := os.Open(fe.File)
+	f, err := wkfs.Open(fe.File)
 	if err != nil {
 		return nil, fmt.Errorf("jsonsign: FetchEntity: %v", err)
 	}
@@ -117,66 +103,10 @@ func (fe *FileEntityFetcher) FetchEntity(keyId string) (*openpgp.Entity, error) 
 	return nil, fmt.Errorf("jsonsign: entity for keyid %q not found in %q", keyId, fe.File)
 }
 
-func (fe *FileEntityFetcher) decryptEntity(e *openpgp.Entity) error {
-	// TODO: syscall.Mlock a region and keep pass phrase in it.
-	pubk := &e.PrivateKey.PublicKey
-	desc := fmt.Sprintf("Need to unlock GPG key %s to use it for signing.",
-		pubk.KeyIdShortString())
-
-	conn, err := gpgagent.NewConn()
-	switch err {
-	case gpgagent.ErrNoAgent:
-		fmt.Fprintf(os.Stderr, "Note: gpg-agent not found; resorting to on-demand password entry.\n")
-	case nil:
-		defer conn.Close()
-		req := &gpgagent.PassphraseRequest{
-			CacheKey: "camli:jsonsign:" + pubk.KeyIdShortString(),
-			Prompt:   "Passphrase",
-			Desc:     desc,
-		}
-		for tries := 0; tries < 2; tries++ {
-			pass, err := conn.GetPassphrase(req)
-			if err == nil {
-				err = e.PrivateKey.Decrypt([]byte(pass))
-				if err == nil {
-					return nil
-				}
-				req.Error = "Passphrase failed to decrypt: " + err.Error()
-				conn.RemoveFromCache(req.CacheKey)
-				continue
-			}
-			if err == gpgagent.ErrCancel {
-				return errors.New("jsonsign: failed to decrypt key; action canceled")
-			}
-			log.Printf("jsonsign: gpgagent: %v", err)
-		}
-	default:
-		log.Printf("jsonsign: gpgagent: %v", err)
-	}
-
-	pinReq := &pinentry.Request{Desc: desc, Prompt: "Passphrase"}
-	for tries := 0; tries < 2; tries++ {
-		pass, err := pinReq.GetPIN()
-		if err == nil {
-			err = e.PrivateKey.Decrypt([]byte(pass))
-			if err == nil {
-				return nil
-			}
-			pinReq.Error = "Passphrase failed to decrypt: " + err.Error()
-			continue
-		}
-		if err == pinentry.ErrCancel {
-			return errors.New("jsonsign: failed to decrypt key; action canceled")
-		}
-		log.Printf("jsonsign: pinentry: %v", err)
-	}
-	return fmt.Errorf("jsonsign: failed to decrypt key %q", pubk.KeyIdShortString())
-}
-
 type SignRequest struct {
 	UnsignedJSON string
-	Fetcher      interface{} // blobref.Fetcher or blobref.StreamingFetcher
-	ServerMode   bool        // if true, can't use pinentry or gpg-agent, etc.
+	Fetcher      blob.Fetcher
+	ServerMode   bool // if true, can't use pinentry or gpg-agent, etc.
 
 	// Optional signature time. If zero, time.Now() is used.
 	SignatureTime time.Time
@@ -187,8 +117,7 @@ type SignRequest struct {
 
 	// SecretKeyringPath is only used if EntityFetcher is nil,
 	// in which case SecretKeyringPath is used if non-empty.
-	// As a final resort, the flag value (defaulting to
-	// ~/.gnupg/secring.gpg) is used.
+	// As a final resort, we default to osutil.SecretRingFile().
 	SecretKeyringPath string
 }
 
@@ -196,7 +125,7 @@ func (sr *SignRequest) secretRingPath() string {
 	if sr.SecretKeyringPath != "" {
 		return sr.SecretKeyringPath
 	}
-	return flagSecretRing
+	return osutil.SecretRingFile()
 }
 
 func (sr *SignRequest) Sign() (signedJSON string, err error) {
@@ -221,27 +150,20 @@ func (sr *SignRequest) Sign() (signedJSON string, err error) {
 	}
 
 	camliSignerStr, _ := camliSigner.(string)
-	signerBlob := blobref.Parse(camliSignerStr)
-	if signerBlob == nil {
+	signerBlob, ok := blob.Parse(camliSignerStr)
+	if !ok {
 		return inputfail("json \"camliSigner\" key is malformed or unsupported")
 	}
 
-	var pubkeyReader io.ReadCloser
-	switch fetcher := sr.Fetcher.(type) {
-	case blobref.SeekFetcher:
-		pubkeyReader, _, err = fetcher.Fetch(signerBlob)
-	case blobref.StreamingFetcher:
-		pubkeyReader, _, err = fetcher.FetchStreaming(signerBlob)
-	default:
-		panic(fmt.Sprintf("jsonsign: bogus SignRequest.Fetcher of type %T", sr.Fetcher))
-	}
+	pubkeyReader, _, err := sr.Fetcher.Fetch(signerBlob)
 	if err != nil {
 		// TODO: not really either an inputfail or an execfail.. but going
 		// with exec for now.
-		return execfail(fmt.Sprintf("failed to find public key %s", signerBlob.String()))
+		return execfail(fmt.Sprintf("failed to find public key %s: %v", signerBlob.String(), err))
 	}
 
 	pubk, err := openArmoredPublicKeyFile(pubkeyReader)
+	pubkeyReader.Close()
 	if err != nil {
 		return execfail(fmt.Sprintf("failed to parse public key from blobref %s: %v", signerBlob.String(), err))
 	}
@@ -258,9 +180,9 @@ func (sr *SignRequest) Sign() (signedJSON string, err error) {
 	if entityFetcher == nil {
 		file := sr.secretRingPath()
 		if file == "" {
-			return "", errors.New("jsonsign: no EntityFetcher, SecretKeyringPath, or secret-keyring flag provided")
+			return "", errors.New("jsonsign: no EntityFetcher, and no secret ring file defined.")
 		}
-		secring, err := os.Open(sr.secretRingPath())
+		secring, err := wkfs.Open(sr.secretRingPath())
 		if err != nil {
 			return "", fmt.Errorf("jsonsign: failed to open secret ring file %q: %v", sr.secretRingPath(), err)
 		}
@@ -273,7 +195,12 @@ func (sr *SignRequest) Sign() (signedJSON string, err error) {
 	}
 
 	var buf bytes.Buffer
-	err = openpgp.ArmoredDetachSignAt(&buf, signer, sr.SignatureTime, strings.NewReader(trimmedJSON))
+	err = openpgp.ArmoredDetachSign(
+		&buf,
+		signer,
+		strings.NewReader(trimmedJSON),
+		&packet.Config{Time: func() time.Time { return sr.SignatureTime }},
+	)
 	if err != nil {
 		return "", err
 	}

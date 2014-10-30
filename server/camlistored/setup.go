@@ -22,14 +22,26 @@ import (
 	"net/http"
 	"syscall"
 
+	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/netutil"
-	"camlistore.org/pkg/webserver"
 )
 
 func setupHome(rw http.ResponseWriter, req *http.Request) {
-	_, port, _ := net.SplitHostPort(*webserver.Listen)
-	ourAddr := "127.0.0.1:" + port
-	uid, err := netutil.AddrPairUserid(req.RemoteAddr, ourAddr)
+	port := httputil.RequestTargetPort(req)
+	localhostAddr, err := netutil.Localhost()
+	if err != nil {
+		httputil.ServeError(rw, req, err)
+	}
+	ourAddr := &net.TCPAddr{IP: localhostAddr, Port: port}
+	rAddr, err := net.ResolveTCPAddr("tcp", req.RemoteAddr)
+	if err != nil {
+		fmt.Printf("camlistored: unable to resolve RemoteAddr %q: %v", req.RemoteAddr, err)
+		return
+	}
+	uid, err := netutil.AddrPairUserid(rAddr, ourAddr)
+	if err != nil {
+		httputil.ServeError(rw, req, err)
+	}
 
 	fmt.Fprintf(rw, "Hello %q\n", req.RemoteAddr)
 	fmt.Fprintf(rw, "<p>uid = %d\n", syscall.Getuid())

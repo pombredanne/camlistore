@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package netutil identifies the system userid responsible for
+// localhost TCP connections.
 package netutil
 
 import (
@@ -27,72 +29,84 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 )
 
-var ErrNotFound = errors.New("netutil: connection not found")
+var (
+	ErrNotFound      = errors.New("netutil: connection not found")
+	ErrUnsupportedOS = errors.New("netutil: not implemented on this operating system")
+)
 
 // ConnUserid returns the uid that owns the given localhost connection.
 // The returned error is ErrNotFound if the connection wasn't found.
 func ConnUserid(conn net.Conn) (uid int, err error) {
-	return AddrPairUserid(conn.LocalAddr().String(), conn.RemoteAddr().String())
+	return AddrPairUserid(conn.LocalAddr(), conn.RemoteAddr())
 }
 
-func splitIPPort(param, value string) (ip net.IP, port int, reterr error) {
-	addrs, ports, err := net.SplitHostPort(value)
+// HostPortToIP parses a host:port to a TCPAddr without resolving names.
+// If given a context IP, it will resolve localhost to match the context's IP family.
+func HostPortToIP(hostport string, ctx *net.TCPAddr) (hostaddr *net.TCPAddr, err error) {
+	host, port, err := net.SplitHostPort(hostport)
 	if err != nil {
-		reterr = fmt.Errorf("netutil: AddrPairUserid invalid %s value of %q: %v", param, value, err)
-		return
+		return nil, err
 	}
-	ip = net.ParseIP(addrs)
-	if ip == nil {
-		reterr = fmt.Errorf("netutil: invalid %s IP %q", param, addrs)
-		return
+	iport, err := strconv.Atoi(port)
+	if err != nil || iport < 0 || iport > 0xFFFF {
+		return nil, fmt.Errorf("invalid port %d", iport)
 	}
-	port, err = strconv.Atoi(ports)
-	if err != nil || port <= 0 || port > 65535 {
-		reterr = fmt.Errorf("netutil: invalid port %q", ports)
-		return
+	var addr net.IP
+	if ctx != nil && host == "localhost" {
+		if ctx.IP.To4() != nil {
+			addr = net.IPv4(127, 0, 0, 1)
+		} else {
+			addr = net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+		}
+	} else if addr = net.ParseIP(host); addr == nil {
+		return nil, fmt.Errorf("could not parse IP %s", host)
 	}
-	return
+
+	return &net.TCPAddr{IP: addr, Port: iport}, nil
 }
 
 // AddrPairUserid returns the local userid who owns the TCP connection
 // given by the local and remote ip:port (lipport and ripport,
 // respectively).  Returns ErrNotFound for the error if the TCP connection
 // isn't found.
-func AddrPairUserid(lipport, ripport string) (uid int, err error) {
-	lip, lport, err := splitIPPort("lipport", lipport)
-	if err != nil {
-		return -1, err
+func AddrPairUserid(local, remote net.Addr) (uid int, err error) {
+	lAddr, lOk := local.(*net.TCPAddr)
+	rAddr, rOk := remote.(*net.TCPAddr)
+	if !(lOk && rOk) {
+		return -1, fmt.Errorf("netutil: Could not convert Addr to TCPAddr.")
 	}
-	rip, rport, err := splitIPPort("ripport", ripport)
-	if err != nil {
-		return -1, err
-	}
-	localv4 := (lip.To4() != nil)
-	remotev4 := (rip.To4() != nil)
+
+	localv4 := (lAddr.IP.To4() != nil)
+	remotev4 := (rAddr.IP.To4() != nil)
 	if localv4 != remotev4 {
 		return -1, fmt.Errorf("netutil: address pairs of different families; localv4=%v, remotev4=%v",
 			localv4, remotev4)
 	}
 
-	if runtime.GOOS == "darwin" {
-		return uidFromDarwinLsof(lip, lport, rip, rport)
+	switch runtime.GOOS {
+	case "darwin":
+		return uidFromLsof(lAddr.IP, lAddr.Port, rAddr.IP, rAddr.Port)
+	case "freebsd":
+		return uidFromSockstat(lAddr.IP, lAddr.Port, rAddr.IP, rAddr.Port)
+	case "linux":
+		file := "/proc/net/tcp"
+		if !localv4 {
+			file = "/proc/net/tcp6"
+		}
+		f, err := os.Open(file)
+		if err != nil {
+			return -1, fmt.Errorf("Error opening %s: %v", file, err)
+		}
+		defer f.Close()
+		return uidFromProcReader(lAddr.IP, lAddr.Port, rAddr.IP, rAddr.Port, f)
 	}
-
-	file := "/proc/net/tcp"
-	if !localv4 {
-		file = "/proc/net/tcp6"
-	}
-	f, err := os.Open(file)
-	if err != nil {
-		return -1, fmt.Errorf("Error opening %s: %v", file, err)
-	}
-	defer f.Close()
-	return uidFromReader(lip, lport, rip, rport, f)
+	return 0, ErrUnsupportedOS
 }
 
 func toLinuxIPv4Order(b []byte) []byte {
@@ -118,14 +132,32 @@ func (p maybeBrackets) String() string {
 	return s
 }
 
-func uidFromDarwinLsof(lip net.IP, lport int, rip net.IP, rport int) (uid int, err error) {
+// Changed by tests.
+var uidFromUsername = uidFromUsernameFn
+
+func uidFromUsernameFn(username string) (uid int, err error) {
+	if uid := os.Getuid(); uid != 0 && username == os.Getenv("USER") {
+		return uid, nil
+	}
+	u, err := user.Lookup(username)
+	if err == nil {
+		uid, err := strconv.Atoi(u.Uid)
+		return uid, err
+	}
+	return 0, err
+}
+
+func uidFromLsof(lip net.IP, lport int, rip net.IP, rport int) (uid int, err error) {
 	seek := fmt.Sprintf("%s:%d->%s:%d", maybeBrackets(lip), lport, maybeBrackets(rip), rport)
 	seekb := []byte(seek)
+	if _, err = exec.LookPath("lsof"); err != nil {
+		return
+	}
 	cmd := exec.Command("lsof",
-		"-b",    // avoid system calls that could block
-		"-w",    // and don't warn about cases where -b fails
-		"-n",    // don't resolve network names
-		"-P",    // don't resolve network ports,
+		"-b", // avoid system calls that could block
+		"-w", // and don't warn about cases where -b fails
+		"-n", // don't resolve network names
+		"-P", // don't resolve network ports,
 		// TODO(bradfitz): pass down the uid we care about, then do: ?
 		//"-a",  // AND the following together:
 		// "-u", strconv.Itoa(uid)  // just this uid
@@ -159,21 +191,52 @@ func uidFromDarwinLsof(lip net.IP, lport int, rip net.IP, rport int) (uid int, e
 			continue
 		}
 		username := string(f[2])
-		if uid := os.Getuid(); uid != 0 && username == os.Getenv("USER") {
-			return uid, nil
-		}
-		u, err := user.Lookup(username)
-		if err == nil {
-			uid, err := strconv.Atoi(u.Uid)
-			return uid, err
-		}
-		return 0, err
+		return uidFromUsername(username)
 	}
 	return -1, ErrNotFound
 
 }
 
-func uidFromReader(lip net.IP, lport int, rip net.IP, rport int, r io.Reader) (uid int, err error) {
+func uidFromSockstat(lip net.IP, lport int, rip net.IP, rport int) (int, error) {
+	cmd := exec.Command("sockstat", "-Ptcp")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return -1, err
+	}
+	defer cmd.Wait()
+	defer stdout.Close()
+	err = cmd.Start()
+	if err != nil {
+		return -1, err
+	}
+	defer cmd.Process.Kill()
+
+	return uidFromSockstatReader(lip, lport, rip, rport, stdout)
+}
+
+func uidFromSockstatReader(lip net.IP, lport int, rip net.IP, rport int, r io.Reader) (int, error) {
+	pat, err := regexp.Compile(fmt.Sprintf(`^([^ ]+).*%s:%d *%s:%d$`,
+		lip.String(), lport, rip.String(), rport))
+	if err != nil {
+		return -1, err
+	}
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		l := scanner.Text()
+		m := pat.FindStringSubmatch(l)
+		if len(m) == 2 {
+			return uidFromUsername(m[1])
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return -1, err
+	}
+
+	return -1, ErrNotFound
+}
+
+func uidFromProcReader(lip net.IP, lport int, rip net.IP, rport int, r io.Reader) (uid int, err error) {
 	buf := bufio.NewReader(r)
 
 	localHex := ""
@@ -209,4 +272,17 @@ func uidFromReader(lip net.IP, lport int, rip net.IP, rport int, r io.Reader) (u
 		}
 	}
 	panic("unreachable")
+}
+
+// Localhost returns the first address found when
+// doing a lookup of "localhost".
+func Localhost() (net.IP, error) {
+	ips, err := net.LookupIP("localhost")
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) < 1 {
+		return nil, errors.New("IP lookup for localhost returned no result")
+	}
+	return ips[0], nil
 }

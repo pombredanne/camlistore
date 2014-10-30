@@ -12,245 +12,94 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-*/
+ */
 
 package org.camlistore;
 
-import java.io.BufferedOutputStream;
-import java.io.FileInputStream;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.io.PrintWriter;
-import java.io.UnsupportedEncodingException;
-import java.util.ArrayList;
-import java.util.LinkedList;
-import java.util.List;
+import java.io.OutputStreamWriter;
+import java.util.HashMap;
 import java.util.ListIterator;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-import org.apache.http.Header;
-import org.apache.http.HttpEntity;
-import org.apache.http.HttpResponse;
-import org.apache.http.StatusLine;
-import org.apache.http.auth.AuthScope;
-import org.apache.http.auth.UsernamePasswordCredentials;
-import org.apache.http.client.ClientProtocolException;
-import org.apache.http.client.CredentialsProvider;
-import org.apache.http.client.entity.UrlEncodedFormEntity;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.impl.client.BasicCredentialsProvider;
-import org.apache.http.impl.client.DefaultHttpClient;
-import org.apache.http.message.BasicHeader;
-import org.apache.http.message.BasicNameValuePair;
-import org.json.JSONArray;
-import org.json.JSONException;
-import org.json.JSONObject;
-
-import android.os.ParcelFileDescriptor;
-import android.os.SystemClock;
-import android.util.Base64;
 import android.util.Log;
 
 public class UploadThread extends Thread {
     private static final String TAG = "UploadThread";
-    
+
     private final UploadService mService;
     private final HostPort mHostPort;
+    private final String mTrustedCert;
+    private final String mUsername;
     private final String mPassword;
-    private LinkedList<QueuedFile> mQueue;
+    private final LinkedBlockingQueue<UploadThreadMessage> msgCh = new LinkedBlockingQueue<UploadThreadMessage>();
 
-    private final AtomicBoolean mStopRequested = new AtomicBoolean(false);
+    AtomicReference<Process> goProcess = new AtomicReference<Process>();
+    AtomicReference<OutputStream> toChildRef = new AtomicReference<OutputStream>();
+    HashMap<String, QueuedFile> mQueuedFile = new HashMap<String, QueuedFile>(); // guarded
+                                                                                 // by
+                                                                                 // itself
 
-    private final DefaultHttpClient mUA = new DefaultHttpClient();
+    private final Object stdinLock = new Object(); // guards setting and writing
+                                                   // to stdinWriter
+    private BufferedWriter stdinWriter;
 
-    private static final String USERNAME = "TODO-DUMMY-USER";
-
-    public UploadThread(UploadService uploadService, HostPort hp, String password) {
+    public UploadThread(UploadService uploadService, HostPort hp, String trustedCert, String username, String password) {
         mService = uploadService;
         mHostPort = hp;
+        mTrustedCert = trustedCert != null ? trustedCert.toLowerCase().trim() : "";
+        mUsername = username;
         mPassword = password;
-
-        // TODO: this crap results in double HTTP requests on everything.
-        // And the setAuthenticationPreemptive method described at
-        //    http://hc.apache.org/httpclient-3.x/authentication.html
-        // doesn't seem to be available on Android.  So screw it, do it by hand instead
-        // below, manually setting the Authorization header.
-        //
-        //CredentialsProvider creds = new BasicCredentialsProvider();
-        //creds.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(USERNAME,
-        //password));
-        //mUA.setCredentialsProvider(creds);
-        Log.d(TAG, "Authorization: " + getBasicAuthHeaderValue());
-    }
-    
-    public void stopPlease() {
-        mStopRequested.set(true);
     }
 
-    private String getBasicAuthHeaderValue() {
-        return Util.getBasicAuthHeaderValue(USERNAME, mPassword);
-    }
-
-    @Override
-    public void run() {
-        if (!mHostPort.isValid()) {
+    public void stopUploads() {
+        Process p = goProcess.get();
+        if (p == null) {
             return;
         }
-        status("Running UploadThread for " + mHostPort);
-
-        mService.setInFlightBytes(0);
-        mService.setInFlightBlobs(0);
-        
-        while (!(mQueue = mService.uploadQueue()).isEmpty()) {
-            if (mStopRequested.get()) {
-                status("Upload pause requested; ending upload.");
+        synchronized (stdinLock) {
+            if (stdinWriter == null) {
+                // force kill. confused.
+                p.destroy();
+                goProcess.set(null);
+                return;
+            }
+            try {
+                stdinWriter.close();
+                Log.d(TAG, "Closed camput's stdin");
+                stdinWriter = null;
+            } catch (IOException e) {
+                p.destroy(); // force kill
+                goProcess.set(null);
                 return;
             }
 
-            status("Starting pre-upload of " + mQueue.size() + " files.");
-            JSONObject preUpload = doPreUpload();
-            if (preUpload == null) {
-                Log.w(TAG, "Preupload stat failed, ending UploadThread.");
-                return;
-            }
+            // Unnecessary paranoia, never seen in practice:
+            new Thread() {
+                @Override
+                public void run() {
+                    try {
+                        Thread.sleep(750, 0);
+                        stopUploads(); // force kill if still alive.
+                    } catch (InterruptedException e) {
+                    }
 
-            if (mStopRequested.get()) {
-                status("Upload pause requested; ending upload.");
-                return;
-            }
-
-            status("Uploading...");
-            if (!doUpload(preUpload)) {
-                Log.w(TAG, "Upload failed, ending UploadThread.");
-                return;
-            }
-            mService.setInFlightBytes(0);
-            mService.setInFlightBlobs(0);
-        }
-
-        status("Queue empty; done.");
-    }
-
-    private JSONObject doPreUpload() {
-        // Do the pre-upload.
-        HttpPost preReq = new HttpPost(mHostPort.httpScheme() + "://" + mHostPort
-                + "/camli/stat");
-        preReq.setHeader("Authorization", getBasicAuthHeaderValue());
-        List<BasicNameValuePair> uploadKeys = new ArrayList<BasicNameValuePair>();
-        uploadKeys.add(new BasicNameValuePair("camliversion", "1"));
-
-        int n = 0;
-        for (QueuedFile qf : mQueue) {
-            uploadKeys.add(new BasicNameValuePair("blob" + (++n), qf.getContentName()));
-        }
-
-        try {
-            preReq.setEntity(new UrlEncodedFormEntity(uploadKeys));
-        } catch (UnsupportedEncodingException e) {
-            Log.e(TAG, "error", e);
-            return null;
-        }
-
-        JSONObject preUpload = null;
-        String jsonSlurp = null;
-        try {
-            HttpResponse res = mUA.execute(preReq);
-            Log.d(TAG, "response: " + res);
-            Log.d(TAG, "response code: " + res.getStatusLine());
-            // TODO: check response code
-
-            jsonSlurp = Util.slurp(res.getEntity().getContent());
-            preUpload = new JSONObject(jsonSlurp);
-        } catch (ClientProtocolException e) {
-            Log.e(TAG, "preupload error", e);
-            return null;
-        } catch (IOException e) {
-            Log.e(TAG, "preupload error", e);
-            return null;
-        } catch (JSONException e) {
-            Log.e(TAG, "preupload JSON parse error from: " + jsonSlurp, e);
-            return null;
-        }
-        return preUpload;
-    }
-
-    private boolean doUpload(JSONObject preUpload) {
-        Log.d(TAG, "JSON: " + preUpload);
-        String uploadUrl = preUpload
-            .optString("uploadUrl", mHostPort.httpScheme() + "://" + mHostPort + "/camli/upload");
-        Log.d(TAG, "uploadURL is: " + uploadUrl);
-
-        // Which ones do we already have, so don't have to upload again?
-        filterOutAlreadyUploadedBlobs(preUpload.optJSONArray("alreadyHave"));
-        if (mQueue.isEmpty()) {
-            return true;
-        }
-
-        HttpPost uploadReq = new HttpPost(uploadUrl);
-        uploadReq.setHeader("Authorization", getBasicAuthHeaderValue());
-        MultipartEntity entity = new MultipartEntity();
-        uploadReq.setEntity(entity);
-        HttpResponse uploadRes = null;
-        try {
-            uploadRes = mUA.execute(uploadReq);
-        } catch (ClientProtocolException e) {
-            Log.e(TAG, "upload1 error", e);
-            return false;
-        } catch (IOException e) {
-            Log.e(TAG, "upload2 error", e);
-            return false;
-        }
-        Log.d(TAG, "response: " + uploadRes);
-        StatusLine statusLine = uploadRes.getStatusLine();
-        Log.d(TAG, "response code: " + statusLine);
-        // TODO: check response body, once response body is defined?
-        mService.setInFlightBlobs(0);
-        mService.setInFlightBytes(0);
-        if (statusLine == null || statusLine.getStatusCode() < 200
-                || statusLine.getStatusCode() > 299) {
-            Log.d(TAG, "upload error.");
-            // TODO: back-off? or probably in the Service layer.
-            return false;
-        }
-        for (QueuedFile qf : entity.getFilesWritten()) {
-            // TODO: only do this if acknowledged in JSON response?
-            Log.d(TAG, "Upload complete for: " + qf);
-            mService.onUploadComplete(qf, true /* not a dupe, uploaded */);
-        }
-        Log.d(TAG, "doUpload returning true.");
-        return true;
-    }
-
-    private void filterOutAlreadyUploadedBlobs(JSONArray alreadyHave) {
-        if (alreadyHave == null) {
-            return;
-        }
-        for (int i = 0; i < alreadyHave.length(); ++i) {
-            JSONObject o = alreadyHave.optJSONObject(i);
-            if (o == null) {
-                // Malformed response; ignore.
-                continue;
-            }
-            String blobRef = o.optString("blobRef");
-            if (blobRef == null) {
-                // Malformed response; ignore
-                continue;
-            }
-            filterOutBlobRef(blobRef);
+                }
+            }.start();
         }
     }
 
-    private void filterOutBlobRef(String blobRef) {
-        // TODO: kinda lame, iterating over whole list.
-        ListIterator<QueuedFile> iter = mQueue.listIterator();
-        while (iter.hasNext()) {
-            QueuedFile qf = iter.next();
-            if (qf.getContentName().equals(blobRef)) {
-                iter.remove();
-                mService.onUploadComplete(qf, false /* not uploaded */);
-            }
-        }
+    private String binaryPath(String suffix) {
+        return mService.getBaseContext().getFilesDir().getAbsolutePath() + "/" + suffix;
     }
 
     private void status(String st) {
@@ -258,174 +107,303 @@ public class UploadThread extends Thread {
         mService.setUploadStatusText(st);
     }
 
-    private class MultipartEntity implements HttpEntity {
+    // An UploadThreadMessage can be sent on msgCh and read by the run() method
+    // in
+    // until it's time to quit the thread.
+    private static class UploadThreadMessage {
+    }
 
-        private static final String CONTENT_DISPOSITION_LINE_PATTERN = "Content-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n";
-        private static final String CONTENT_TYPE_LINE = "Content-Type: application/octet-stream\r\n";
-        private static final String CRLF = "\r\n";
+    private static class ProcessExitedMessage extends UploadThreadMessage {
+        public int code;
 
-        private static final int MAX_WRITE_PER_ENTITY = 1024 * 1024;
-
-        private boolean mDone = false;
-        private final String mBoundary;
-        private final List<QueuedFile> mFilesWritten = new ArrayList<QueuedFile>();
-
-        public MultipartEntity() {
-            // TODO: proper boundary
-            mBoundary = "TODOLKSDJFLKSDJFLdslkjfjf23ojf0j30dm32LFDSJFLKSDJF";
-        }
-
-        public List<QueuedFile> getFilesWritten() {
-            return mFilesWritten;
-        }
-
-        public void consumeContent() throws IOException {
-            // From the docs: "The name of this method is misnomer ...
-            // This method is called to indicate that the content of this entity
-            // is no longer required. All entity implementations are expected to
-            // release all allocated resources as a result of this method
-            // invocation."
-            Log.d(TAG, "consumeContent()");
-            mDone = true;
-        }
-
-        public InputStream getContent() throws IOException, IllegalStateException {
-            throw new RuntimeException("unexpected getContent() call");
-        }
-
-        public Header getContentEncoding() {
-            return null; // "unknown"
-        }
-
-        public long getContentLength() {
-            long length = 0;
-            int bytesWritten = 0;
-            for (QueuedFile qf : mQueue) {
-                ParcelFileDescriptor pfd = mService.getFileDescriptor(qf.getUri());
-                long totalFileBytes = pfd.getStatSize();
-
-                length += newBoundarySize();
-                length += String.format(CONTENT_DISPOSITION_LINE_PATTERN, qf.getContentName(), qf.getContentName()).length();
-                length += CONTENT_TYPE_LINE.length();
-                length += CRLF.length();
-
-                length += totalFileBytes;
-
-                // copied logic from writeTo below. kinda lame.
-                bytesWritten += totalFileBytes;
-                if (bytesWritten > MAX_WRITE_PER_ENTITY) {
-                    break;
-                }
-            }
-            length += endBoundarySize();
-            Log.d(TAG, "multipart getContentLength(): " + length);
-            return length;
-        }
-
-        public Header getContentType() {
-            return new BasicHeader("Content-Type", "multipart/form-data; boundary=" + mBoundary);
-        }
-
-        public boolean isChunked() {
-            Log.d(TAG, "multipart isChunked(): false");
-            return false;
-        }
-
-        public boolean isRepeatable() {
-            // Well, not really, but needs to be for DefaultRequestDirector
-            return true;
-        }
-
-        public boolean isStreaming() {
-            Log.d(TAG, "multipart isStreaming(): " + !mDone);
-            return !mDone;
-        }
-
-        public void writeTo(OutputStream out) throws IOException {
-            Log.d(TAG, "writeTo outputstream...");
-            BufferedOutputStream bos = new BufferedOutputStream(out, 1024);
-            PrintWriter pw = new PrintWriter(bos);
-            byte[] buf = new byte[1024];
-
-            int bytesWritten = 0;
-            long timeStarted = SystemClock.uptimeMillis();
-
-            for (QueuedFile qf : mQueue) {
-                Log.d(TAG, "begin writeTo of " + qf);
-                ParcelFileDescriptor pfd = mService.getFileDescriptor(qf.getUri());
-                long uploadedFileBytes = 0;
-                if (pfd == null) {
-                    // TODO: report some error up to user?
-                    mQueue.removeFirst();
-                    continue;
-                }
-                startNewBoundary(pw);
-                pw.flush();
-                pw.print(String.format(CONTENT_DISPOSITION_LINE_PATTERN, qf.getContentName(), qf.getContentName()));
-                pw.print(CONTENT_TYPE_LINE);
-                pw.print(CRLF);
-                pw.flush();
-
-                FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
-                int n;
-                while ((n = fis.read(buf)) != -1) {
-                    bos.write(buf, 0, n);
-                    bytesWritten += n;
-                    uploadedFileBytes += n;
-                    mService.setInFlightBytes(bytesWritten);
-                    if (mStopRequested.get()) {
-                        status("Upload pause requested; ending write.");
-                        pfd.close();
-                        return;
-                    }
-                }
-                bos.flush();
-                pfd.close();
-                // TODO: notification of update
-
-                Log.d(TAG, "write of " + qf.getContentName() + " complete.");
-                mFilesWritten.add(qf);
-
-                if (bytesWritten > MAX_WRITE_PER_ENTITY) {
-                    Log.d(TAG, "enough bytes written, stopping writing after " + bytesWritten);
-                    // Stop after 1MB to get response.
-                    // TODO: make this smarter, configurable, time-based.
-                    break;
-                }
-
-                long now = SystemClock.uptimeMillis();
-                if (now - timeStarted > 15 * 1000) {
-                    // TODO: configurable
-                    status("We've been writing this request for 15 seconds, finish it.");
-                    break;
-                }
-            }
-            endBoundary(pw);
-            pw.flush();
-            bos.flush();
-            Log.d(TAG, "finished writing upload MIME body.");
-        }
-
-        private int newBoundarySize() {
-            // "\r\n--" + boundary + "\r\n"
-            return 6 + mBoundary.length();
-        }
-
-        private void startNewBoundary(PrintWriter pw) {
-            pw.print("\r\n--");
-            pw.print(mBoundary);
-            pw.print("\r\n");
-        }
-
-        private int endBoundarySize() {
-            // "\r\n--" + boundary + "--\r\n"
-            return 8 + mBoundary.length();
-        }
-
-        private void endBoundary(PrintWriter pw) {
-            pw.print("\r\n--");
-            pw.print(mBoundary);
-            pw.print("--\r\n");
+        public ProcessExitedMessage(int code) {
+            this.code = code;
         }
     }
+
+    public boolean enqueueFile(QueuedFile qf) {
+        String diskPath = qf.getDiskPath();
+        if (diskPath == null) {
+            Log.d(TAG, "file has no disk path: " + qf);
+            return false;
+        }
+        synchronized (stdinLock) {
+            if (stdinWriter == null) {
+                return false;
+            }
+            synchronized (mQueuedFile) {
+                mQueuedFile.put(diskPath, qf);
+            }
+            try {
+                stdinWriter.write(diskPath + "\n");
+                stdinWriter.flush();
+            } catch (IOException e) {
+                Log.d(TAG, "Failed to write " + diskPath + " to camput stdin: " + e);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    public void run() {
+        Log.d(TAG, "Running");
+        if (!mHostPort.isValid()) {
+            Log.d(TAG, "host/port is invalid");
+            return;
+        }
+        status("Running UploadThread for " + mHostPort);
+
+        mService.onStatReceived(null, 0);
+
+        Process process = null;
+        try {
+            ProcessBuilder pb = new ProcessBuilder();
+            pb.command(binaryPath("camput.bin"), "--server=" + mHostPort.urlPrefix(), "file", "-stdinargs", "-vivify");
+            pb.redirectErrorStream(false);
+            pb.environment().put("CAMLI_AUTH", "userpass:" + mUsername + ":" + mPassword);
+            pb.environment().put("CAMLI_TRUSTED_CERT", mTrustedCert);
+            pb.environment().put("CAMLI_CACHE_DIR", mService.getCacheDir().getAbsolutePath());
+            pb.environment().put("CAMPUT_ANDROID_OUTPUT", "1");
+            process = pb.start();
+            goProcess.set(process);
+            synchronized (stdinLock) {
+                stdinWriter = new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), "UTF-8"));
+            }
+            new CopyToAndroidLogThread("stderr", process.getErrorStream()).start();
+            new ParseCamputOutputThread(process, mService).start();
+            new WaitForProcessThread(process).start();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
+        ListIterator<QueuedFile> iter = mService.uploadQueue().listIterator();
+        while (iter.hasNext()) {
+            enqueueFile(iter.next());
+        }
+
+        // Loop forever reading from msgCh
+        while (true) {
+            UploadThreadMessage msg = null;
+            try {
+                msg = msgCh.poll(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                continue;
+            }
+            if (msg instanceof ProcessExitedMessage) {
+                status("Upload process ended.");
+                ProcessExitedMessage pem = (ProcessExitedMessage) msg;
+                Log.d(TAG, "Loop exiting; code was = " + pem.code);
+                return;
+            }
+        }
+    }
+
+    // "CHUNK_UPLOADED %d %s %s\n", sb.Size, blob, asr.path
+    private final static Pattern chunkUploadedPattern = Pattern.compile("^CHUNK_UPLOADED (\\d+) (\\S+) (.+)");
+
+    public class CamputChunkUploadedMessage {
+        private final String mFilename;
+        private final long mSize;
+
+        public CamputChunkUploadedMessage(String line) {
+            Matcher m = chunkUploadedPattern.matcher(line);
+            if (!m.matches()) {
+                throw new RuntimeException("bogus CamputChunkMessage: " + line);
+            }
+            mSize = Long.parseLong(m.group(1));
+            mFilename = m.group(3);
+        }
+
+        public QueuedFile queuedFile() {
+            synchronized (mQueuedFile) {
+                return mQueuedFile.get(mFilename);
+            }
+        }
+
+        public long size() {
+            return mSize;
+        }
+    }
+
+    // STAT %s %d\n
+    private final static Pattern statPattern = Pattern.compile("^STAT (\\S+) (\\d+)\\b");
+
+    public class CamputStatMessage {
+        private final Matcher mm;
+
+        public CamputStatMessage(String line) {
+            mm = statPattern.matcher(line);
+            if (!mm.matches()) {
+                throw new RuntimeException("bogus CamputStatMessage: " + line);
+            }
+        }
+
+        public String name() {
+            return mm.group(1);
+        }
+
+        public long value() {
+            return Long.parseLong(mm.group(2));
+        }
+    }
+
+    // STATS nfile=%d nbyte=%d skfile=%d skbyte=%d upfile=%d upbyte=%d\n
+    private final static Pattern statsPattern = Pattern.compile("^STATS nfile=(\\d+) nbyte=(\\d+) skfile=(\\d+) skbyte=(\\d+) upfile=(\\d+) upbyte=(\\d+)");
+
+    public class CamputStatsMessage {
+        private final Matcher mm;
+
+        public CamputStatsMessage(String line) {
+            mm = statsPattern.matcher(line);
+            if (!mm.matches()) {
+                throw new RuntimeException("bogus CamputStatsMessage: " + line);
+            }
+        }
+
+        private long field(int n) {
+            return Long.parseLong(mm.group(n));
+        }
+
+        public long totalFiles() {
+            return field(1);
+        }
+
+        public long totalBytes() {
+            return field(2);
+        }
+
+        public long skippedFiles() {
+            return field(3);
+        }
+
+        public long skippedBytes() {
+            return field(4);
+        }
+
+        public long uploadedFiles() {
+            return field(5);
+        }
+
+        public long uploadedBytes() {
+            return field(6);
+        }
+    }
+
+    private class ParseCamputOutputThread extends Thread {
+        private final BufferedReader mBufIn;
+        private final UploadService mService;
+        private final static String TAG = UploadThread.TAG + "/camput-out";
+        private final static boolean DEBUG_CAMPUT_ACTIVITY = false;
+
+        public ParseCamputOutputThread(Process process, UploadService service) {
+            mService = service;
+            mBufIn = new BufferedReader(new InputStreamReader(process.getInputStream()));
+        }
+
+        @Override
+        public void run() {
+            while (true) {
+                String line = null;
+                try {
+                    line = mBufIn.readLine();
+                } catch (IOException e) {
+                    Log.d(TAG, "Exception reading camput's stdout: " + e.toString());
+                    return;
+                }
+                if (DEBUG_CAMPUT_ACTIVITY) {
+                    Log.d(TAG, "camput: " + line);
+                }
+                if (line == null) {
+                    // EOF
+                    return;
+                }
+                if (line.startsWith("CHUNK_UPLOADED ")) {
+                    CamputChunkUploadedMessage msg = new CamputChunkUploadedMessage(line);
+                    mService.onChunkUploaded(msg);
+                    continue;
+                }
+                if (line.startsWith("STATS ")) {
+                    CamputStatsMessage msg = new CamputStatsMessage(line);
+                    mService.onStatsReceived(msg);
+                    continue;
+                }
+                if (line.startsWith("STAT ")) {
+                    CamputStatMessage msg = new CamputStatMessage(line);
+                    mService.onStatReceived(msg.name(), msg.value());
+                    continue;
+                }
+                if (line.startsWith("FILE_UPLOADED ")) {
+                    String filename = line.substring(14).trim();
+                    QueuedFile qf = null;
+                    synchronized (mQueuedFile) {
+                        qf = mQueuedFile.get(filename);
+                        if (qf != null) {
+                            mQueuedFile.remove(filename);
+                        }
+                    }
+                    if (qf != null) {
+                        mService.onUploadComplete(qf);
+                    }
+                    continue;
+                }
+                Log.d(TAG, "camput said unknown line: " + line);
+            }
+
+        }
+    }
+
+    private class WaitForProcessThread extends Thread {
+        private final Process mProcess;
+
+        public WaitForProcessThread(Process p) {
+            mProcess = p;
+        }
+
+        @Override
+        public void run() {
+            Log.d(TAG, "Waiting for camput process.");
+            try {
+                mProcess.waitFor();
+            } catch (InterruptedException e) {
+                Log.d(TAG, "Interrupted waiting for camput");
+                msgCh.offer(new ProcessExitedMessage(-1));
+                return;
+            }
+            Log.d(TAG, "Exit status of camput = " + mProcess.exitValue());
+            msgCh.offer(new ProcessExitedMessage(mProcess.exitValue()));
+        }
+    }
+
+    // CopyToAndroidLogThread copies the camput child process's stderr
+    // to Android's log.
+    private static class CopyToAndroidLogThread extends Thread {
+        private final BufferedReader mBufIn;
+        private final String mStream;
+
+        public CopyToAndroidLogThread(String stream, InputStream in) {
+            mBufIn = new BufferedReader(new InputStreamReader(in));
+            mStream = stream;
+        }
+
+        @Override
+        public void run() {
+            String tag = TAG + "/" + mStream + "-child";
+            while (true) {
+                String line = null;
+                try {
+                    line = mBufIn.readLine();
+                } catch (IOException e) {
+                    Log.d(tag, "Exception: " + e.toString());
+                    return;
+                }
+                if (line == null) {
+                    // EOF
+                    return;
+                }
+                Log.d(tag, line);
+            }
+        }
+    }
+
 }

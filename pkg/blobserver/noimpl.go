@@ -20,46 +20,34 @@ import (
 	"errors"
 	"io"
 	"os"
-	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/context"
 )
 
-type NoImplStorage struct {
-}
+// NoImplStorage is an implementation of Storage that returns a not
+// implemented error for all operations.
+type NoImplStorage struct{}
 
-var _ Storage = (*NoImplStorage)(nil)
+var _ Storage = NoImplStorage{}
 
-func (nis *NoImplStorage) GetBlobHub() BlobHub {
-	return nil
-}
-
-func (nis *NoImplStorage) Fetch(*blobref.BlobRef) (file blobref.ReadSeekCloser, size int64, err error) {
+func (NoImplStorage) Fetch(blob.Ref) (file io.ReadCloser, size uint32, err error) {
 	return nil, 0, os.ErrNotExist
 }
 
-func (nis *NoImplStorage) FetchStreaming(*blobref.BlobRef) (file io.ReadCloser, size int64, err error) {
-	return nil, 0, os.ErrNotExist
-}
-
-func (nis *NoImplStorage) ReceiveBlob(blob *blobref.BlobRef, source io.Reader) (sb blobref.SizedBlobRef, err error) {
+func (NoImplStorage) ReceiveBlob(blob.Ref, io.Reader) (sb blob.SizedRef, err error) {
 	err = errors.New("ReceiveBlob not implemented")
 	return
 }
 
-func (nis *NoImplStorage) StatBlobs(dest chan<- blobref.SizedBlobRef,
-	blobs []*blobref.BlobRef,
-	wait time.Duration) error {
+func (NoImplStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
 	return errors.New("Stat not implemented")
 }
 
-func (nis *NoImplStorage) EnumerateBlobs(dest chan<- blobref.SizedBlobRef,
-	after string,
-	limit int,
-	wait time.Duration) error {
+func (NoImplStorage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	return errors.New("EnumerateBlobs not implemented")
 }
 
-func (nis *NoImplStorage) RemoveBlobs(blobs []*blobref.BlobRef) error {
+func (NoImplStorage) RemoveBlobs(blobs []blob.Ref) error {
 	return errors.New("Remove not implemented")
 }

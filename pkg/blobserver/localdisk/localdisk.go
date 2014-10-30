@@ -14,122 +14,159 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+/*
+Package localdisk registers the "filesystem" blobserver storage type,
+storing blobs in a forest of sharded directories at the specified root.
+
+Example low-level config:
+
+     "/storage/": {
+         "handler": "storage-filesystem",
+         "handlerArgs": {
+            "path": "/var/camlistore/blobs"
+          }
+     },
+
+*/
 package localdisk
 
 import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
-	"regexp"
+	"path/filepath"
+	"sync"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/blobserver/local"
 	"camlistore.org/pkg/jsonconfig"
+	"camlistore.org/pkg/osutil"
+	"camlistore.org/pkg/types"
 )
 
+// DiskStorage implements the blobserver.Storage interface using the
+// local filesystem.
 type DiskStorage struct {
-	*blobserver.SimpleBlobHubPartitionMap
 	root string
 
-	// the sub-partition (queue) to write to / read from, or "" for none.
-	partition string
+	// dirLockMu must be held for writing when deleting an empty directory
+	// and for read when receiving blobs.
+	dirLockMu *sync.RWMutex
 
-	// queue partitions to mirror new blobs into (when partition
-	// above is the empty string)
-	mirrorPartitions []*DiskStorage
+	// gen will be nil if partition != ""
+	gen *local.Generationer
 }
 
-func New(root string) (storage *DiskStorage, err error) {
+func (ds *DiskStorage) String() string {
+	return fmt.Sprintf("\"filesystem\" file-per-blob at %s", ds.root)
+}
+
+// IsDir reports whether root is a localdisk (file-per-blob) storage directory.
+func IsDir(root string) (bool, error) {
+	if osutil.DirExists(filepath.Join(root, blob.RefFromString("").HashName())) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// New returns a new local disk storage implementation at the provided
+// root directory, which must already exist.
+func New(root string) (*DiskStorage, error) {
 	// Local disk.
-	fi, staterr := os.Stat(root)
-	if staterr != nil || !fi.IsDir() {
-		err = errors.New(fmt.Sprintf("Storage root %q doesn't exist or is not a directory.", root))
-		return
+	fi, err := os.Stat(root)
+	if os.IsNotExist(err) {
+		return nil, fmt.Errorf("Storage root %q doesn't exist", root)
 	}
-	storage = &DiskStorage{
-		SimpleBlobHubPartitionMap: &blobserver.SimpleBlobHubPartitionMap{},
-		root:                      root,
+	if err != nil {
+		return nil, fmt.Errorf("Failed to stat directory %q: %v", root, err)
 	}
-	return
+	if !fi.IsDir() {
+		return nil, fmt.Errorf("Storage root %q exists but is not a directory.", root)
+	}
+	ds := &DiskStorage{
+		root:      root,
+		dirLockMu: new(sync.RWMutex),
+		gen:       local.NewGenerationer(root),
+	}
+	if err := ds.migrate3to2(); err != nil {
+		return nil, fmt.Errorf("Error updating localdisk format: %v", err)
+	}
+	if _, _, err := ds.StorageGeneration(); err != nil {
+		return nil, fmt.Errorf("Error initialization generation for %q: %v", root, err)
+	}
+	return ds, nil
 }
 
 func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (storage blobserver.Storage, err error) {
-	sto := &DiskStorage{
-		SimpleBlobHubPartitionMap: &blobserver.SimpleBlobHubPartitionMap{},
-		root:                      config.RequiredString("path"),
-	}
+	path := config.RequiredString("path")
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	fi, err := os.Stat(sto.root)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to stat directory %q: %v", sto.root, err)
-	}
-	if !fi.IsDir() {
-		return nil, fmt.Errorf("Path %q isn't a directory", sto.root)
-	}
-	return sto, nil
+	return New(path)
 }
 
 func init() {
 	blobserver.RegisterStorageConstructor("filesystem", blobserver.StorageConstructor(newFromConfig))
 }
 
-var validQueueName = regexp.MustCompile(`^[a-zA-Z0-9\-\_]+$`)
-
-func (ds *DiskStorage) CreateQueue(name string) (blobserver.Storage, error) {
-	if !validQueueName.MatchString(name) {
-		return nil, fmt.Errorf("invalid queue name %q", name)
-	}
-	if ds.partition != "" {
-		return nil, fmt.Errorf("can't create queue %q on existing queue %q",
-			name, ds.partition)
-	}
-	q := &DiskStorage{
-		SimpleBlobHubPartitionMap: &blobserver.SimpleBlobHubPartitionMap{},
-		root:                      ds.root,
-		partition:                 "queue-" + name,
-	}
-	baseDir := ds.PartitionRoot(q.partition)
-	if err := os.MkdirAll(baseDir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create queue base dir: %v", err)
-	}
-
-	ds.mirrorPartitions = append(ds.mirrorPartitions, q)
-	return q, nil
+func (ds *DiskStorage) tryRemoveDir(dir string) {
+	ds.dirLockMu.Lock()
+	defer ds.dirLockMu.Unlock()
+	os.Remove(dir) // ignore error
 }
 
-func (ds *DiskStorage) FetchStreaming(blob *blobref.BlobRef) (io.ReadCloser, int64, error) {
-	return ds.Fetch(blob)
+func (ds *DiskStorage) Fetch(br blob.Ref) (io.ReadCloser, uint32, error) {
+	return ds.fetch(br, 0, -1)
 }
 
-func (ds *DiskStorage) Fetch(blob *blobref.BlobRef) (blobref.ReadSeekCloser, int64, error) {
-	fileName := ds.blobPath("", blob)
+func (ds *DiskStorage) SubFetch(br blob.Ref, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 || length < 0 {
+		return nil, errors.New("invalid offset or length")
+	}
+	rc, _, err := ds.fetch(br, offset, length)
+	return rc, err
+}
+
+// length -1 means entire file
+func (ds *DiskStorage) fetch(br blob.Ref, offset, length int64) (rc io.ReadCloser, size uint32, err error) {
+	fileName := ds.blobPath(br)
 	stat, err := os.Stat(fileName)
-	if errorIsNoEnt(err) {
+	if os.IsNotExist(err) {
 		return nil, 0, os.ErrNotExist
 	}
+	size = types.U32(stat.Size())
 	file, err := os.Open(fileName)
 	if err != nil {
-		if errorIsNoEnt(err) {
+		if os.IsNotExist(err) {
 			err = os.ErrNotExist
 		}
 		return nil, 0, err
 	}
-	return file, stat.Size(), nil
+	// normal Fetch:
+	if length < 0 {
+		return file, size, nil
+	}
+	// SubFetch:
+	return struct {
+		io.Reader
+		io.Closer
+	}{
+		io.NewSectionReader(file, offset, length),
+		file,
+	}, 0 /* unused */, err
 }
 
-func (ds *DiskStorage) RemoveBlobs(blobs []*blobref.BlobRef) error {
+func (ds *DiskStorage) RemoveBlobs(blobs []blob.Ref) error {
 	for _, blob := range blobs {
-		fileName := ds.blobPath(ds.partition, blob)
+		fileName := ds.blobPath(blob)
 		err := os.Remove(fileName)
 		switch {
 		case err == nil:
 			continue
-		case errorIsNoEnt(err):
-			log.Printf("Deleting already-deleted file; harmless.")
+		case os.IsNotExist(err):
+			// deleting already-deleted file; harmless.
 			continue
 		default:
 			return err

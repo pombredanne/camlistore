@@ -25,7 +25,6 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"net/http/cgi"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -33,7 +32,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	txttemplate "text/template"
 	"time"
+
+	"camlistore.org/pkg/types/camtypes"
 )
 
 const defaultAddr = ":31798" // default webserver address
@@ -41,23 +43,24 @@ const defaultAddr = ":31798" // default webserver address
 var h1TitlePattern = regexp.MustCompile(`<h1>([^<]+)</h1>`)
 
 var (
-	httpAddr            = flag.String("http", defaultAddr, "HTTP service address (e.g., '"+defaultAddr+"')")
-	httpsAddr           = flag.String("https", "", "HTTPS service address")
-	root                = flag.String("root", "", "Website root (parent of 'static', 'content', and 'tmpl")
-	gitwebScript        = flag.String("gitwebscript", "/usr/lib/cgi-bin/gitweb.cgi", "Path to gitweb.cgi, or blank to disable.")
-	gitwebFiles         = flag.String("gitwebfiles", "/usr/share/gitweb/static", "Path to gitweb's static files.")
-	logDir              = flag.String("logdir", "", "Directory to write log files to (one per hour), or empty to not log.")
-	logStdout           = flag.Bool("logstdout", true, "Write to stdout?")
-	tlsCertFile         = flag.String("tlscert", "", "TLS cert file")
-	tlsKeyFile          = flag.String("tlskey", "", "TLS private key file")
-	gerritUser          = flag.String("gerrituser", "ubuntu", "Gerrit host's username")
-	gerritHost          = flag.String("gerrithost", "", "Gerrit host, or empty.")
-	pageHtml, errorHtml *template.Template
+	httpAddr        = flag.String("http", defaultAddr, "HTTP service address (e.g., '"+defaultAddr+"')")
+	httpsAddr       = flag.String("https", "", "HTTPS service address")
+	root            = flag.String("root", "", "Website root (parent of 'static', 'content', and 'tmpl")
+	logDir          = flag.String("logdir", "", "Directory to write log files to (one per hour), or empty to not log.")
+	logStdout       = flag.Bool("logstdout", true, "Write to stdout?")
+	tlsCertFile     = flag.String("tlscert", "", "TLS cert file")
+	tlsKeyFile      = flag.String("tlskey", "", "TLS private key file")
+	buildbotBackend = flag.String("buildbot_backend", "", "Build bot status backend URL")
+	buildbotHost    = flag.String("buildbot_host", "", "Hostname to map to the buildbot_backend. If an HTTP request with this hostname is received, it proxies to buildbot_backend.")
+	alsoRun         = flag.String("also_run", "", "Optional path to run as a child process. (Used to run camlistore.org's ./scripts/run-blob-server)")
+
+	pageHTML, errorHTML, camliErrorHTML *template.Template
+	packageHTML                         *txttemplate.Template
 )
 
 var fmap = template.FuncMap{
-	"":         textFmt,
-	"html":     htmlFmt,
+	"":        textFmt,
+	"html":    htmlFmt,
 	"htmlesc": htmlEscFmt,
 }
 
@@ -117,6 +120,14 @@ func applyTemplate(t *template.Template, name string, data interface{}) []byte {
 }
 
 func servePage(w http.ResponseWriter, title, subtitle string, content []byte) {
+	// insert an "install command" if it applies
+	if strings.Contains(title, cmdPattern) && subtitle != cmdPattern {
+		toInsert := `
+		<h3>Installation</h3>
+		<pre>go get camlistore.org/cmd/` + subtitle + `</pre>
+		<h3>Overview</h3><p>`
+		content = bytes.Replace(content, []byte("<p>"), []byte(toInsert), 1)
+	}
 	d := struct {
 		Title    string
 		Subtitle string
@@ -127,7 +138,7 @@ func servePage(w http.ResponseWriter, title, subtitle string, content []byte) {
 		template.HTML(content),
 	}
 
-	if err := pageHtml.Execute(w, &d); err != nil {
+	if err := pageHTML.Execute(w, &d); err != nil {
 		log.Printf("godocHTML.Execute: %s", err)
 	}
 }
@@ -146,25 +157,58 @@ func readTemplate(name string) *template.Template {
 }
 
 func readTemplates() {
-	pageHtml = readTemplate("page.html")
-	errorHtml = readTemplate("error.html")
+	pageHTML = readTemplate("page.html")
+	errorHTML = readTemplate("error.html")
+	camliErrorHTML = readTemplate("camlierror.html")
+	// TODO(mpl): see about not using text template anymore?
+	packageHTML = readTextTemplate("package.html")
 }
 
 func serveError(w http.ResponseWriter, r *http.Request, relpath string, err error) {
-	contents := applyTemplate(errorHtml, "errorHtml", err) // err may contain an absolute path!
+	contents := applyTemplate(errorHTML, "errorHTML", err) // err may contain an absolute path!
 	w.WriteHeader(http.StatusNotFound)
 	servePage(w, "File "+relpath, "", contents)
 }
 
+const gerritURLPrefix = "https://camlistore.googlesource.com/camlistore/+/"
+
+var commitHash = regexp.MustCompile(`^p=camlistore.git;a=commit;h=([0-9a-f]+)$`)
+
+// empty return value means don't redirect.
+func redirectPath(u *url.URL) string {
+	// Example:
+	// /code/?p=camlistore.git;a=commit;h=b0d2a8f0e5f27bbfc025a96ec3c7896b42d198ed
+	if strings.HasPrefix(u.Path, "/code/") {
+		m := commitHash.FindStringSubmatch(u.RawQuery)
+		if len(m) == 2 {
+			return gerritURLPrefix + m[1]
+		}
+	}
+
+	if strings.HasPrefix(u.Path, "/gw/") {
+		path := strings.TrimPrefix(u.Path, "/gw/")
+		if strings.HasPrefix(path, "doc") || strings.HasPrefix(path, "clients") {
+			return gerritURLPrefix + "master/" + path
+		}
+		// Assume it's a commit
+		return gerritURLPrefix + path
+	}
+	return ""
+}
+
 func mainHandler(rw http.ResponseWriter, req *http.Request) {
-	relPath := req.URL.Path[1:] // serveFile URL paths start with '/'
-	if strings.Contains(relPath, "..") {
+	if target := redirectPath(req.URL); target != "" {
+		http.Redirect(rw, req, target, http.StatusFound)
 		return
 	}
 
-	if strings.HasPrefix(relPath, "gw/") {
-		path := relPath[3:]
-		http.Redirect(rw, req, "/code/?p=camlistore.git;f="+path+";hb=master", http.StatusFound)
+	if dest, ok := issueRedirect(req.URL.Path); ok {
+		http.Redirect(rw, req, dest, http.StatusFound)
+		return
+	}
+
+	relPath := req.URL.Path[1:] // serveFile URL paths start with '/'
+	if strings.Contains(relPath, "..") {
 		return
 	}
 
@@ -186,10 +230,32 @@ func mainHandler(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	switch {
-	case !fi.IsDir():
+	if !fi.IsDir() {
+		if checkLastModified(rw, req, fi.ModTime()) {
+			return
+		}
 		serveFile(rw, req, relPath, absPath)
 	}
+}
+
+// modtime is the modification time of the resource to be served, or IsZero().
+// return value is whether this request is now complete.
+func checkLastModified(w http.ResponseWriter, r *http.Request, modtime time.Time) bool {
+	if modtime.IsZero() {
+		return false
+	}
+
+	// The Date-Modified header truncates sub-second precision, so
+	// use mtime < t+1s instead of mtime <= t to check for unmodified.
+	if t, err := time.Parse(http.TimeFormat, r.Header.Get("If-Modified-Since")); err == nil && modtime.Before(t.Add(1*time.Second)) {
+		h := w.Header()
+		delete(h, "Content-Type")
+		delete(h, "Content-Length")
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+	w.Header().Set("Last-Modified", modtime.UTC().Format(http.TimeFormat))
+	return false
 }
 
 func serveFile(rw http.ResponseWriter, req *http.Request, relPath, absPath string) {
@@ -205,20 +271,6 @@ func serveFile(rw http.ResponseWriter, req *http.Request, relPath, absPath strin
 	}
 
 	servePage(rw, title, "", data)
-}
-
-type gitwebHandler struct {
-	Cgi    http.Handler
-	Static http.Handler
-}
-
-func (h *gitwebHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/code/" ||
-		strings.HasPrefix(r.URL.Path, "/code/?") {
-		h.Cgi.ServeHTTP(rw, r)
-	} else {
-		h.Static.ServeHTTP(rw, r)
-	}
 }
 
 func isBot(r *http.Request) bool {
@@ -242,25 +294,39 @@ func (h *noWwwHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	host := strings.ToLower(r.Host)
 	if host == "www.camlistore.org" {
-		http.Redirect(rw, r, "http://camlistore.org"+r.URL.RequestURI(), http.StatusFound)
+		scheme := "https"
+		if r.TLS == nil {
+			scheme = "http"
+		}
+		http.Redirect(rw, r, scheme+"://camlistore.org"+r.URL.RequestURI(), http.StatusFound)
 		return
 	}
 	h.Handler.ServeHTTP(rw, r)
 }
 
-func fixupGitwebFiles() {
-	fi, err := os.Stat(*gitwebFiles)
-	if err != nil || !fi.IsDir() {
-		if *gitwebFiles == "/usr/share/gitweb/static" {
-			// Old Debian/Ubuntu location
-			*gitwebFiles = "/usr/share/gitweb"
-		}
+// runAsChild runs res as a child process and
+// does not wait for it to finish.
+func runAsChild(res string) {
+	cmdName, err := exec.LookPath(res)
+	if err != nil {
+		log.Fatalf("Could not find %v in $PATH: %v", res, err)
 	}
+	cmd := exec.Command(cmdName)
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	log.Printf("Running %v", res)
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("Program %v failed to start: %v", res, err)
+	}
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			log.Fatalf("Program %s did not end successfully: %v", res, err)
+		}
+	}()
 }
 
 func main() {
 	flag.Parse()
-	readTemplates()
 
 	if *root == "" {
 		var err error
@@ -269,73 +335,55 @@ func main() {
 			log.Fatalf("Failed to getwd: %v", err)
 		}
 	}
-
-	fixupGitwebFiles()
-
-	latestGits := filepath.Join(*root, "latestgits")
-	os.Mkdir(latestGits, 0700)
-	if *gerritHost != "" {
-		go rsyncFromGerrit(latestGits)
-	}
+	readTemplates()
 
 	mux := http.DefaultServeMux
 	mux.Handle("/favicon.ico", http.FileServer(http.Dir(filepath.Join(*root, "static"))))
 	mux.Handle("/robots.txt", http.FileServer(http.Dir(filepath.Join(*root, "static"))))
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir(filepath.Join(*root, "static")))))
 	mux.Handle("/talks/", http.StripPrefix("/talks/", http.FileServer(http.Dir(filepath.Join(*root, "talks")))))
+	mux.Handle(pkgPattern, godocHandler{})
+	mux.Handle(cmdPattern, godocHandler{})
+	mux.HandleFunc(errPattern, errHandler)
 
-	gerritUrl, _ := url.Parse(fmt.Sprintf("http://%s:8000/", *gerritHost))
-	var gerritHandler http.Handler = httputil.NewSingleHostReverseProxy(gerritUrl)
-	if *httpsAddr != "" {
-		proxyHandler := gerritHandler
-		gerritHandler = http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-			if req.TLS != nil {
-				proxyHandler.ServeHTTP(rw, req)
-				return
-			}
-			http.Redirect(rw, req, "https://camlistore.org"+req.URL.RequestURI(), http.StatusFound)
-		})
-	}
-	mux.Handle("/r/", gerritHandler)
+	mux.HandleFunc("/r/", gerritRedirect)
 	mux.HandleFunc("/debugz/ip", ipHandler)
+	mux.Handle("/docs/contributing", redirTo("/code#contributing"))
+	mux.Handle("/lists", redirTo("/community"))
 
-	testCgi := &cgi.Handler{Path: filepath.Join(*root, "test.cgi"),
-		Root: "/test.cgi",
-	}
-	mux.Handle("/test.cgi", testCgi)
-	mux.Handle("/test.cgi/foo", testCgi)
-	mux.Handle("/code", http.RedirectHandler("/code/", http.StatusFound))
-	if *gitwebScript != "" {
-		env := os.Environ()
-		env = append(env, "GITWEB_CONFIG="+filepath.Join(*root, "gitweb-camli.conf"))
-		env = append(env, "CAMWEB_ROOT="+filepath.Join(*root))
-		env = append(env, "CAMWEB_GITDIR="+latestGits)
-		mux.Handle("/code/", &fixUpGitwebUrls{&gitwebHandler{
-			Cgi: &cgi.Handler{
-				Path: *gitwebScript,
-				Root: "/code/",
-				Env:  env,
-			},
-			Static: http.StripPrefix("/code/", http.FileServer(http.Dir(*gitwebFiles))),
-		}})
-	}
+	mux.HandleFunc("/contributors", contribHandler())
 	mux.HandleFunc("/", mainHandler)
+
+	if *buildbotHost != "" && *buildbotBackend != "" {
+		buildbotUrl, err := url.Parse(*buildbotBackend)
+		if err != nil {
+			log.Fatalf("Failed to parse %v as a URL: %v", *buildbotBackend, err)
+		}
+		buildbotHandler := httputil.NewSingleHostReverseProxy(buildbotUrl)
+		bbhpattern := strings.TrimRight(*buildbotHost, "/") + "/"
+		mux.Handle(bbhpattern, buildbotHandler)
+	}
 
 	var handler http.Handler = &noWwwHandler{Handler: mux}
 	if *logDir != "" || *logStdout {
 		handler = NewLoggingHandler(handler, *logDir, *logStdout)
 	}
 
-	errch := make(chan error)
+	errc := make(chan error)
+	startEmailCommitLoop(errc)
+
+	if *alsoRun != "" {
+		runAsChild(*alsoRun)
+	}
 
 	httpServer := &http.Server{
 		Addr:         *httpAddr,
 		Handler:      handler,
-		ReadTimeout:  connTimeoutNanos,
-		WriteTimeout: connTimeoutNanos,
+		ReadTimeout:  5 * time.Minute,
+		WriteTimeout: 30 * time.Minute,
 	}
 	go func() {
-		errch <- httpServer.ListenAndServe()
+		errc <- httpServer.ListenAndServe()
 	}()
 
 	if *httpsAddr != "" {
@@ -344,17 +392,43 @@ func main() {
 		*httpsServer = *httpServer
 		httpsServer.Addr = *httpsAddr
 		go func() {
-			errch <- httpsServer.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile)
+			errc <- httpsServer.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile)
 		}()
 	}
 
-	log.Fatalf("Serve error: %v", <-errch)
+	log.Fatalf("Serve error: %v", <-errc)
 }
 
-const connTimeoutNanos = 15e9
+var issueNum = regexp.MustCompile(`^/(?:issue(?:s)?|bugs)(/\d*)?$`)
 
-type fixUpGitwebUrls struct {
-	handler http.Handler
+// issueRedirect returns whether the request should be redirected to the
+// issues tracker, and the url for that redirection if yes, the empty
+// string otherwise.
+func issueRedirect(urlPath string) (string, bool) {
+	m := issueNum.FindStringSubmatch(urlPath)
+	if m == nil {
+		return "", false
+	}
+	issueNumber := strings.TrimPrefix(m[1], "/")
+	suffix := "list"
+	if issueNumber != "" {
+		suffix = "detail?id=" + issueNumber
+	}
+	return "https://code.google.com/p/camlistore/issues/" + suffix, true
+}
+
+func gerritRedirect(w http.ResponseWriter, r *http.Request) {
+	dest := "https://camlistore-review.googlesource.com/"
+	if len(r.URL.Path) > len("/r/") {
+		dest += r.URL.Path[1:]
+	}
+	http.Redirect(w, r, dest, http.StatusFound)
+}
+
+func redirTo(dest string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, dest, http.StatusFound)
+	})
 }
 
 // Not sure what's making these broken URLs like:
@@ -364,6 +438,7 @@ type fixUpGitwebUrls struct {
 // ... but something is.  Maybe Buzz?  For now just re-write them
 // . Doesn't seem to be a bug in the CGI implementation, though, which
 // is what I'd originally suspected.
+/*
 func (fu *fixUpGitwebUrls) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	oldUrl := req.URL.String()
 	newUrl := strings.Replace(oldUrl, "%3B", ";", -1)
@@ -373,16 +448,7 @@ func (fu *fixUpGitwebUrls) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 	}
 	http.Redirect(rw, req, newUrl, http.StatusFound)
 }
-
-func rsyncFromGerrit(dest string) {
-	for {
-		err := exec.Command("rsync", "-avPW", *gerritUser+"@"+*gerritHost+":gerrit/git/", dest+"/").Run()
-		if err != nil {
-			log.Printf("rsync from gerrit = %v", err)
-		}
-		time.Sleep(10e9)
-	}
-}
+*/
 
 func ipHandler(w http.ResponseWriter, r *http.Request) {
 	out, _ := exec.Command("ip", "-f", "inet", "addr", "show", "dev", "eth0").Output()
@@ -398,4 +464,32 @@ func ipHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	str = str[:pos]
 	w.Write([]byte(str))
+}
+
+const (
+	errPattern  = "/err/"
+	toHyperlink = `<a href="$1$2">$1$2</a>`
+)
+
+var camliURLPattern = regexp.MustCompile(`(https?://camlistore.org)([a-zA-Z0-9\-\_/]+)?`)
+
+func errHandler(w http.ResponseWriter, r *http.Request) {
+	errString := strings.TrimPrefix(r.URL.Path, errPattern)
+
+	defer func() {
+		if x := recover(); x != nil {
+			http.Error(w, fmt.Sprintf("unknown error: %v", errString), http.StatusNotFound)
+		}
+	}()
+	err := camtypes.Err(errString)
+	data := struct {
+		Code        string
+		Description template.HTML
+	}{
+		Code:        errString,
+		Description: template.HTML(camliURLPattern.ReplaceAllString(err.Error(), toHyperlink)),
+	}
+	contents := applyTemplate(camliErrorHTML, "camliErrorHTML", data)
+	w.WriteHeader(http.StatusFound)
+	servePage(w, errString, "", contents)
 }

@@ -20,45 +20,77 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/context"
+	"camlistore.org/pkg/sorted"
 )
 
-func (ix *Index) EnumerateBlobs(dest chan<- blobref.SizedBlobRef, after string, limit int, wait time.Duration) error {
+func (ix *Index) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) (err error) {
 	defer close(dest)
-	it := ix.s.Find("have:" + after)
+	it := ix.s.Find("have:"+after, "have~")
+	defer func() {
+		closeErr := it.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}()
+
+	afterKey := "have:" + after
 	n := int(0)
 	for n < limit && it.Next() {
 		k := it.Key()
+		if k <= afterKey {
+			continue
+		}
 		if !strings.HasPrefix(k, "have:") {
 			break
 		}
 		n++
-		br := blobref.Parse(k[len("have:"):])
-		size, err := strconv.ParseInt(it.Value(), 10, 64)
-		if br != nil && err == nil {
-			dest <- blobref.SizedBlobRef{br, size}
+		br, ok := blob.Parse(k[len("have:"):])
+		if !ok {
+			continue
+		}
+		size, err := parseHaveVal(it.Value())
+		if err == nil {
+			select {
+			case dest <- blob.SizedRef{br, uint32(size)}:
+			case <-ctx.Done():
+				return context.ErrCanceled
+			}
 		}
 	}
-	return it.Close()
+	return nil
 }
 
-func (ix *Index) StatBlobs(dest chan<- blobref.SizedBlobRef, blobs []*blobref.BlobRef, wait time.Duration) error {
+func (ix *Index) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
 	for _, br := range blobs {
 		key := "have:" + br.String()
 		v, err := ix.s.Get(key)
-		if err == ErrNotFound {
+		if err == sorted.ErrNotFound {
 			continue
 		}
 		if err != nil {
 			return fmt.Errorf("error looking up key %q: %v", key, err)
 		}
-		size, err := strconv.ParseInt(v, 10, 64)
+		size, err := parseHaveVal(v)
 		if err != nil {
 			return fmt.Errorf("invalid size for key %q = %q", key, v)
 		}
-		dest <- blobref.SizedBlobRef{br, size}
+		dest <- blob.SizedRef{br, uint32(size)}
 	}
 	return nil
+}
+
+// parseHaveVal takes the value part of an "have" index row and returns
+// the blob size found in that value. Examples:
+// parseHaveVal("324|indexed") == 324
+// parseHaveVal("654") == 654
+func parseHaveVal(val string) (size uint64, err error) {
+	pipei := strings.Index(val, "|")
+	if pipei >= 0 {
+		// filter out the "indexed" suffix
+		val = val[:pipei]
+	}
+	return strconv.ParseUint(val, 10, 32)
 }

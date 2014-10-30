@@ -23,29 +23,35 @@ import (
 	"strconv"
 	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/blobserver/protocol"
 	"camlistore.org/pkg/httputil"
 )
 
-func CreateStatHandler(storage blobserver.Storage) func(http.ResponseWriter, *http.Request) {
-	return func(conn http.ResponseWriter, req *http.Request) {
+func CreateStatHandler(storage blobserver.BlobStatter) http.Handler {
+	return http.HandlerFunc(func(conn http.ResponseWriter, req *http.Request) {
 		handleStat(conn, req, storage)
-	}
+	})
 }
 
 const maxStatBlobs = 1000
 
 func handleStat(conn http.ResponseWriter, req *http.Request, storage blobserver.BlobStatter) {
-	if w, ok := storage.(blobserver.ContextWrapper); ok {
-		storage = w.WrapContext(req)
+	res := new(protocol.StatResponse)
+
+	if configer, ok := storage.(blobserver.Configer); ok {
+		if conf := configer.Config(); conf != nil {
+			res.CanLongPoll = conf.CanLongPoll
+		}
 	}
 
-	toStat := make([]*blobref.BlobRef, 0)
+	needStat := map[blob.Ref]bool{}
+
 	switch req.Method {
 	case "POST":
 		fallthrough
-	case "GET":
+	case "GET", "HEAD":
 		camliVersion := req.FormValue("camliversion")
 		if camliVersion == "" {
 			httputil.BadRequestError(conn, "No camliversion")
@@ -64,12 +70,12 @@ func handleStat(conn http.ResponseWriter, req *http.Request, storage blobserver.
 				httputil.BadRequestError(conn, "Too many stat blob checks")
 				return
 			}
-			ref := blobref.Parse(value)
-			if ref == nil {
+			ref, ok := blob.Parse(value)
+			if !ok {
 				httputil.BadRequestError(conn, "Bogus blobref for key "+key)
 				return
 			}
-			toStat = append(toStat, ref)
+			needStat[ref] = true
 		}
 	default:
 		httputil.BadRequestError(conn, "Invalid method.")
@@ -91,21 +97,32 @@ func handleStat(conn http.ResponseWriter, req *http.Request, storage blobserver.
 		}
 	}
 
-	statRes := make([]map[string]interface{}, 0)
-	if len(toStat) > 0 {
-		blobch := make(chan blobref.SizedBlobRef)
+	deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
+
+	toStat := make([]blob.Ref, 0, len(needStat))
+	buildToStat := func() {
+		toStat = toStat[:0]
+		for br := range needStat {
+			toStat = append(toStat, br)
+		}
+	}
+
+	for len(needStat) > 0 {
+		buildToStat()
+		blobch := make(chan blob.SizedRef)
 		resultch := make(chan error, 1)
 		go func() {
-			err := storage.StatBlobs(blobch, toStat, time.Duration(waitSeconds) * time.Second)
+			err := storage.StatBlobs(blobch, toStat)
 			close(blobch)
 			resultch <- err
 		}()
 
 		for sb := range blobch {
-			ah := make(map[string]interface{})
-			ah["blobRef"] = sb.BlobRef.String()
-			ah["size"] = sb.Size
-			statRes = append(statRes, ah)
+			res.Stat = append(res.Stat, blob.SizedRef{
+				Ref:  sb.Ref,
+				Size: uint32(sb.Size),
+			})
+			delete(needStat, sb.Ref)
 		}
 
 		err := <-resultch
@@ -114,16 +131,14 @@ func handleStat(conn http.ResponseWriter, req *http.Request, storage blobserver.
 			conn.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+
+		if len(needStat) == 0 || waitSeconds == 0 || time.Now().After(deadline) {
+			break
+		}
+
+		buildToStat()
+		blobserver.WaitForBlob(storage, deadline, toStat)
 	}
 
-	configer, _ := storage.(blobserver.Configer)
-	ret := commonUploadResponse(configer, req)
-	ret["canLongPoll"] = false
-	if configer != nil {
-		if conf := configer.Config(); conf != nil {
-			ret["canLongPoll"] = conf.CanLongPoll
-		}
-	}
-	ret["stat"] = statRes
-	httputil.ReturnJSON(conn, ret)
+	httputil.ReturnJSON(conn, res)
 }

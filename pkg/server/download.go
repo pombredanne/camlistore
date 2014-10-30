@@ -19,55 +19,57 @@ package server
 import (
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/magic"
 	"camlistore.org/pkg/schema"
 )
 
+const oneYear = 365 * 86400 * time.Second
+
 type DownloadHandler struct {
-	Fetcher   blobref.StreamingFetcher
+	Fetcher   blob.Fetcher
 	Cache     blobserver.Storage
 	ForceMime string // optional
 }
 
-func (dh *DownloadHandler) storageSeekFetcher() (blobref.SeekFetcher, error) {
-	return blobref.SeekerFromStreamingFetcher(dh.Fetcher) // TODO: pass dh.Cache?
+func (dh *DownloadHandler) blobSource() blob.Fetcher {
+	return dh.Fetcher // TODO: use dh.Cache
 }
 
-func (dh *DownloadHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, file *blobref.BlobRef) {
+func (dh *DownloadHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, file blob.Ref) {
 	if req.Method != "GET" && req.Method != "HEAD" {
 		http.Error(rw, "Invalid download method", 400)
 		return
 	}
-
-	fetchSeeker, err := dh.storageSeekFetcher()
-	if err != nil {
-		http.Error(rw, err.Error(), 500)
+	if req.Header.Get("If-Modified-Since") != "" {
+		// Immutable, so any copy's a good copy.
+		rw.WriteHeader(http.StatusNotModified)
 		return
 	}
 
-	fr, err := schema.NewFileReader(fetchSeeker, file)
+	fr, err := schema.NewFileReader(dh.blobSource(), file)
 	if err != nil {
 		http.Error(rw, "Can't serve file: "+err.Error(), 500)
 		return
 	}
 	defer fr.Close()
 
-	schema := fr.FileSchema()
-	rw.Header().Set("Content-Length", fmt.Sprintf("%d", schema.SumPartsSize()))
+	h := rw.Header()
+	h.Set("Content-Length", fmt.Sprintf("%d", fr.Size()))
+	h.Set("Expires", time.Now().Add(oneYear).Format(http.TimeFormat))
 
-	mimeType, reader := magic.MimeTypeFromReader(fr)
+	mimeType := magic.MIMETypeFromReaderAt(fr)
 	if dh.ForceMime != "" {
 		mimeType = dh.ForceMime
 	}
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
-	rw.Header().Set("Content-Type", mimeType)
+	h.Set("Content-Type", mimeType)
 	if mimeType == "application/octet-stream" {
 		// Chrome seems to silently do nothing on
 		// application/octet-stream unless this is set.
@@ -76,32 +78,21 @@ func (dh *DownloadHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, 
 		rw.Header().Set("Content-Disposition", "attachment; filename=file-"+file.String()+".dat")
 	}
 
-	if req.Method == "HEAD" {
-		vbr := blobref.Parse(req.FormValue("verifycontents"))
-		if vbr == nil {
+	if req.Method == "HEAD" && req.FormValue("verifycontents") != "" {
+		vbr, ok := blob.Parse(req.FormValue("verifycontents"))
+		if !ok {
 			return
 		}
 		hash := vbr.Hash()
 		if hash == nil {
 			return
 		}
-		io.Copy(hash, reader) // ignore errors, caught later
+		io.Copy(hash, fr) // ignore errors, caught later
 		if vbr.HashMatches(hash) {
 			rw.Header().Set("X-Camli-Contents", vbr.String())
 		}
 		return
 	}
 
-	n, err := io.Copy(rw, reader)
-	log.Printf("For %q request of %s: copied %d, %v", req.Method, req.URL.Path, n, err)
-	if err != nil {
-		log.Printf("error serving download of file schema %s: %v", file, err)
-		return
-	}
-	if size := schema.SumPartsSize(); n != int64(size) {
-		log.Printf("error serving download of file schema %s: sent %d, expected size of %d",
-			file, n, size)
-		return
-	}
-
+	http.ServeContent(rw, req, "", time.Now(), fr)
 }

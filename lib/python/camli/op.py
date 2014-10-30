@@ -83,7 +83,7 @@ class CamliOp(object):
                buffer_size=BUFFER_SIZE,
                create_connection=httplib.HTTPConnection,
                auth=None,
-               basepath=False):
+               basepath=""):
     """Initializer.
 
     Args:
@@ -100,9 +100,10 @@ class CamliOp(object):
     self._create_connection = create_connection
     self._connection = None
     self._authorization = ''
+    self.basepath = ""
     if auth:
       if len(auth.split(':')) != 2:
-          # Default to dummy username; current server doesn't care 
+          # Default to dummy username; current server doesn't care
           # TODO(jrabbit): care when necessary
           auth = "username:" + auth #If username not given use the implicit default, 'username'
       self._authorization = ('Basic ' + base64.encodestring(auth).strip())
@@ -257,7 +258,8 @@ class CamliOp(object):
       new_relative_url = urlparse.urlunparse(pieces)
       logging.debug('Redirect %s -> %s', relative_url, new_relative_url)
       relative_url = new_relative_url
-      self.connection.request('GET', relative_url)
+      self.connection.request('GET', relative_url, headers={
+          'Authorization': self._authorization})
       response = self.connection.getresponse()
 
     if response.status != 200:
@@ -348,7 +350,12 @@ class CamliOp(object):
 
     for blobref in blobref_list:
       logging.debug('Getting blobref=%s', blobref)
-      self.connection.request('GET', '/camli/' + blobref)
+      if self.basepath:
+          fullpath = self.basepath + '/camli/'
+      else:
+          fullpath = '/camli/'
+      self.connection.request('GET', fullpath + blobref,
+                              headers={'Authorization': self._authorization})
       response = self.connection.getresponse()
       if response.status == 404:
         logging.debug('Server does not have blobref=%s', blobref)

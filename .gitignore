@@ -17,3 +17,15 @@ clients/go/camwebdav/camwebdav
 .goroot
 appengine-sdk
 build/root
+.DS_Store
+bin/cam*
+bin/devcam
+bin/*_*
+bin/hello
+bin/publisher
+tmp
+server/camlistored/newui/all.js
+server/camlistored/newui/all.js.map
+server/camlistored/newui/zembed_all.js.go
+server/appengine/source_root/
+config/selfgen_pem*

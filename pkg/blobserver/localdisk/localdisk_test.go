@@ -17,17 +17,20 @@ limitations under the License.
 package localdisk
 
 import (
-	. "camlistore.org/pkg/test/asserts"
-	"camlistore.org/pkg/blobref"
-	"camlistore.org/pkg/blobserver"
-	"crypto/sha1"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"os"
-	"strings"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"sync"
 	"testing"
-	"time"
+
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/blobserver/storagetest"
+	"camlistore.org/pkg/test"
+	. "camlistore.org/pkg/test/asserts"
 )
 
 func cleanUp(ds *DiskStorage) {
@@ -54,65 +57,25 @@ func NewStorage(t *testing.T) *DiskStorage {
 	return ds
 }
 
-type testBlob struct {
-	val string
-}
-
-func (tb *testBlob) BlobRef() *blobref.BlobRef {
-	h := sha1.New()
-	h.Write([]byte(tb.val))
-	return blobref.FromHash("sha1", h)
-}
-
-func (tb *testBlob) BlobRefSlice() []*blobref.BlobRef {
-	return []*blobref.BlobRef{tb.BlobRef()}
-}
-
-func (tb *testBlob) Size() int64 {
-	return int64(len(tb.val))
-}
-
-func (tb *testBlob) Reader() io.Reader {
-	return strings.NewReader(tb.val)
-}
-
-func (tb *testBlob) AssertMatches(t *testing.T, sb blobref.SizedBlobRef) {
-	if sb.Size != tb.Size() {
-		t.Fatalf("Got size %d; expected %d", sb.Size, tb.Size())
-	}
-	if sb.BlobRef.String() != tb.BlobRef().String() {
-		t.Fatalf("Got blob %q; expected %q", sb.BlobRef.String(), tb.BlobRef())
-	}
-}
-
-func (tb *testBlob) ExpectUploadBlob(t *testing.T, ds blobserver.BlobReceiver) {
-	sb, err := ds.ReceiveBlob(tb.BlobRef(), tb.Reader())
-	if err != nil {
-		t.Fatalf("ReceiveBlob error: %v", err)
-	}
-	tb.AssertMatches(t, sb)
-}
-
 func TestUploadDup(t *testing.T) {
 	ds := NewStorage(t)
 	defer cleanUp(ds)
-	ds.CreateQueue("some-queue")
-	tb := &testBlob{"Foo"}
-	tb.ExpectUploadBlob(t, ds)
-	tb.ExpectUploadBlob(t, ds)
+	tb := &test.Blob{"Foo"}
+	tb.MustUpload(t, ds)
+	tb.MustUpload(t, ds)
 }
 
 func TestReceiveStat(t *testing.T) {
 	ds := NewStorage(t)
 	defer cleanUp(ds)
 
-	tb := &testBlob{"Foo"}
-	tb.ExpectUploadBlob(t, ds)
+	tb := &test.Blob{"Foo"}
+	tb.MustUpload(t, ds)
 
-	ch := make(chan blobref.SizedBlobRef, 0)
+	ch := make(chan blob.SizedRef, 0)
 	errch := make(chan error, 1)
 	go func() {
-		errch <- ds.StatBlobs(ch, tb.BlobRefSlice(), 0)
+		errch <- ds.StatBlobs(ch, tb.BlobRefSlice())
 		close(ch)
 	}()
 	got := 0
@@ -125,78 +88,57 @@ func TestReceiveStat(t *testing.T) {
 	AssertNil(t, <-errch, "result from stat")
 }
 
-func TestStatWait(t *testing.T) {
-	ds := NewStorage(t)
-	defer cleanUp(ds)
-	tb := &testBlob{"Foo"}
-
-	// Do a stat before the blob exists, but wait 2 seconds for it to arrive.
-	wait := 2 * time.Second
-	ch := make(chan blobref.SizedBlobRef, 0)
-	errch := make(chan error, 1)
-	go func() {
-		errch <- ds.StatBlobs(ch, tb.BlobRefSlice(), wait)
-		close(ch)
-	}()
-
-	// Sum and verify the stat results, writing the total number of returned matches
-	// to statCountCh (expected: 1)
-	statCountCh := make(chan int)
-	go func() {
-		got := 0
-		for sb := range ch {
-			got++
-			tb.AssertMatches(t, sb)
-		}
-		statCountCh <- got
-	}()
-
-	// Now upload the blob, now that everything else is in-flight.
-	// Sleep a bit to make sure the ds.Stat above has had a chance to fail and sleep.
-	time.Sleep(1e9 / 5) // 200ms in nanos
-	tb.ExpectUploadBlob(t, ds)
-
-	AssertInt(t, 1, <-statCountCh, "number stat results")
-}
-
 func TestMultiStat(t *testing.T) {
 	ds := NewStorage(t)
 	defer cleanUp(ds)
 
-	blobfoo := &testBlob{"foo"}
-	blobbar := &testBlob{"bar!"}
-	blobfoo.ExpectUploadBlob(t, ds)
-	blobbar.ExpectUploadBlob(t, ds)
+	blobfoo := &test.Blob{"foo"}
+	blobbar := &test.Blob{"bar!"}
+	blobfoo.MustUpload(t, ds)
+	blobbar.MustUpload(t, ds)
 
-	need := make(map[string]bool)
-	need[blobfoo.BlobRef().String()] = true
-	need[blobbar.BlobRef().String()] = true
+	need := make(map[blob.Ref]bool)
+	need[blobfoo.BlobRef()] = true
+	need[blobbar.BlobRef()] = true
 
-	ch := make(chan blobref.SizedBlobRef, 0)
+	blobs := []blob.Ref{blobfoo.BlobRef(), blobbar.BlobRef()}
+
+	// In addition to the two "foo" and "bar" blobs, add
+	// maxParallelStats other dummy blobs, to exercise the stat
+	// rate-limiting (which had a deadlock once after a cleanup)
+	for i := 0; i < maxParallelStats; i++ {
+		blobs = append(blobs, blob.SHA1FromString(strconv.Itoa(i)))
+	}
+
+	ch := make(chan blob.SizedRef, 0)
 	errch := make(chan error, 1)
 	go func() {
-		errch <- ds.StatBlobs(ch,
-			[]*blobref.BlobRef{blobfoo.BlobRef(), blobbar.BlobRef()},
-			0)
+		errch <- ds.StatBlobs(ch, blobs)
 		close(ch)
 	}()
 	got := 0
 	for sb := range ch {
 		got++
-		br := sb.BlobRef
-		brstr := br.String()
-		Expect(t, need[brstr], "need stat of blobref "+brstr)
-		delete(need, brstr)
+		if !need[sb.Ref] {
+			t.Errorf("didn't need %s", sb.Ref)
+		}
+		delete(need, sb.Ref)
 	}
-	ExpectInt(t, 2, got, "number stat results")
-	ExpectNil(t, <-errch, "result from stat")
-	ExpectInt(t, 0, len(need), "all stat results needed returned")
+	if want := 2; got != want {
+		t.Errorf("number stats = %d; want %d", got, want)
+	}
+	if err := <-errch; err != nil {
+		t.Errorf("StatBlobs: %v", err)
+	}
+	if len(need) != 0 {
+		t.Errorf("Not all stat results returned; still need %d", len(need))
+	}
 }
 
 func TestMissingGetReturnsNoEnt(t *testing.T) {
 	ds := NewStorage(t)
 	defer cleanUp(ds)
-	foo := &testBlob{"foo"}
+	foo := &test.Blob{"foo"}
 
 	blob, _, err := ds.Fetch(foo.BlobRef())
 	if err != os.ErrNotExist {
@@ -205,4 +147,52 @@ func TestMissingGetReturnsNoEnt(t *testing.T) {
 	if blob != nil {
 		t.Errorf("expected nil blob; got a value")
 	}
+}
+
+func rename(old, new string) error {
+	if err := os.Rename(old, new); err != nil {
+		if renameErr := mapRenameError(err, old, new); renameErr != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type file struct {
+	name     string
+	contents string
+}
+
+func TestRename(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Skipping test if not on windows")
+	}
+	files := []file{
+		file{name: filepath.Join(os.TempDir(), "foo"), contents: "foo"},
+		file{name: filepath.Join(os.TempDir(), "bar"), contents: "barr"},
+		file{name: filepath.Join(os.TempDir(), "baz"), contents: "foo"},
+	}
+	for _, v := range files {
+		if err := ioutil.WriteFile(v.name, []byte(v.contents), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// overwriting "bar" with "foo" should not be allowed
+	if err := rename(files[0].name, files[1].name); err == nil {
+		t.Fatalf("Renaming %v into %v should not succeed", files[0].name, files[1].name)
+	}
+
+	// but overwriting "baz" with "foo" is ok because they have the same
+	// contents
+	if err := rename(files[0].name, files[2].name); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLocaldisk(t *testing.T) {
+	storagetest.Test(t, func(t *testing.T) (blobserver.Storage, func()) {
+		ds := NewStorage(t)
+		return ds, func() { cleanUp(ds) }
+	})
 }

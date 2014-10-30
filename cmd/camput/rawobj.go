@@ -21,6 +21,7 @@ import (
 	"flag"
 	"strings"
 
+	"camlistore.org/pkg/cmdmain"
 	"camlistore.org/pkg/schema"
 )
 
@@ -30,7 +31,7 @@ type rawCmd struct {
 }
 
 func init() {
-	RegisterCommand("rawobj", func(flags *flag.FlagSet) CommandRunner {
+	cmdmain.RegisterCommand("rawobj", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		cmd := new(rawCmd)
 		flags.StringVar(&cmd.vals, "vals", "", "Pipe-separated key=value properties")
 		flags.BoolVar(&cmd.signed, "signed", true, "whether to sign the JSON object")
@@ -38,37 +39,40 @@ func init() {
 	})
 }
 
+func (c *rawCmd) Describe() string {
+	return "Upload a custom JSON schema blob."
+}
+
 func (c *rawCmd) Usage() {
-	errf("Usage: camput [globalopts] rawobj [rawopts]\n")
+	cmdmain.Errorf("Usage: camput [globalopts] rawobj [rawopts]\n")
 }
 
 func (c *rawCmd) Examples() []string {
 	return []string{"(debug command)"}
 }
 
-func (c *rawCmd) RunCommand(up *Uploader, args []string) error {
+func (c *rawCmd) RunCommand(args []string) error {
 	if len(args) > 0 {
 		return errors.New("Raw Object command doesn't take any additional arguments")
 	}
 
-	m := make(schema.Map)
 	if c.vals == "" {
 		return errors.New("No values")
 	}
+
+	bb := schema.NewBuilder()
 	for _, kv := range strings.Split(c.vals, "|") {
 		kv := strings.SplitN(kv, "=", 2)
-		m[kv[0]] = kv[1]
-	}
-	if _, ok := m["camliVersion"]; !ok {
-		m["camliVersion"] = "1"
+		bb.SetRawStringField(kv[0], kv[1])
 	}
 
+	up := getUploader()
 	if c.signed {
-		put, err := up.UploadAndSignMap(m)
+		put, err := up.UploadAndSignBlob(bb)
 		handleResult("raw-object-signed", put, err)
 		return err
 	}
-	cj, err := m.JSON()
+	cj, err := bb.JSON()
 	if err != nil {
 		return err
 	}

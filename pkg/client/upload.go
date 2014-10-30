@@ -18,7 +18,6 @@ package client
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,37 +30,61 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/blobserver/protocol"
+	"camlistore.org/pkg/constants"
+	"camlistore.org/pkg/httputil"
 )
 
-var _ = log.Printf
+var debugUploads = os.Getenv("CAMLI_DEBUG_UPLOADS") != ""
 
 // multipartOverhead is how many extra bytes mime/multipart's
 // Writer adds around content
 var multipartOverhead = calculateMultipartOverhead()
 
+// UploadHandle contains the parameters is a request to upload a blob.
 type UploadHandle struct {
-	BlobRef  *blobref.BlobRef
-	Size     int64 // or -1 if size isn't known
+	// BlobRef is the required blobref of the blob to upload.
+	BlobRef blob.Ref
+
+	// Contents is the blob data.
 	Contents io.Reader
+
+	// Size optionally specifies the size of Contents.
+	// If <= 0, the Contents are slurped into memory to count the size.
+	Size uint32
+
+	// Vivify optionally instructs the server to create a
+	// permanode for this blob. If used, the blob should be a
+	// "file" schema blob. This is typically used by
+	// lesser-trusted clients (such a mobile phones) which don't
+	// have rights to do signing directly.
+	Vivify bool
+
+	// SkipStat indicates whether the stat check (checking whether
+	// the server already has the blob) will be skipped and the
+	// blob should be uploaded immediately. This is useful for
+	// small blobs that the server is unlikely to already have
+	// (e.g. new claims).
+	SkipStat bool
 }
 
 type PutResult struct {
-	BlobRef *blobref.BlobRef
-	Size    int64
+	BlobRef blob.Ref
+	Size    uint32
 	Skipped bool // already present on blobserver
 }
 
-func (pr *PutResult) SizedBlobRef() blobref.SizedBlobRef {
-	return blobref.SizedBlobRef{pr.BlobRef, pr.Size}
+func (pr *PutResult) SizedBlobRef() blob.SizedRef {
+	return blob.SizedRef{pr.BlobRef, pr.Size}
 }
 
+// TODO: ditch this type and use protocol.StatResponse directly?
+// Or at least make HaveMap keyed by a blob.Ref instead of a string.
 type statResponse struct {
-	HaveMap                    map[string]blobref.SizedBlobRef
-	maxUploadSize              int64
-	uploadUrl                  string
-	uploadUrlExpirationSeconds int
-	canLongPoll                bool
+	HaveMap     map[string]blob.SizedRef
+	canLongPoll bool
 }
 
 type ResponseFormatError error
@@ -82,112 +105,175 @@ func newResFormatError(s string, arg ...interface{}) ResponseFormatError {
 	return ResponseFormatError(fmt.Errorf(s, arg...))
 }
 
-// TODO-GO: if outerr is replaced by a "_", gotest(!) fails with a 6g error.
-func parseStatResponse(r io.Reader) (sr *statResponse, outerr error) {
-	var (
-		ok   bool
-		err  error
-		s    = &statResponse{HaveMap: make(map[string]blobref.SizedBlobRef)}
-		jmap = make(map[string]interface{})
-	)
-	if err = json.NewDecoder(io.LimitReader(r, 5<<20)).Decode(&jmap); err != nil {
+func parseStatResponse(res *http.Response) (*statResponse, error) {
+	var s = &statResponse{HaveMap: make(map[string]blob.SizedRef)}
+	var pres protocol.StatResponse
+	if err := httputil.DecodeJSON(res, &pres); err != nil {
 		return nil, ResponseFormatError(err)
 	}
-	defer func() {
-		if sr == nil {
-			log.Printf("parseStatResponse got map: %#v", jmap)
+
+	s.canLongPoll = pres.CanLongPoll
+	for _, statItem := range pres.Stat {
+		br := statItem.Ref
+		if !br.Valid() {
+			continue
 		}
-	}()
-
-	s.uploadUrl, ok = jmap["uploadUrl"].(string)
-	if !ok {
-		return nil, newResFormatError("no 'uploadUrl' in stat response")
+		s.HaveMap[br.String()] = blob.SizedRef{br, uint32(statItem.Size)}
 	}
-
-	if n, ok := jmap["maxUploadSize"].(float64); ok {
-		s.maxUploadSize = int64(n)
-	} else {
-		return nil, newResFormatError("no 'maxUploadSize' in stat response")
-	}
-
-	if n, ok := jmap["uploadUrlExpirationSeconds"].(float64); ok {
-		s.uploadUrlExpirationSeconds = int(n)
-	} else {
-		return nil, newResFormatError("no 'uploadUrlExpirationSeconds' in stat response")
-	}
-
-	if v, ok := jmap["canLongPoll"].(bool); ok {
-		s.canLongPoll = v
-	}
-
-	alreadyHave, ok := jmap["stat"].([]interface{})
-	if !ok {
-		return nil, newResFormatError("no 'stat' key in stat response")
-	}
-
-	for _, li := range alreadyHave {
-		m, ok := li.(map[string]interface{})
-		if !ok {
-			return nil, newResFormatError("'stat' list value of unexpected type %T", li)
-		}
-		blobRefStr, ok := m["blobRef"].(string)
-		if !ok {
-			return nil, newResFormatError("'stat' list item has non-string 'blobRef' key")
-		}
-		size, ok := m["size"].(float64)
-		if !ok {
-			return nil, newResFormatError("'stat' list item has non-number 'size' key")
-		}
-		br := blobref.Parse(blobRefStr)
-		if br == nil {
-			return nil, newResFormatError("'stat' list item has invalid 'blobRef' key")
-		}
-		s.HaveMap[br.String()] = blobref.SizedBlobRef{br, int64(size)}
-	}
-
 	return s, nil
 }
 
+// NewUploadHandleFromString returns an upload handle
 func NewUploadHandleFromString(data string) *UploadHandle {
-	bref := blobref.SHA1FromString(data)
+	bref := blob.SHA1FromString(data)
 	r := strings.NewReader(data)
-	return &UploadHandle{BlobRef: bref, Size: int64(len(data)), Contents: r}
+	return &UploadHandle{BlobRef: bref, Size: uint32(len(data)), Contents: r}
 }
 
-func (c *Client) jsonFromResponse(requestName string, resp *http.Response) (map[string]interface{}, error) {
+// TODO(bradfitz): delete most of this. use new camlistore.org/pkg/blobserver/protocol types instead
+// of a map[string]interface{}.
+func (c *Client) responseJSONMap(requestName string, resp *http.Response) (map[string]interface{}, error) {
 	if resp.StatusCode != 200 {
 		log.Printf("After %s request, failed to JSON from response; status code is %d", requestName, resp.StatusCode)
 		io.Copy(os.Stderr, resp.Body)
-		return nil, errors.New(fmt.Sprintf("After %s request, HTTP response code is %d; no JSON to parse.", requestName, resp.StatusCode))
+		return nil, fmt.Errorf("After %s request, HTTP response code is %d; no JSON to parse.", requestName, resp.StatusCode)
 	}
-	// TODO: LimitReader here for paranoia
-	buf := new(bytes.Buffer)
-	io.Copy(buf, resp.Body)
-	resp.Body.Close()
 	jmap := make(map[string]interface{})
-	if jerr := json.Unmarshal(buf.Bytes(), &jmap); jerr != nil {
-		return nil, jerr
+	if err := httputil.DecodeJSON(resp, &jmap); err != nil {
+		return nil, err
 	}
 	return jmap, nil
 }
 
-func (c *Client) StatBlobs(dest chan<- blobref.SizedBlobRef, blobs []*blobref.BlobRef, wait time.Duration) error {
-	if len(blobs) == 0 {
+// statReq is a request to stat a blob.
+type statReq struct {
+	br   blob.Ref
+	dest chan<- blob.SizedRef // written to on success
+	errc chan<- error         // written to on both failure and success (after any dest)
+}
+
+func (c *Client) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
+	if c.sto != nil {
+		return c.sto.StatBlobs(dest, blobs)
+	}
+	var needStat []blob.Ref
+	for _, br := range blobs {
+		if !br.Valid() {
+			panic("invalid blob")
+		}
+		if size, ok := c.haveCache.StatBlobCache(br); ok {
+			dest <- blob.SizedRef{br, size}
+		} else {
+			if needStat == nil {
+				needStat = make([]blob.Ref, 0, len(blobs))
+			}
+			needStat = append(needStat, br)
+		}
+	}
+	if len(needStat) == 0 {
 		return nil
 	}
 
-	// TODO: if len(blobs) > 1000 or something, cut this up into
-	// multiple http requests, and also if the server returns a
-	// 400 error, per the blob-stat-protocol.txt document.
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "camliversion=1")
-	for n, blob := range blobs {
-		if blob == nil {
-			panic("nil blob")
+	// Here begins all the batching logic. In a SPDY world, this
+	// will all be somewhat useless, so consider detecting SPDY on
+	// the underlying connection and just always calling doStat
+	// instead.  The one thing this code below is also cut up
+	// >1000 stats into smaller batches.  But with SPDY we could
+	// even just do lots of little 1-at-a-time stats.
+
+	var errcs []chan error // one per blob to stat
+
+	c.pendStatMu.Lock()
+	{
+		if c.pendStat == nil {
+			c.pendStat = make(map[blob.Ref][]statReq)
 		}
-		fmt.Fprintf(&buf, "&blob%d=%s", n+1, blob)
+		for _, blob := range needStat {
+			errc := make(chan error, 1)
+			errcs = append(errcs, errc)
+			c.pendStat[blob] = append(c.pendStat[blob], statReq{blob, dest, errc})
+		}
+	}
+	c.pendStatMu.Unlock()
+
+	// Kick off at least one worker. It may do nothing and lose
+	// the race, but somebody will handle our requests in
+	// pendStat.
+	go c.doSomeStats()
+
+	for _, errc := range errcs {
+		if err := <-errc; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+const maxStatPerReq = 1000 // TODO: detect this from client discovery? add it on server side too.
+
+func (c *Client) doSomeStats() {
+	c.httpGate.Start()
+	defer c.httpGate.Done()
+
+	var batch map[blob.Ref][]statReq
+
+	c.pendStatMu.Lock()
+	{
+		if len(c.pendStat) == 0 {
+			// Lost race. Another batch got these.
+			c.pendStatMu.Unlock()
+			return
+		}
+		batch = make(map[blob.Ref][]statReq)
+		for br, reqs := range c.pendStat {
+			batch[br] = reqs
+			delete(c.pendStat, br)
+			if len(batch) == maxStatPerReq {
+				go c.doSomeStats() // kick off next batch
+				break
+			}
+		}
+	}
+	c.pendStatMu.Unlock()
+
+	if debugUploads {
+		println("doing stat batch of", len(batch))
 	}
 
+	blobs := make([]blob.Ref, 0, len(batch))
+	for br := range batch {
+		blobs = append(blobs, br)
+	}
+
+	ourDest := make(chan blob.SizedRef)
+	errc := make(chan error, 1)
+	go func() {
+		// false for not gated, since we already grabbed the
+		// token at the beginning of this function.
+		errc <- c.doStat(ourDest, blobs, 0, false)
+		close(ourDest)
+	}()
+
+	for sb := range ourDest {
+		for _, req := range batch[sb.Ref] {
+			req.dest <- sb
+		}
+	}
+
+	// Copy the doStat's error to all waiters for all blobrefs in this batch.
+	err := <-errc
+	for _, reqs := range batch {
+		for _, req := range reqs {
+			req.errc <- err
+		}
+	}
+}
+
+// doStat does an HTTP request for the stat. the number of blobs is used verbatim. No extra splitting
+// or batching is done at this layer.
+func (c *Client) doStat(dest chan<- blob.SizedRef, blobs []blob.Ref, wait time.Duration, gated bool) error {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "camliversion=1")
 	if wait > 0 {
 		secs := int(wait.Seconds())
 		if secs == 0 {
@@ -195,14 +281,23 @@ func (c *Client) StatBlobs(dest chan<- blobref.SizedBlobRef, blobs []*blobref.Bl
 		}
 		fmt.Fprintf(&buf, "&maxwaitsec=%d", secs)
 	}
+	for i, blob := range blobs {
+		fmt.Fprintf(&buf, "&blob%d=%s", i+1, blob)
+	}
 
-	req := c.newRequest("POST", fmt.Sprintf("%s/camli/stat", c.server))
-	bodyStr := buf.String()
-	req.Body = ioutil.NopCloser(strings.NewReader(bodyStr))
+	pfx, err := c.prefix()
+	if err != nil {
+		return err
+	}
+	req := c.newRequest("POST", fmt.Sprintf("%s/camli/stat", pfx), &buf)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.ContentLength = int64(len(bodyStr))
 
-	resp, err := c.httpClient.Do(req)
+	var resp *http.Response
+	if gated {
+		resp, err = c.doReqGated(req)
+	} else {
+		resp, err = c.httpClient.Do(req)
+	}
 	if err != nil {
 		return fmt.Errorf("stat HTTP error: %v", err)
 	}
@@ -214,7 +309,7 @@ func (c *Client) StatBlobs(dest chan<- blobref.SizedBlobRef, blobs []*blobref.Bl
 		return fmt.Errorf("stat response had http status %d", resp.StatusCode)
 	}
 
-	stat, err := parseStatResponse(resp.Body)
+	stat, err := parseStatResponse(resp)
 	if err != nil {
 		return err
 	}
@@ -227,10 +322,9 @@ func (c *Client) StatBlobs(dest chan<- blobref.SizedBlobRef, blobs []*blobref.Bl
 
 // Figure out the size of the contents.
 // If the size was provided, trust it.
-// If the size was not provided (-1), slurp.
-func readerAndSize(h *UploadHandle) (io.Reader, int64, error) {
-	if h.Size != -1 {
-		return h.Contents, h.Size, nil
+func (h *UploadHandle) readerAndSize() (io.Reader, int64, error) {
+	if h.Size > 0 {
+		return h.Contents, int64(h.Size), nil
 	}
 	var b bytes.Buffer
 	n, err := io.Copy(&b, h.Contents)
@@ -240,6 +334,7 @@ func readerAndSize(h *UploadHandle) (io.Reader, int64, error) {
 	return &b, n, nil
 }
 
+// Upload uploads a blob, as described by the provided UploadHandle parameters.
 func (c *Client) Upload(h *UploadHandle) (*PutResult, error) {
 	errorf := func(msg string, arg ...interface{}) (*PutResult, error) {
 		err := fmt.Errorf(msg, arg...)
@@ -247,9 +342,12 @@ func (c *Client) Upload(h *UploadHandle) (*PutResult, error) {
 		return nil, err
 	}
 
-	bodyReader, bodySize, err := readerAndSize(h)
+	bodyReader, bodySize, err := h.readerAndSize()
 	if err != nil {
 		return nil, fmt.Errorf("client: error slurping upload handle to find its length: %v", err)
+	}
+	if bodySize > constants.MaxBlobSize {
+		return nil, errors.New("client: body is bigger then max blob size")
 	}
 
 	c.statsMutex.Lock()
@@ -257,41 +355,75 @@ func (c *Client) Upload(h *UploadHandle) (*PutResult, error) {
 	c.stats.UploadRequests.Bytes += bodySize
 	c.statsMutex.Unlock()
 
+	pr := &PutResult{BlobRef: h.BlobRef, Size: uint32(bodySize)}
+
+	if c.sto != nil {
+		// TODO: stat first so we can show skipped?
+		_, err := blobserver.Receive(c.sto, h.BlobRef, bodyReader)
+		if err != nil {
+			return nil, err
+		}
+		return pr, nil
+	}
+
+	if !h.Vivify {
+		if _, ok := c.haveCache.StatBlobCache(h.BlobRef); ok {
+			pr.Skipped = true
+			return pr, nil
+		}
+	}
+
 	blobrefStr := h.BlobRef.String()
 
-	// Pre-upload.  Check whether the blob already exists on the
+	// Pre-upload. Check whether the blob already exists on the
 	// server and if not, the URL to upload it to.
-	url_ := fmt.Sprintf("%s/camli/stat", c.server)
-	requestBody := "camliversion=1&blob1=" + blobrefStr
-	req := c.newRequest("POST", url_)
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	req.Body = ioutil.NopCloser(strings.NewReader(requestBody))
-	req.ContentLength = int64(len(requestBody))
-	req.TransferEncoding = nil
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return errorf("stat http error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return errorf("stat response had http status %d", resp.StatusCode)
-	}
-
-	stat, err := parseStatResponse(resp.Body)
+	pfx, err := c.prefix()
 	if err != nil {
 		return nil, err
 	}
-	resp.Body.Close()
 
-	pr := &PutResult{BlobRef: h.BlobRef, Size: bodySize}
-	if _, ok := stat.HaveMap[blobrefStr]; ok {
-		pr.Skipped = true
-		if closer, ok := h.Contents.(io.Closer); ok {
-			closer.Close()
+	if !h.SkipStat {
+		url_ := fmt.Sprintf("%s/camli/stat", pfx)
+		req := c.newRequest("POST", url_, strings.NewReader("camliversion=1&blob1="+blobrefStr))
+		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+		resp, err := c.doReqGated(req)
+		if err != nil {
+			return errorf("stat http error: %v", err)
 		}
-		return pr, nil
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return errorf("stat response had http status %d", resp.StatusCode)
+		}
+
+		stat, err := parseStatResponse(resp)
+		if err != nil {
+			return nil, err
+		}
+		for _, sbr := range stat.HaveMap {
+			c.haveCache.NoteBlobExists(sbr.Ref, uint32(sbr.Size))
+		}
+		_, serverHasIt := stat.HaveMap[blobrefStr]
+		if debugUploads {
+			log.Printf("HTTP Stat(%s) = %v", blobrefStr, serverHasIt)
+		}
+		if !h.Vivify && serverHasIt {
+			pr.Skipped = true
+			if closer, ok := h.Contents.(io.Closer); ok {
+				// TODO(bradfitz): I did this
+				// Close-if-possible thing early on, before I
+				// knew better.  Fix the callers instead, and
+				// fix the docs.
+				closer.Close()
+			}
+			c.haveCache.NoteBlobExists(h.BlobRef, uint32(bodySize))
+			return pr, nil
+		}
+	}
+
+	if debugUploads {
+		log.Printf("Uploading: %s (%d bytes)", blobrefStr, bodySize)
 	}
 
 	pipeReader, pipeWriter := io.Pipe()
@@ -313,14 +445,17 @@ func (c *Client) Upload(h *UploadHandle) (*PutResult, error) {
 	}()
 
 	// TODO(bradfitz): verbosity levels. make this VLOG(2) or something. it's noisy:
-	// c.log.Printf("Uploading %s to URL: %s", blobrefStr, stat.uploadUrl)
+	// c.log.Printf("Uploading %s", br)
 
-	req = c.newRequest("POST", stat.uploadUrl)
+	uploadURL := fmt.Sprintf("%s/camli/upload", pfx)
+	req := c.newRequest("POST", uploadURL)
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	if h.Vivify {
+		req.Header.Add("X-Camlistore-Vivify", "1")
+	}
 	req.Body = ioutil.NopCloser(pipeReader)
 	req.ContentLength = multipartOverhead + bodySize + int64(len(blobrefStr))*2
-	req.TransferEncoding = nil
-	resp, err = c.httpClient.Do(req)
+	resp, err := c.doReqGated(req)
 	if err != nil {
 		return errorf("upload http error: %v", err)
 	}
@@ -341,63 +476,46 @@ func (c *Client) Upload(h *UploadHandle) (*PutResult, error) {
 		if otherLocation == "" {
 			return errorf("303 without a Location")
 		}
-		baseUrl, _ := url.Parse(stat.uploadUrl)
-		absUrl, err := baseUrl.Parse(otherLocation)
+		baseURL, _ := url.Parse(uploadURL)
+		absURL, err := baseURL.Parse(otherLocation)
 		if err != nil {
 			return errorf("303 Location URL relative resolve error: %v", err)
 		}
-		otherLocation = absUrl.String()
+		otherLocation = absURL.String()
 		resp, err = http.Get(otherLocation)
 		if err != nil {
 			return errorf("error following 303 redirect after upload: %v", err)
 		}
 	}
 
-	ures, err := c.jsonFromResponse("upload", resp)
-	if err != nil {
-		return errorf("json parse from upload error: %v", err)
+	var ures protocol.UploadResponse
+	if err := httputil.DecodeJSON(resp, &ures); err != nil {
+		return errorf("error in upload response: %v", err)
 	}
 
-	errorText, ok := ures["errorText"].(string)
-	if ok {
-		c.log.Printf("Blob server reports error: %s", errorText)
+	if ures.ErrorText != "" {
+		c.log.Printf("Blob server reports error: %s", ures.ErrorText)
 	}
 
-	received, ok := ures["received"].([]interface{})
-	if !ok {
-		return errorf("upload json validity error: no 'received'")
-	}
+	expectedSize := uint32(bodySize)
 
-	expectedSize := bodySize
-
-	for _, rit := range received {
-		it, ok := rit.(map[string]interface{})
-		if !ok {
-			return errorf("upload json validity error: 'received' is malformed")
+	for _, sb := range ures.Received {
+		if sb.Ref != h.BlobRef {
+			continue
 		}
-		if it["blobRef"] == blobrefStr {
-			switch size := it["size"].(type) {
-			case nil:
-				return errorf("upload json validity error: 'received' is missing 'size'")
-			case float64:
-				if int64(size) == expectedSize {
-					// Success!
-					c.statsMutex.Lock()
-					c.stats.Uploads.Blobs++
-					c.stats.Uploads.Bytes += expectedSize
-					c.statsMutex.Unlock()
-					if pr.Size == -1 {
-						pr.Size = expectedSize
-					}
-					return pr, nil
-				} else {
-					return errorf("Server got blob, but reports wrong length (%v; we sent %d)",
-						size, expectedSize)
-				}
-			default:
-				return errorf("unsupported type of 'size' in received response")
-			}
+		if sb.Size != expectedSize {
+			return errorf("Server got blob %v, but reports wrong length (%v; we sent %d)",
+				sb.Ref, sb.Size, expectedSize)
 		}
+		c.statsMutex.Lock()
+		c.stats.Uploads.Blobs++
+		c.stats.Uploads.Bytes += bodySize
+		c.statsMutex.Unlock()
+		if pr.Size <= 0 {
+			pr.Size = sb.Size
+		}
+		c.haveCache.NoteBlobExists(pr.BlobRef, pr.Size)
+		return pr, nil
 	}
 
 	return nil, errors.New("Server didn't receive blob.")

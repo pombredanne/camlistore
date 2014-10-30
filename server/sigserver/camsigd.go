@@ -14,29 +14,37 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// The sigserver is a stand-alone JSON signing and verification server.
+//
+// TODO(bradfitz): as of 2012-01-10 this is very old and superceded by
+// the general server and pkg/serverconfig.  We should just make it
+// possible to configure a signing-only server with
+// serverconfig/genconfig.go.  I think we basically already can. Then
+// we can delete this.
 package main
 
 import (
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/blobref"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/webserver"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+
+	"camlistore.org/pkg/auth"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/httputil"
+	"camlistore.org/pkg/webserver"
 )
 
 var accessPassword string
 
-var flagPubKeyDir *string = flag.String("pubkey-dir", "test/pubkey-blobs",
+var flagPubKeyDir = flag.String("pubkey-dir", "test/pubkey-blobs",
 	"Temporary development hack; directory to dig-xxxx.camli public keys.")
 
 // TODO: for now, the only implementation of the blobref.Fetcher
 // interface for fetching public keys is the "local, from disk"
 // implementation used for testing.  In reality we'd want to be able
 // to fetch these from blobservers.
-var pubKeyFetcher = blobref.NewSimpleDirectoryFetcher(*flagPubKeyDir)
+var pubKeyFetcher = blob.NewSimpleDirectoryFetcher(*flagPubKeyDir)
 
 func handleRoot(conn http.ResponseWriter, req *http.Request) {
 	fmt.Fprintf(conn, "camsigd")
@@ -51,7 +59,7 @@ func handleCamliSig(conn http.ResponseWriter, req *http.Request) {
 	case "POST":
 		switch req.URL.Path {
 		case "/camli/sig/sign":
-			handler = auth.RequireAuth(handleSign)
+			handler = auth.RequireAuth(handleSign, auth.OpSign)
 		case "/camli/sig/verify":
 			handler = handleVerify
 		}
@@ -62,10 +70,11 @@ func handleCamliSig(conn http.ResponseWriter, req *http.Request) {
 func main() {
 	flag.Parse()
 
-	_, err := auth.FromEnv()
+	mode, err := auth.FromEnv()
 	if err != nil {
 		log.Fatal(err)
 	}
+	auth.SetMode(mode)
 
 	ws := webserver.New()
 	ws.HandleFunc("/", handleRoot)

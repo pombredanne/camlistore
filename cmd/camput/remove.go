@@ -19,30 +19,38 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/cmdmain"
 )
 
 type removeCmd struct{}
 
 func init() {
-	RegisterCommand("remove", func(flags *flag.FlagSet) CommandRunner {
+	cmdmain.RegisterCommand("remove", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		cmd := new(removeCmd)
 		return cmd
 	})
 }
 
 func (c *removeCmd) Usage() {
-	fmt.Fprintf(os.Stderr, `Usage: camput remove <blobref(s)>
+	fmt.Fprintf(cmdmain.Stderr, `Usage: camput remove <blobref(s)>
 
 This command is for debugging only.  You're not expected to use it in practice.
 `)
 }
 
-func (c *removeCmd) RunCommand(up *Uploader, args []string) error {
+func (c *removeCmd) RunCommand(args []string) error {
 	if len(args) == 0 {
-		return ErrUsage
+		return cmdmain.ErrUsage
 	}
-	return up.RemoveBlobs(blobref.ParseMulti(args))
+	refs := make([]blob.Ref, 0, len(args))
+	for _, s := range args {
+		br, ok := blob.Parse(s)
+		if !ok {
+			return fmt.Errorf("Invalid blobref %q", s)
+		}
+		refs = append(refs, br)
+	}
+	return getUploader().RemoveBlobs(refs)
 }

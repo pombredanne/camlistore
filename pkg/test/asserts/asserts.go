@@ -14,12 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package asserts provides a bad implementation of test predicate
+// helpers. This package should either go away or dramatically
+// improve.
 package asserts
 
 import (
 	"strings"
 	"testing"
 )
+
+// NOTE: THESE FUNCTIONS ARE DEPRECATED. PLEASE DO NOT USE THEM IN
+// NEW CODE.
 
 func Expect(t *testing.T, got bool, what string) {
 	if !got {

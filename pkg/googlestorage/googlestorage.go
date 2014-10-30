@@ -14,65 +14,119 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Implements the Google Storage API calls needed by camlistore.
-// This is intended to be exclude camlistore-specific logic.
-
+// Package googlestorage is simple Google Cloud Storage client.
+//
+// It does not include any Camlistore-specific logic.
 package googlestorage
 
 import (
+	"bytes"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
+	"camlistore.org/pkg/httputil"
 	"camlistore.org/third_party/code.google.com/p/goauth2/oauth"
+	api "camlistore.org/third_party/code.google.com/p/google-api-go-client/storage/v1"
+	"camlistore.org/third_party/github.com/bradfitz/gce"
 )
 
 const (
-	gsAccessURL = "https://commondatastorage.googleapis.com"
+	gsAccessURL = "https://storage.googleapis.com"
 )
 
+// A Client provides access to Google Cloud Storage.
 type Client struct {
-	transport *oauth.Transport
 	client    *http.Client
+	transport *oauth.Transport // nil for service clients
+	service   *api.Service
 }
 
+// An Object holds the name of an object (its bucket and key) within
+// Google Cloud Storage.
 type Object struct {
 	Bucket string
 	Key    string
 }
 
+func (o *Object) valid() error {
+	if o == nil {
+		return errors.New("invalid nil Object")
+	}
+	if o.Bucket == "" {
+		return errors.New("missing required Bucket field in Object")
+	}
+	if o.Key == "" {
+		return errors.New("missing required Key field in Object")
+	}
+	return nil
+}
+
+// A SizedObject holds the bucket, key, and size of an object.
 type SizedObject struct {
 	Object
 	Size int64
 }
 
+// NewServiceClient returns a Client for use when running on Google
+// Compute Engine.  This client can access buckets owned by the samre
+// project ID as the VM.
+func NewServiceClient() (*Client, error) {
+	if !gce.OnGCE() {
+		return nil, errors.New("not running on Google Compute Engine")
+	}
+	scopes, _ := gce.Scopes("default")
+	if !scopes.Contains("https://www.googleapis.com/auth/devstorage.full_control") &&
+		!scopes.Contains("https://www.googleapis.com/auth/devstorage.read_write") {
+		return nil, errors.New("when this Google Compute Engine VM instance was created, it wasn't granted access to Cloud Storage")
+	}
+	service, _ := api.New(gce.Client)
+	return &Client{client: gce.Client, service: service}, nil
+}
+
 func NewClient(transport *oauth.Transport) *Client {
-	return &Client{transport, transport.Client()}
+	client := transport.Client()
+	service, _ := api.New(client)
+	return &Client{
+		client:    transport.Client(),
+		transport: transport,
+		service:   service,
+	}
 }
 
-func (gso Object) String() string {
-	return fmt.Sprintf("%v/%v", gso.Bucket, gso.Key)
+func (o *Object) String() string {
+	if o == nil {
+		return "<nil *Object>"
+	}
+	return fmt.Sprintf("%v/%v", o.Bucket, o.Key)
 }
 
-func (sgso SizedObject) String() string {
-	return fmt.Sprintf("%v/%v (%vB)", sgso.Bucket, sgso.Key, sgso.Size)
+func (so SizedObject) String() string {
+	return fmt.Sprintf("%v/%v (%vB)", so.Bucket, so.Key, so.Size)
 }
 
 // A close relative to http.Client.Do(), helping with token refresh logic.
-// If canResend is true and the initial request's response is an auth error 
-// (401 or 403), oauth credentials will be refreshed and the request sent 
+// If canResend is true and the initial request's response is an auth error
+// (401 or 403), oauth credentials will be refreshed and the request sent
 // again.  This should only be done for requests with empty bodies, since the
 // Body will be consumed on the first attempt if it exists.
-// If canResend is false, and req would have been resent if canResend were 
+// If canResend is false, and req would have been resent if canResend were
 // true, then shouldRetry will be true.
 // One of resp or err will always be nil.
 func (gsa *Client) doRequest(req *http.Request, canResend bool) (resp *http.Response, err error, shouldRetry bool) {
-	if resp, err = gsa.client.Do(req); err != nil {
+	resp, err = gsa.client.Do(req)
+	if err != nil {
+		return
+	}
+	if gsa.transport == nil {
 		return
 	}
 
@@ -106,69 +160,122 @@ func (gsa *Client) simpleRequest(method, url_ string) (resp *http.Response, err 
 	return
 }
 
-// Fetch a GS object.
-// Bucket and Key fields are trusted to be valid.
-// Returns (object reader, object size, err).  Reader must be closed.
-func (gsa *Client) GetObject(obj *Object) (io.ReadCloser, int64, error) {
-	log.Printf("Fetching object from Google Storage: %s/%s\n", obj.Bucket, obj.Key)
-
-	resp, err := gsa.simpleRequest("GET", gsAccessURL+"/"+obj.Bucket+"/"+obj.Key)
+// GetObject fetches a Google Cloud Storage object.
+// The caller must close rc.
+func (c *Client) GetObject(obj *Object) (rc io.ReadCloser, size int64, err error) {
+	if err = obj.valid(); err != nil {
+		return
+	}
+	resp, err := c.simpleRequest("GET", gsAccessURL+"/"+obj.Bucket+"/"+obj.Key)
 	if err != nil {
 		return nil, 0, fmt.Errorf("GS GET request failed: %v\n", err)
 	}
-
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil, 0, os.ErrNotExist
+	}
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		return nil, 0, fmt.Errorf("GS GET request failed status: %v\n", resp.Status)
 	}
 
 	return resp.Body, resp.ContentLength, nil
 }
 
-// Check for size / existence of a GS object.
-// Bucket and Key fields are trusted to be valid.
-// err signals io / authz errors, a nonexistant file is not an error.
-func (gsa *Client) StatObject(obj *Object) (size int64, exists bool, err error) {
-	log.Printf("Statting object in Google Storage: %s/%s\n", obj.Bucket, obj.Key)
+// GetPartialObject fetches part of a Google Cloud Storage object.
+// If length is negative, the rest of the object is returned.
+// The caller must close rc.
+func (c *Client) GetPartialObject(obj Object, offset, length int64) (rc io.ReadCloser, err error) {
+	if offset < 0 {
+		return nil, errors.New("invalid negative length")
+	}
+	if err = obj.valid(); err != nil {
+		return
+	}
 
-	resp, err := gsa.simpleRequest("HEAD", gsAccessURL+"/"+obj.Bucket+"/"+obj.Key)
+	req, err := http.NewRequest("GET", gsAccessURL+"/"+obj.Bucket+"/"+obj.Key, nil)
 	if err != nil {
 		return
 	}
-	resp.Body.Close() // should be empty
+	req.Header.Set("x-goog-api-version", "2")
+	if length >= 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	} else {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
 
+	resp, err, _ := c.doRequest(req, true)
+	if err != nil {
+		return nil, fmt.Errorf("GS GET request failed: %v\n", err)
+	}
 	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil, os.ErrNotExist
+	}
+	if !(resp.StatusCode == http.StatusPartialContent || (offset == 0 && resp.StatusCode == http.StatusOK)) {
+		resp.Body.Close()
+		return nil, fmt.Errorf("GS GET request failed status: %v\n", resp.Status)
+	}
+
+	return resp.Body, nil
+}
+
+// StatObject checks for the size & existence of a Google Cloud Storage object.
+// Non-existence of a file is not an error.
+func (gsa *Client) StatObject(obj *Object) (size int64, exists bool, err error) {
+	if err = obj.valid(); err != nil {
 		return
 	}
-	if resp.StatusCode == http.StatusOK {
-		if size, err = strconv.ParseInt(resp.Header["Content-Length"][0], 10, 64); err != nil {
+	res, err := gsa.simpleRequest("HEAD", gsAccessURL+"/"+obj.Bucket+"/"+obj.Key)
+	if err != nil {
+		return
+	}
+	res.Body.Close() // per contract but unnecessary for most RoundTrippers
+
+	switch res.StatusCode {
+	case http.StatusNotFound:
+		return 0, false, nil
+	case http.StatusOK:
+		if size, err = strconv.ParseInt(res.Header["Content-Length"][0], 10, 64); err != nil {
 			return
 		}
 		return size, true, nil
+	default:
+		return 0, false, fmt.Errorf("Bad head response code: %v", res.Status)
 	}
-
-	// Any response other than 404 or 200 is erroneous
-	return 0, false, fmt.Errorf("Bad head response code: %v", resp.Status)
 }
 
-// Upload a GS object.  Bucket and Key are trusted to be valid.
+// PutObject uploads a Google Cloud Storage object.
 // shouldRetry will be true if the put failed due to authorization, but
 // credentials have been refreshed and another attempt is likely to succeed.
 // In this case, content will have been consumed.
-func (gsa *Client) PutObject(obj *Object, content io.ReadCloser) (shouldRetry bool, err error) {
-	log.Printf("Putting object in Google Storage: %s/%s\n", obj.Bucket, obj.Key)
+func (gsa *Client) PutObject(obj *Object, content io.Reader) (shouldRetry bool, err error) {
+	if err := obj.valid(); err != nil {
+		return false, err
+	}
+	const maxSlurp = 2 << 20
+	var buf bytes.Buffer
+	n, err := io.CopyN(&buf, content, maxSlurp)
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	contentType := http.DetectContentType(buf.Bytes())
+	if contentType == "application/octet-stream" && n < maxSlurp && utf8.Valid(buf.Bytes()) {
+		contentType = "text/plain; charset=utf-8"
+	}
 
 	objURL := gsAccessURL + "/" + obj.Bucket + "/" + obj.Key
 	var req *http.Request
-	if req, err = http.NewRequest("PUT", objURL, content); err != nil {
+	if req, err = http.NewRequest("PUT", objURL, ioutil.NopCloser(io.MultiReader(&buf, content))); err != nil {
 		return
 	}
 	req.Header.Set("x-goog-api-version", "2")
+	req.Header.Set("Content-Type", contentType)
 
 	var resp *http.Response
 	if resp, err, shouldRetry = gsa.doRequest(req, false); err != nil {
 		return
 	}
-	resp.Body.Close() // should be empty
 
 	if resp.StatusCode != http.StatusOK {
 		return shouldRetry, fmt.Errorf("Bad put response code: %v", resp.Status)
@@ -176,35 +283,28 @@ func (gsa *Client) PutObject(obj *Object, content io.ReadCloser) (shouldRetry bo
 	return
 }
 
-// Removes a GS object.
-// Bucket and Key values are trusted to be valid.
-func (gsa *Client) DeleteObject(obj *Object) (err error) {
-	log.Printf("Deleting %v/%v\n", obj.Bucket, obj.Key)
-
-	//	bucketURL := gsAccessURL + "/" + obj.Bucket + "/" + obj.Key
+// DeleteObject removes an object.
+func (gsa *Client) DeleteObject(obj *Object) error {
+	if err := obj.valid(); err != nil {
+		return err
+	}
 	resp, err := gsa.simpleRequest("DELETE", gsAccessURL+"/"+obj.Bucket+"/"+obj.Key)
 	if err != nil {
-		return
+		return err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
-		err = fmt.Errorf("Bad delete response code: %v", resp.Status)
+		return fmt.Errorf("Error deleting %v: bad delete response code: %v", obj, resp.Status)
 	}
-	return
+	return nil
 }
 
-// Used for unmarshalling XML returned by enumerate request
-type gsListResult struct {
-	Contents []SizedObject
-}
-
-// List the objects in a GS bucket.
-// If after is nonempty, listing will begin with lexically greater object names
-// If limit is nonzero, the length of the list will be limited to that number.
-func (gsa *Client) EnumerateObjects(bucket, after string, limit uint) ([]SizedObject, error) {
-	log.Printf("Fetching from %v: after '%v', limit %v\n", bucket, after, limit)
-
+// EnumerateObjects lists the objects in a bucket.
+// If after is non-empty, listing will begin with lexically greater object names.
+// If limit is non-zero, the length of the list will be limited to that number.
+func (gsa *Client) EnumerateObjects(bucket, after string, limit int) ([]SizedObject, error) {
 	// Build url, with query params
-	params := make([]string, 0, 2)
+	var params []string
 	if after != "" {
 		params = append(params, "marker="+url.QueryEscape(after))
 	}
@@ -216,7 +316,6 @@ func (gsa *Client) EnumerateObjects(bucket, after string, limit uint) ([]SizedOb
 		query = "?" + strings.Join(params, "&")
 	}
 
-	// Make the request
 	resp, err := gsa.simpleRequest("GET", gsAccessURL+"/"+bucket+"/"+query)
 	if err != nil {
 		return nil, err
@@ -226,15 +325,23 @@ func (gsa *Client) EnumerateObjects(bucket, after string, limit uint) ([]SizedOb
 		return nil, fmt.Errorf("Bad enumerate response code: %v", resp.Status)
 	}
 
-	// Parse the XML response
-	result := &gsListResult{make([]SizedObject, 0, limit)}
-	if err = xml.NewDecoder(resp.Body).Decode(result); err != nil {
+	var xres struct {
+		Contents []SizedObject
+	}
+	defer httputil.CloseBody(resp.Body)
+	if err = xml.NewDecoder(resp.Body).Decode(&xres); err != nil {
 		return nil, err
 	}
+
 	// Fill in the Bucket on all the SizedObjects
-	for i, _ := range result.Contents {
-		result.Contents[i].Bucket = bucket
+	for _, o := range xres.Contents {
+		o.Bucket = bucket
 	}
 
-	return result.Contents, nil
+	return xres.Contents, nil
+}
+
+// BucketInfo returns information about a bucket.
+func (c *Client) BucketInfo(bucket string) (*api.Bucket, error) {
+	return c.service.Buckets.Get(bucket).Do()
 }

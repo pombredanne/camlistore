@@ -2,8 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// The oauth package provides support for making
-// OAuth2-authenticated HTTP requests.
+// Package oauth supports making OAuth2-authenticated HTTP requests.
 //
 // Example usage:
 //
@@ -37,31 +36,119 @@
 //
 package oauth
 
-// TODO(adg): A means of automatically saving credentials when updated.
-
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"mime"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
-// Config is the configuration of an OAuth consumer.
-type Config struct {
-	ClientId     string
-	ClientSecret string
-	Scope        string
-	AuthURL      string
-	TokenURL     string
-	RedirectURL  string // Defaults to out-of-band mode if empty.
+// OAuthError is the error type returned by many operations.
+//
+// In retrospect it should not exist. Don't depend on it.
+type OAuthError struct {
+	prefix string
+	msg    string
 }
 
-func (c *Config) redirectURL() string {
-	if c.RedirectURL != "" {
-		return c.RedirectURL
+func (oe OAuthError) Error() string {
+	return "OAuthError: " + oe.prefix + ": " + oe.msg
+}
+
+// Cache specifies the methods that implement a Token cache.
+type Cache interface {
+	Token() (*Token, error)
+	PutToken(*Token) error
+}
+
+// CacheFile implements Cache. Its value is the name of the file in which
+// the Token is stored in JSON format.
+type CacheFile string
+
+func (f CacheFile) Token() (*Token, error) {
+	file, err := os.Open(string(f))
+	if err != nil {
+		return nil, OAuthError{"CacheFile.Token", err.Error()}
 	}
-	return "oob"
+	defer file.Close()
+	tok := &Token{}
+	if err := json.NewDecoder(file).Decode(tok); err != nil {
+		return nil, OAuthError{"CacheFile.Token", err.Error()}
+	}
+	return tok, nil
+}
+
+func (f CacheFile) PutToken(tok *Token) error {
+	file, err := os.OpenFile(string(f), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return OAuthError{"CacheFile.PutToken", err.Error()}
+	}
+	if err := json.NewEncoder(file).Encode(tok); err != nil {
+		file.Close()
+		return OAuthError{"CacheFile.PutToken", err.Error()}
+	}
+	if err := file.Close(); err != nil {
+		return OAuthError{"CacheFile.PutToken", err.Error()}
+	}
+	return nil
+}
+
+// Config is the configuration of an OAuth consumer.
+type Config struct {
+	// ClientId is the OAuth client identifier used when communicating with
+	// the configured OAuth provider.
+	ClientId string
+
+	// ClientSecret is the OAuth client secret used when communicating with
+	// the configured OAuth provider.
+	ClientSecret string
+
+	// Scope identifies the level of access being requested. Multiple scope
+	// values should be provided as a space-delimited string.
+	Scope string
+
+	// AuthURL is the URL the user will be directed to in order to grant
+	// access.
+	AuthURL string
+
+	// TokenURL is the URL used to retrieve OAuth tokens.
+	TokenURL string
+
+	// RedirectURL is the URL to which the user will be returned after
+	// granting (or denying) access.
+	RedirectURL string
+
+	// TokenCache allows tokens to be cached for subsequent requests.
+	TokenCache Cache
+
+	// AccessType is an OAuth extension that gets sent as the
+	// "access_type" field in the URL from AuthCodeURL.
+	// See https://developers.google.com/accounts/docs/OAuth2WebServer.
+	// It may be "online" (the default) or "offline".
+	// If your application needs to refresh access tokens when the
+	// user is not present at the browser, then use offline. This
+	// will result in your application obtaining a refresh token
+	// the first time your application exchanges an authorization
+	// code for a user.
+	AccessType string
+
+	// ApprovalPrompt indicates whether the user should be
+	// re-prompted for consent. If set to "auto" (default) the
+	// user will be prompted only if they haven't previously
+	// granted consent and the code can only be exchanged for an
+	// access token.
+	// If set to "force" the user will always be prompted, and the
+	// code can be exchanged for a refresh token.
+	ApprovalPrompt string
 }
 
 // Token contains an end-user's tokens.
@@ -70,9 +157,19 @@ type Token struct {
 	AccessToken  string
 	RefreshToken string
 	Expiry       time.Time // If zero the token has no (known) expiry time.
+
+	// Extra optionally contains extra metadata from the server
+	// when updating a token. The only current key that may be
+	// populated is "id_token". It may be nil and will be
+	// initialized as needed.
+	Extra map[string]string
 }
 
+// Expired reports whether the token has expired or is invalid.
 func (t *Token) Expired() bool {
+	if t.AccessToken == "" {
+		return true
+	}
 	if t.Expiry.IsZero() {
 		return false
 	}
@@ -92,6 +189,9 @@ func (t *Token) Expired() bool {
 type Transport struct {
 	*Config
 	*Token
+
+	// mu guards modifying the token.
+	mu sync.Mutex
 
 	// Transport is the HTTP transport to use when making requests.
 	// It will default to http.DefaultTransport if nil.
@@ -119,11 +219,13 @@ func (c *Config) AuthCodeURL(state string) string {
 		panic("AuthURL malformed: " + err.Error())
 	}
 	q := url.Values{
-		"response_type": {"code"},
-		"client_id":     {c.ClientId},
-		"redirect_uri":  {c.redirectURL()},
-		"scope":         {c.Scope},
-		"state":         {state},
+		"response_type":   {"code"},
+		"client_id":       {c.ClientId},
+		"redirect_uri":    {c.RedirectURL},
+		"scope":           {c.Scope},
+		"state":           {state},
+		"access_type":     {c.AccessType},
+		"approval_prompt": {c.ApprovalPrompt},
 	}.Encode()
 	if url_.RawQuery == "" {
 		url_.RawQuery = q
@@ -134,21 +236,34 @@ func (c *Config) AuthCodeURL(state string) string {
 }
 
 // Exchange takes a code and gets access Token from the remote server.
-func (t *Transport) Exchange(code string) (tok *Token, err error) {
+func (t *Transport) Exchange(code string) (*Token, error) {
 	if t.Config == nil {
-		return nil, errors.New("no Config supplied")
+		return nil, OAuthError{"Exchange", "no Config supplied"}
 	}
-	tok = new(Token)
-	err = t.updateToken(tok, url.Values{
+
+	// If the transport or the cache already has a token, it is
+	// passed to `updateToken` to preserve existing refresh token.
+	tok := t.Token
+	if tok == nil && t.TokenCache != nil {
+		tok, _ = t.TokenCache.Token()
+	}
+	if tok == nil {
+		tok = new(Token)
+	}
+	err := t.updateToken(tok, url.Values{
 		"grant_type":   {"authorization_code"},
-		"redirect_uri": {t.redirectURL()},
+		"redirect_uri": {t.RedirectURL},
 		"scope":        {t.Scope},
 		"code":         {code},
 	})
-	if err == nil {
-		t.Token = tok
+	if err != nil {
+		return nil, err
 	}
-	return
+	t.Token = tok
+	if t.TokenCache != nil {
+		return tok, t.TokenCache.PutToken(tok)
+	}
+	return tok, nil
 }
 
 // RoundTrip executes a single HTTP transaction using the Transport's
@@ -160,64 +275,187 @@ func (t *Transport) Exchange(code string) (tok *Token, err error) {
 // If the Token is invalid callers should expect HTTP-level errors,
 // as indicated by the Response's StatusCode.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.Config == nil {
-		return nil, errors.New("no Config supplied")
+	accessToken, err := t.getAccessToken()
+	if err != nil {
+		return nil, err
 	}
+	// To set the Authorization header, we must make a copy of the Request
+	// so that we don't modify the Request we were given.
+	// This is required by the specification of http.RoundTripper.
+	req = cloneRequest(req)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	// Make the HTTP request.
+	return t.transport().RoundTrip(req)
+}
+
+func (t *Transport) getAccessToken() (string, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if t.Token == nil {
-		return nil, errors.New("no Token supplied")
+		if t.Config == nil {
+			return "", OAuthError{"RoundTrip", "no Config supplied"}
+		}
+		if t.TokenCache == nil {
+			return "", OAuthError{"RoundTrip", "no Token supplied"}
+		}
+		var err error
+		t.Token, err = t.TokenCache.Token()
+		if err != nil {
+			return "", err
+		}
 	}
 
 	// Refresh the Token if it has expired.
 	if t.Expired() {
 		if err := t.Refresh(); err != nil {
-			return nil, err
+			return "", err
 		}
 	}
+	if t.AccessToken == "" {
+		return "", errors.New("no access token obtained from refresh")
+	}
+	return t.AccessToken, nil
+}
 
-	// Make the HTTP request.
-	req.Header.Set("Authorization", "OAuth "+t.AccessToken)
-	return t.transport().RoundTrip(req)
+// cloneRequest returns a clone of the provided *http.Request.
+// The clone is a shallow copy of the struct and its Header map.
+func cloneRequest(r *http.Request) *http.Request {
+	// shallow copy of the struct
+	r2 := new(http.Request)
+	*r2 = *r
+	// deep copy of the Header
+	r2.Header = make(http.Header)
+	for k, s := range r.Header {
+		r2.Header[k] = s
+	}
+	return r2
 }
 
 // Refresh renews the Transport's AccessToken using its RefreshToken.
 func (t *Transport) Refresh() error {
+	if t.Token == nil {
+		return OAuthError{"Refresh", "no existing Token"}
+	}
+	if t.RefreshToken == "" {
+		return OAuthError{"Refresh", "Token expired; no Refresh Token"}
+	}
 	if t.Config == nil {
-		return errors.New("no Config supplied")
-	} else if t.Token == nil {
-		return errors.New("no existing Token")
+		return OAuthError{"Refresh", "no Config supplied"}
 	}
 
-	return t.updateToken(t.Token, url.Values{
+	err := t.updateToken(t.Token, url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {t.RefreshToken},
 	})
+	if err != nil {
+		return err
+	}
+	if t.TokenCache != nil {
+		return t.TokenCache.PutToken(t.Token)
+	}
+	return nil
 }
 
+// AuthenticateClient gets an access Token using the client_credentials grant
+// type.
+func (t *Transport) AuthenticateClient() error {
+	if t.Config == nil {
+		return OAuthError{"Exchange", "no Config supplied"}
+	}
+	if t.Token == nil {
+		t.Token = &Token{}
+	}
+	return t.updateToken(t.Token, url.Values{"grant_type": {"client_credentials"}})
+}
+
+// providerAuthHeaderWorks reports whether the OAuth2 server identified by the tokenURL
+// implements the OAuth2 spec correctly
+// See https://code.google.com/p/goauth2/issues/detail?id=31 for background.
+// In summary:
+// - Reddit only accepts client_secret in Authorization header.
+// - Dropbox accepts either, but not both.
+// - Google only accepts client_secret (not spec compliant?)
+func providerAuthHeaderWorks(tokenURL string) bool {
+	if strings.HasPrefix(tokenURL, "https://accounts.google.com/") {
+		// Google fails to implement the OAuth2 spec fully?
+		return false
+	}
+	return true
+}
+
+// updateToken mutates both tok and v.
 func (t *Transport) updateToken(tok *Token, v url.Values) error {
 	v.Set("client_id", t.ClientId)
-	v.Set("client_secret", t.ClientSecret)
-	r, err := (&http.Client{Transport: t.transport()}).PostForm(t.TokenURL, v)
+	bustedAuth := !providerAuthHeaderWorks(t.TokenURL)
+	if bustedAuth {
+		v.Set("client_secret", t.ClientSecret)
+	}
+	client := &http.Client{Transport: t.transport()}
+	req, err := http.NewRequest("POST", t.TokenURL, strings.NewReader(v.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if !bustedAuth {
+		req.SetBasicAuth(t.ClientId, t.ClientSecret)
+	}
+	r, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer r.Body.Close()
 	if r.StatusCode != 200 {
-		return errors.New("invalid response: " + r.Status)
+		return OAuthError{"updateToken", "Unexpected HTTP status " + r.Status}
 	}
 	var b struct {
-		Access    string        `json:"access_token"`
-		Refresh   string        `json:"refresh_token"`
-		ExpiresIn time.Duration `json:"expires_in"`
+		Access    string `json:"access_token"`
+		Refresh   string `json:"refresh_token"`
+		ExpiresIn int64  `json:"expires_in"` // seconds
+		Id        string `json:"id_token"`
 	}
-	if err = json.NewDecoder(r.Body).Decode(&b); err != nil {
+
+	body, err := ioutil.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
 		return err
 	}
+
+	content, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	switch content {
+	case "application/x-www-form-urlencoded", "text/plain":
+		vals, err := url.ParseQuery(string(body))
+		if err != nil {
+			return err
+		}
+
+		b.Access = vals.Get("access_token")
+		b.Refresh = vals.Get("refresh_token")
+		b.ExpiresIn, _ = strconv.ParseInt(vals.Get("expires_in"), 10, 64)
+		b.Id = vals.Get("id_token")
+	default:
+		if err = json.Unmarshal(body, &b); err != nil {
+			return fmt.Errorf("got bad response from server: %q", body)
+		}
+	}
+	if b.Access == "" {
+		return errors.New("received empty access token from authorization server")
+	}
 	tok.AccessToken = b.Access
-	tok.RefreshToken = b.Refresh
+	// Don't overwrite `RefreshToken` with an empty value
+	if b.Refresh != "" {
+		tok.RefreshToken = b.Refresh
+	}
 	if b.ExpiresIn == 0 {
 		tok.Expiry = time.Time{}
 	} else {
-		tok.Expiry = time.Now().Add(b.ExpiresIn * time.Second)
+		tok.Expiry = time.Now().Add(time.Duration(b.ExpiresIn) * time.Second)
+	}
+	if b.Id != "" {
+		if tok.Extra == nil {
+			tok.Extra = make(map[string]string)
+		}
+		tok.Extra["id_token"] = b.Id
 	}
 	return nil
 }

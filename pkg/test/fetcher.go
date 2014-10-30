@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Camlistore Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,77 +18,69 @@ package test
 
 import (
 	"io"
-	"os"
-	"sync"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/blobserver/memory"
 )
 
+// Fetcher is an in-memory implementation of the blobserver Storage
+// interface.  It started as just a fetcher and grew. It also includes
+// other convenience methods for testing.
 type Fetcher struct {
-	l sync.Mutex
-	m map[string]*Blob
+	memory.Storage
+
+	// ReceiveErr optionally returns the error to return on receive.
+	ReceiveErr error
+
+	// FetchErr, if non-nil, specifies the error to return on the next fetch call.
+	// If it returns nil, fetches proceed as normal.
+	FetchErr func() error
+}
+
+var _ blobserver.Storage = (*Fetcher)(nil)
+
+func (tf *Fetcher) Fetch(ref blob.Ref) (file io.ReadCloser, size uint32, err error) {
+	if tf.FetchErr != nil {
+		if err = tf.FetchErr(); err != nil {
+			return
+		}
+	}
+	file, size, err = tf.Storage.Fetch(ref)
+	if err != nil {
+		return
+	}
+	return file, size, nil
+}
+
+func (tf *Fetcher) SubFetch(ref blob.Ref, offset, length int64) (io.ReadCloser, error) {
+	if tf.FetchErr != nil {
+		if err := tf.FetchErr(); err != nil {
+			return nil, err
+		}
+	}
+	rc, err := tf.Storage.SubFetch(ref, offset, length)
+	if err != nil {
+		return rc, err
+	}
+	return rc, nil
+}
+
+func (tf *Fetcher) ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, error) {
+	sb, err := tf.Storage.ReceiveBlob(br, source)
+	if err != nil {
+		return sb, err
+	}
+	if err := tf.ReceiveErr; err != nil {
+		tf.RemoveBlobs([]blob.Ref{br})
+		return sb, err
+	}
+	return sb, nil
 }
 
 func (tf *Fetcher) AddBlob(b *Blob) {
-	tf.l.Lock()
-	defer tf.l.Unlock()
-	if tf.m == nil {
-		tf.m = make(map[string]*Blob)
+	_, err := tf.ReceiveBlob(b.BlobRef(), b.Reader())
+	if err != nil {
+		panic(err)
 	}
-	tf.m[b.BlobRef().String()] = b
-}
-
-func (tf *Fetcher) FetchStreaming(ref *blobref.BlobRef) (file io.ReadCloser, size int64, err error) {
-	return tf.Fetch(ref)
-}
-
-func (tf *Fetcher) Fetch(ref *blobref.BlobRef) (file blobref.ReadSeekCloser, size int64, err error) {
-	tf.l.Lock()
-	defer tf.l.Unlock()
-	if tf.m == nil {
-		err = os.ErrNotExist
-		return
-	}
-	tb, ok := tf.m[ref.String()]
-	if !ok {
-		err = os.ErrNotExist
-		return
-	}
-	file = &strReader{tb.Contents, 0}
-	size = int64(len(tb.Contents))
-	return
-}
-
-type strReader struct {
-	s   string
-	pos int
-}
-
-func (sr *strReader) Close() error { return nil }
-
-func (sr *strReader) Seek(offset int64, whence int) (ret int64, err error) {
-	// Note: ignoring 64-bit offsets.  test data should be tiny.
-	switch whence {
-	case 0:
-		sr.pos = int(offset)
-	case 1:
-		sr.pos += int(offset)
-	case 2:
-		sr.pos = len(sr.s) + int(offset)
-	}
-	ret = int64(sr.pos)
-	return
-}
-
-func (sr *strReader) Read(p []byte) (n int, err error) {
-	if sr.pos >= len(sr.s) {
-		err = io.EOF
-		return
-	}
-	n = copy(p, sr.s[sr.pos:])
-	if n == 0 {
-		err = io.EOF
-	}
-	sr.pos += n
-	return
 }

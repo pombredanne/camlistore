@@ -14,43 +14,64 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+/*
+Package remote registers the "remote" blobserver storage type, storing
+and fetching blobs from a remote Camlistore server, speaking the HTTP
+protocol.
+
+Example low-level config:
+
+     "/peer/": {
+         "handler": "storage-remote",
+         "handlerArgs": {
+             "url": "http://10.0.0.17/base",
+             "auth": "userpass:user:pass",
+             "skipStartupCheck": false
+          }
+     },
+
+*/
 package remote
 
 import (
 	"io"
-	"time"
+	"log"
+	"os"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/client"
+	"camlistore.org/pkg/context"
 	"camlistore.org/pkg/jsonconfig"
 )
 
 // remoteStorage is a blobserver.Storage proxy for a remote camlistore
 // blobserver.
 type remoteStorage struct {
-	*blobserver.SimpleBlobHubPartitionMap // but not really
-	client                                *client.Client
+	client *client.Client
 }
 
 var _ = blobserver.Storage((*remoteStorage)(nil))
 
+// NewFromClient returns a new Storage implementation using the
+// provided Camlistore client.
 func NewFromClient(c *client.Client) blobserver.Storage {
 	return &remoteStorage{client: c}
 }
 
 func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (storage blobserver.Storage, err error) {
 	url := config.RequiredString("url")
+	auth := config.RequiredString("auth")
 	skipStartupCheck := config.OptionalBool("skipStartupCheck", false)
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
 
 	client := client.New(url)
-	err = client.SetupAuthFromConfig(config)
-	if err != nil {
+	if err = client.SetupAuthFromString(auth); err != nil {
 		return nil, err
 	}
+	client.SetLogger(log.New(os.Stderr, "remote", log.LstdFlags))
 	sto := &remoteStorage{
 		client: client,
 	}
@@ -58,8 +79,8 @@ func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (storage blobserv
 		// Do a quick dummy operation to check that our credentials are
 		// correct.
 		// TODO(bradfitz,mpl): skip this operation smartly if it turns out this is annoying/slow for whatever reason.
-		c := make(chan blobref.SizedBlobRef, 1)
-		err = sto.EnumerateBlobs(c, "", 1, 0)
+		c := make(chan blob.SizedRef, 1)
+		err = sto.EnumerateBlobs(context.TODO(), c, "", 1)
 		if err != nil {
 			return nil, err
 		}
@@ -67,22 +88,22 @@ func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (storage blobserv
 	return sto, nil
 }
 
-func (sto *remoteStorage) RemoveBlobs(blobs []*blobref.BlobRef) error {
+func (sto *remoteStorage) RemoveBlobs(blobs []blob.Ref) error {
 	return sto.client.RemoveBlobs(blobs)
 }
 
-func (sto *remoteStorage) StatBlobs(dest chan<- blobref.SizedBlobRef, blobs []*blobref.BlobRef, wait time.Duration) error {
+func (sto *remoteStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
 	// TODO: cache the stat response's uploadUrl to save a future
 	// stat later?  otherwise clients will just Stat + Upload, but
 	// Upload will also Stat.  should be smart and make sure we
 	// avoid ReceiveBlob's Stat whenever it would be redundant.
-	return sto.client.StatBlobs(dest, blobs, wait)
+	return sto.client.StatBlobs(dest, blobs)
 }
 
-func (sto *remoteStorage) ReceiveBlob(blob *blobref.BlobRef, source io.Reader) (outsb blobref.SizedBlobRef, outerr error) {
+func (sto *remoteStorage) ReceiveBlob(blob blob.Ref, source io.Reader) (outsb blob.SizedRef, outerr error) {
 	h := &client.UploadHandle{
 		BlobRef:  blob,
-		Size:     -1, // size isn't known; -1 is fine, but TODO: ask source if it knows its size
+		Size:     0, // size isn't known; 0 is fine, but TODO: ask source if it knows its size
 		Contents: source,
 	}
 	pr, err := sto.client.Upload(h)
@@ -93,17 +114,16 @@ func (sto *remoteStorage) ReceiveBlob(blob *blobref.BlobRef, source io.Reader) (
 	return pr.SizedBlobRef(), nil
 }
 
-func (sto *remoteStorage) FetchStreaming(b *blobref.BlobRef) (file io.ReadCloser, size int64, err error) {
-	return sto.client.FetchStreaming(b)
+func (sto *remoteStorage) Fetch(b blob.Ref) (file io.ReadCloser, size uint32, err error) {
+	return sto.client.Fetch(b)
 }
 
 func (sto *remoteStorage) MaxEnumerate() int { return 1000 }
 
-func (sto *remoteStorage) EnumerateBlobs(dest chan<- blobref.SizedBlobRef, after string, limit int, wait time.Duration) error {
-	return sto.client.EnumerateBlobsOpts(dest, client.EnumerateOpts{
-		After:   after,
-		MaxWait: wait,
-		Limit:   limit,
+func (sto *remoteStorage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+	return sto.client.EnumerateBlobsOpts(ctx, dest, client.EnumerateOpts{
+		After: after,
+		Limit: limit,
 	})
 }
 

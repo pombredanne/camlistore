@@ -17,21 +17,22 @@ limitations under the License.
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/cmdmain"
 	"camlistore.org/pkg/schema"
 )
 
 type attrCmd struct {
 	add bool
 	del bool
+	up  *Uploader
 }
 
 func init() {
-	RegisterCommand("attr", func(flags *flag.FlagSet) CommandRunner {
+	cmdmain.RegisterCommand("attr", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		cmd := new(attrCmd)
 		flags.BoolVar(&cmd.add, "add", false, `Adds attribute (e.g. "tag")`)
 		flags.BoolVar(&cmd.del, "del", false, "Deletes named attribute [value]")
@@ -39,43 +40,64 @@ func init() {
 	})
 }
 
+func (c *attrCmd) Describe() string {
+	return "Add, set, or delete a permanode's attribute."
+}
+
 func (c *attrCmd) Usage() {
-	errf("Usage: camput [globalopts] attr [attroption] <permanode> <name> <value>")
+	cmdmain.Errorf("Usage: camput [globalopts] attr [attroption] <permanode> <name> <value>")
 }
 
 func (c *attrCmd) Examples() []string {
 	return []string{
-		"<permanode> <name> <value>         Set attribute",
-		"--add <permanode> <name> <value>   Adds attribute (e.g. \"tag\")",
-		"--del <permanode> <name> [<value>] Deletes named attribute [value",
+		"<permanode> <name> <value>       Set attribute",
+		"--add <permanode> <name> <value> Adds attribute (e.g. \"tag\")",
+		"--del <permanode> <name> [<value>] Deletes named attribute",
 	}
 }
 
-func (c *attrCmd) RunCommand(up *Uploader, args []string) error {
-	if len(args) != 3 {
-		return errors.New("Attr takes 3 args: <permanode> <attr> <value>")
+func (c *attrCmd) RunCommand(args []string) error {
+	if err := c.checkArgs(args); err != nil {
+		return err
 	}
-	permanode, attr, value := args[0], args[1], args[2]
+	permanode, attr := args[0], args[1]
+	value := ""
+	if len(args) > 2 {
+		value = args[2]
+	}
 
-	var err error
-
-	pn := blobref.Parse(permanode)
-	if pn == nil {
+	pn, ok := blob.Parse(permanode)
+	if !ok {
 		return fmt.Errorf("Error parsing blobref %q", permanode)
 	}
-	m := schema.NewSetAttributeClaim(pn, attr, value)
-	if c.add {
-		if c.del {
-			return errors.New("Add and del options are exclusive")
+	claimFunc := func() func(blob.Ref, string, string) *schema.Builder {
+		switch {
+		case c.add:
+			return schema.NewAddAttributeClaim
+		case c.del:
+			return schema.NewDelAttributeClaim
+		default:
+			return schema.NewSetAttributeClaim
 		}
-		m = schema.NewAddAttributeClaim(pn, attr, value)
-	} else {
-		// TODO: del, which can make <value> be optional
-		if c.del {
-			return errors.New("del not yet implemented")
+	}()
+	bb := claimFunc(pn, attr, value)
+	put, err := getUploader().UploadAndSignBlob(bb)
+	handleResult(bb.Type(), put, err)
+	return nil
+}
+
+func (c *attrCmd) checkArgs(args []string) error {
+	if c.del {
+		if c.add {
+			return cmdmain.UsageError("Add and del options are exclusive")
 		}
+		if len(args) < 2 {
+			return cmdmain.UsageError("Attr -del takes at least 2 args: <permanode> <attr> [<value>]")
+		}
+		return nil
 	}
-	put, err := up.UploadAndSignMap(m)
-	handleResult(m["claimType"].(string), put, err)
+	if len(args) != 3 {
+		return cmdmain.UsageError("Attr takes 3 args: <permanode> <attr> <value>")
+	}
 	return nil
 }

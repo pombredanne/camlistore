@@ -17,52 +17,67 @@ limitations under the License.
 package blobserver
 
 import (
-	"time"
-
-	"camlistore.org/pkg/blobref"
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/context"
 )
 
 const buffered = 8
 
-// TODO: it'd be nice to make sources be []BlobEnumerator, but that
-// makes callers more complex since assignable interfaces' slice forms
-// aren't assignable.
-func MergedEnumerate(dest chan<- blobref.SizedBlobRef, sources []Storage, after string, limit int, wait time.Duration) error {
+// MergedEnumerate implements the BlobEnumerator interface by
+// merge-joining 0 or more sources.
+func MergedEnumerate(ctx *context.Context, dest chan<- blob.SizedRef, sources []BlobEnumerator, after string, limit int) error {
+	return mergedEnumerate(ctx, dest, len(sources), func(i int) BlobEnumerator { return sources[i] }, after, limit)
+}
+
+// MergedEnumerateStorage implements the BlobEnumerator interface by
+// merge-joining 0 or more sources.
+//
+// In this version, the sources implement the Storage interface, even
+// though only the BlobEnumerator interface is used.
+func MergedEnumerateStorage(ctx *context.Context, dest chan<- blob.SizedRef, sources []Storage, after string, limit int) error {
+	return mergedEnumerate(ctx, dest, len(sources), func(i int) BlobEnumerator { return sources[i] }, after, limit)
+}
+
+func mergedEnumerate(ctx *context.Context, dest chan<- blob.SizedRef, nsrc int, getSource func(int) BlobEnumerator, after string, limit int) error {
 	defer close(dest)
 
-	startEnum := func(source Storage) (*blobref.ChanPeeker, <-chan error) {
-		ch := make(chan blobref.SizedBlobRef, buffered)
+	subctx := ctx.New()
+	defer subctx.Cancel()
+
+	startEnum := func(source BlobEnumerator) (*blob.ChanPeeker, <-chan error) {
+		ch := make(chan blob.SizedRef, buffered)
 		errch := make(chan error, 1)
 		go func() {
-			errch <- source.EnumerateBlobs(ch, after, limit, wait)
+			errch <- source.EnumerateBlobs(subctx, ch, after, limit)
 		}()
-		return &blobref.ChanPeeker{Ch: ch}, errch
+		return &blob.ChanPeeker{Ch: ch}, errch
 	}
 
-	peekers := make([]*blobref.ChanPeeker, 0, len(sources))
-	errs := make([]<-chan error, 0, len(sources))
-	for _, source := range sources {
-		peeker, errch := startEnum(source)
+	peekers := make([]*blob.ChanPeeker, 0, nsrc)
+	errs := make([]<-chan error, 0, nsrc)
+	for i := 0; i < nsrc; i++ {
+		peeker, errch := startEnum(getSource(i))
 		peekers = append(peekers, peeker)
 		errs = append(errs, errch)
 	}
 
 	nSent := 0
-	lastSent := ""
+	var lastSent blob.Ref
+	tooLow := func(br blob.Ref) bool { return lastSent.Valid() && (br == lastSent || br.Less(lastSent)) }
 	for nSent < limit {
 		lowestIdx := -1
-		var lowest blobref.SizedBlobRef
+		var lowest blob.SizedRef
 		for idx, peeker := range peekers {
-			for !peeker.Closed() && peeker.Peek().BlobRef.String() <= lastSent {
+			for !peeker.Closed() && tooLow(peeker.MustPeek().Ref) {
 				peeker.Take()
 			}
 			if peeker.Closed() {
 				continue
 			}
-			sb := peeker.Peek() // can't be nil if not Closed
-			if lowestIdx == -1 || sb.BlobRef.String() < lowest.BlobRef.String() {
+			sb := peeker.MustPeek() // can't be nil if not Closed
+			if lowestIdx == -1 || sb.Ref.Less(lowest.Ref) {
 				lowestIdx = idx
-				lowest = *sb
+				lowest = sb
 			}
 		}
 		if lowestIdx == -1 {
@@ -72,13 +87,7 @@ func MergedEnumerate(dest chan<- blobref.SizedBlobRef, sources []Storage, after 
 
 		dest <- lowest
 		nSent++
-		lastSent = lowest.BlobRef.String()
-	}
-
-	// Once we've gotten enough, ignore the rest of whatever's
-	// coming in.
-	for _, peeker := range peekers {
-		go peeker.ConsumeAll()
+		lastSent = lowest.Ref
 	}
 
 	// If any part returns an error, we return an error.

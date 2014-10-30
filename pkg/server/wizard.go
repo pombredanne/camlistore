@@ -17,6 +17,7 @@ limitations under the License.
 package server
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -32,7 +33,15 @@ import (
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/osutil"
+
+	"camlistore.org/third_party/code.google.com/p/xsrftoken"
 )
+
+var ignoredFields = map[string]bool{
+	"gallery":     true,
+	"blog":        true,
+	"replicateTo": true,
+}
 
 // SetupHandler handles serving the wizard setup page.
 type SetupHandler struct {
@@ -66,7 +75,8 @@ func printWizard(i interface{}) (s string) {
 	return s
 }
 
-// Flatten all published entities as lists and move them at the root 
+// TODO(mpl): probably not needed anymore. check later and remove.
+// Flatten all published entities as lists and move them at the root
 // of the conf, to have them displayed individually by the template
 func flattenPublish(config jsonconfig.Obj) error {
 	gallery := []string{}
@@ -115,26 +125,45 @@ func flattenPublish(config jsonconfig.Obj) error {
 	return nil
 }
 
-func sendWizard(req *http.Request, rw http.ResponseWriter, hasChanged bool) {
+var serverKey = func() string {
+	var b [20]byte
+	rand.Read(b[:])
+	return string(b[:])
+}()
+
+func sendWizard(rw http.ResponseWriter, req *http.Request, hasChanged bool) {
 	config, err := jsonconfig.ReadFile(osutil.UserServerConfigPath())
 	if err != nil {
-		httputil.ServerError(rw, err)
+		httputil.ServeError(rw, req, err)
 		return
 	}
 
 	err = flattenPublish(config)
 	if err != nil {
-		httputil.ServerError(rw, err)
+		httputil.ServeError(rw, req, err)
 		return
 	}
 
 	funcMap := template.FuncMap{
 		"printWizard": printWizard,
+		"showField": func(inputName string) bool {
+			if _, ok := ignoredFields[inputName]; ok {
+				return false
+			}
+			return true
+		},
+		"genXSRF": func() string {
+			return xsrftoken.Generate(serverKey, "user", "wizardSave")
+		},
 	}
 
-	body := `<form id="WizardForm" action="setup" method="post" enctype="multipart/form-data">`
-	body += `{{range $k,$v := .}}{{printf "%v" $k}} <input type="text" size="30" name ="{{printf "%v" $k}}" value="{{printWizard $v}}"><br />{{end}}`
-	body += `<input type="submit" form="WizardForm" value="Save"></form>`
+	body := `
+	<form id="WizardForm" method="POST" enctype="multipart/form-data">
+	<table>
+	{{range $k,$v := .}}{{if showField $k}}<tr><td>{{printf "%v" $k}}</td><td><input type="text" size="30" name ="{{printf "%v" $k}}" value="{{printWizard $v}}" ></td></tr>{{end}}{{end}}
+	</table>
+	<input type="hidden" name="token" value="{{genXSRF}}">
+	<input type="submit" form="WizardForm" value="Save"> (Will restart server.)</form>`
 
 	if hasChanged {
 		body += `<p> Configuration succesfully rewritten </p>`
@@ -142,12 +171,12 @@ func sendWizard(req *http.Request, rw http.ResponseWriter, hasChanged bool) {
 
 	tmpl, err := template.New("wizard").Funcs(funcMap).Parse(topWizard + body + bottomWizard)
 	if err != nil {
-		httputil.ServerError(rw, err)
+		httputil.ServeError(rw, req, err)
 		return
 	}
 	err = tmpl.Execute(rw, config)
 	if err != nil {
-		httputil.ServerError(rw, err)
+		httputil.ServeError(rw, req, err)
 		return
 	}
 }
@@ -167,10 +196,15 @@ func rewriteConfig(config *jsonconfig.Obj, configfile string) error {
 	return err
 }
 
-func handleSetupChange(req *http.Request, rw http.ResponseWriter) {
+func handleSetupChange(rw http.ResponseWriter, req *http.Request) {
 	hilevelConf, err := jsonconfig.ReadFile(osutil.UserServerConfigPath())
 	if err != nil {
-		httputil.ServerError(rw, err)
+		httputil.ServeError(rw, req, err)
+		return
+	}
+	if !xsrftoken.Valid(req.FormValue("token"), serverKey, "user", "wizardSave") {
+		http.Error(rw, "Form expired. Press back and reload form.", http.StatusBadRequest)
+		log.Printf("invalid xsrf token=%q", req.FormValue("token"))
 		return
 	}
 
@@ -185,39 +219,12 @@ func handleSetupChange(req *http.Request, rw http.ResponseWriter) {
 		}
 
 		switch k {
-		case "TLS":
+		case "https", "shareHandler":
 			b, err := strconv.ParseBool(v[0])
 			if err != nil {
-				httputil.ServerError(rw, fmt.Errorf("TLS field expects a boolean value"))
+				httputil.ServeError(rw, req, fmt.Errorf("%v field expects a boolean value", k))
 			}
 			el = b
-		case "replicateTo":
-			// TODO(mpl): figure out why it is always seen as different from the conf
-			el = []interface{}{}
-			if len(v[0]) > 0 {
-				els := []string{}
-				vals := strings.Split(v[0], ",")
-				els = append(els, vals...)
-				el = els
-			}
-		// TODO(mpl): "handler,rootPermanode[,style]" for each published entity for now.
-		// we will need something more readable later probably
-		case "gallery", "blog":
-			if len(v[0]) > 0 {
-				pub := strings.Split(v[0], ",")
-				if len(pub) < 2 || len(pub) > 3 {
-					// no need to fail loudly for now as we'll probably change this format
-					continue
-				}
-				handler := jsonconfig.Obj{}
-				handler["template"] = k
-				handler["rootPermanode"] = pub[1]
-				if len(pub) > 2 {
-					handler["style"] = pub[2]
-				}
-				publish[pub[0]] = handler
-			}
-			continue
 		default:
 			el = v[0]
 		}
@@ -236,39 +243,45 @@ func handleSetupChange(req *http.Request, rw http.ResponseWriter) {
 	if hasChanged {
 		err = rewriteConfig(&hilevelConf, osutil.UserServerConfigPath())
 		if err != nil {
-			httputil.ServerError(rw, err)
+			httputil.ServeError(rw, req, err)
+			return
+		}
+		err = osutil.RestartProcess()
+		if err != nil {
+			log.Fatal("Failed to restart: " + err.Error())
+			http.Error(rw, "Failed to restart process", 500)
 			return
 		}
 	}
-	sendWizard(req, rw, hasChanged)
-	return
+	sendWizard(rw, req, hasChanged)
 }
 
 func (sh *SetupHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	if !auth.LocalhostAuthorized(req) {
+	if !auth.IsLocalhost(req) {
 		fmt.Fprintf(rw,
 			"<html><body>Setup only allowed from localhost"+
 				"<p><a href='/'>Back</a></p>"+
 				"</body></html>\n")
 		return
 	}
+	http.Redirect(rw, req, "http://camlistore.org/docs/server-config", http.StatusMovedPermanently)
+	return
+
+	// TODO: this file and the code in wizard-html.go is outdated. Anyone interested enough
+	// can take care of updating it as something nicer which would fit better with the
+	// react UI. But in the meantime we don't link to it anymore.
+
 	if req.Method == "POST" {
 		err := req.ParseMultipartForm(10e6)
 		if err != nil {
-			httputil.ServerError(rw, err)
+			httputil.ServeError(rw, req, err)
 			return
 		}
 		if len(req.Form) > 0 {
-			handleSetupChange(req, rw)
-			return
+			handleSetupChange(rw, req)
 		}
-		if strings.Contains(req.URL.Path, "restartCamli") {
-			err = osutil.RestartProcess()
-			if err != nil {
-				log.Fatal("Failed to restart: " + err.Error())
-			}
-		}
+		return
 	}
 
-	sendWizard(req, rw, false)
+	sendWizard(rw, req, false)
 }
