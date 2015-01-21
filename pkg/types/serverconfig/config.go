@@ -44,9 +44,10 @@ type Config struct {
 	// Blob storage.
 	MemoryStorage      bool   `json:"memoryStorage,omitempty"`      // do not store anything (blobs or queues) on localdisk, use memory instead.
 	BlobPath           string `json:"blobPath,omitempty"`           // path to the directory containing the blobs.
-	PackBlobs          bool   `json:"packBlobs,omitempty"`          // use diskpacked instead of the default filestorage.
+	PackBlobs          bool   `json:"packBlobs,omitempty"`          // use "diskpacked" instead of the default filestorage. (exclusive with PackRelated)
+	PackRelated        bool   `json:"packRelated,omitempty"`        // use "blobpacked" instead of the default storage (exclusive with PackBlobs)
 	S3                 string `json:"s3,omitempty"`                 // Amazon S3 credentials: access_key_id:secret_access_key:bucket[:hostname].
-	GoogleCloudStorage string `json:"googlecloudstorage,omitempty"` // Google Cloud credentials: clientId:clientSecret:refreshToken:bucket or ":bucket" for auto on GCE
+	GoogleCloudStorage string `json:"googlecloudstorage,omitempty"` // Google Cloud credentials: clientId:clientSecret:refreshToken:bucket[/optional/dir] or ":bucket[/optional/dir/]" for auto on GCE
 	GoogleDrive        string `json:"googledrive,omitempty"`        // Google Drive credentials: clientId:clientSecret:refreshToken:parentId.
 	ShareHandler       bool   `json:"shareHandler,omitempty"`       // enable the share handler. If true, and shareHandlerPath is empty then shareHandlerPath will default to "/share/" when generating the low-level config.
 	ShareHandlerPath   string `json:"shareHandlerPath,omitempty"`   // URL prefix for the share handler. If set, overrides shareHandler.
@@ -72,6 +73,8 @@ type Config struct {
 	//    "index"               (overrides 'dbname' key above)
 	//    "queue-sync-to-index" (the sync queue to index things)
 	//    "queue-sync-to-s3"    (the sync queue to replicate to s3)
+	//    "blobpacked_index"    (the index for blobpacked, the 'packRelated' option)
+	//    "ui_thumbcache"
 	DBNames map[string]string `json:"dbNames"`
 
 	ReplicateTo []interface{} `json:"replicateTo,omitempty"` // NOOP for now.

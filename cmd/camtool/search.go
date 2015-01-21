@@ -26,12 +26,14 @@ import (
 
 	"camlistore.org/pkg/cmdmain"
 	"camlistore.org/pkg/search"
+	"camlistore.org/pkg/strutil"
 )
 
 type searchCmd struct {
 	server   string
 	limit    int
 	describe bool
+	rawQuery bool
 }
 
 func init() {
@@ -40,6 +42,7 @@ func init() {
 		flags.StringVar(&cmd.server, "server", "", "Server to search. "+serverFlagHelp)
 		flags.IntVar(&cmd.limit, "limit", 0, "Limit number of results. 0 is default. Negative means no limit.")
 		flags.BoolVar(&cmd.describe, "describe", false, "Describe results as well.")
+		flags.BoolVar(&cmd.rawQuery, "rawquery", false, "If true, the provided JSON is a SearchQuery, and not a Constraint. In this case, the -limit flag if non-zero is applied after parsing the JSON.")
 		return cmd
 	})
 }
@@ -77,7 +80,15 @@ func (c *searchCmd) RunCommand(args []string) error {
 	req := &search.SearchQuery{
 		Limit: c.limit,
 	}
-	if plausibleJSON(q) {
+	if c.rawQuery {
+		req.Limit = 0 // clear it if they provided it
+		if err := json.NewDecoder(strings.NewReader(q)).Decode(&req); err != nil {
+			return err
+		}
+		if c.limit != 0 {
+			req.Limit = c.limit
+		}
+	} else if strutil.IsPlausibleJSON(q) {
 		cs := new(search.Constraint)
 		if err := json.NewDecoder(strings.NewReader(q)).Decode(&cs); err != nil {
 			return err
@@ -102,8 +113,4 @@ func (c *searchCmd) RunCommand(args []string) error {
 	resj = append(resj, '\n')
 	_, err = os.Stdout.Write(resj)
 	return err
-}
-
-func plausibleJSON(s string) bool {
-	return strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}")
 }

@@ -38,12 +38,12 @@ cam.ServerConnection = function(config, opt_sendXhr) {
 
 cam.ServerConnection.DESCRIBE_REQUEST = {
 	// This size doesn't matter, we don't use it. We only care about the aspect ratio.
-	// TODO(aa): This needs to die: https://code.google.com/p/camlistore/issues/detail?id=321
+	// TODO(aa): This needs to die: https://camlistore.org/issue/321
 	thumbnailSize: 1000,
 
 	// TODO(aa): This is not perfect. The describe request will return some data we don't care about:
 	// - Properties we don't use
-	// See: https://code.google.com/p/camlistore/issues/detail?id=319
+	// See: https://camlistore.org/issue/319
 
 	depth: 1,
 	rules: [
@@ -254,11 +254,11 @@ cam.ServerConnection.prototype.search = function(query, opt_describe, opt_limit,
 // @param {string} target blobref of permanode we want to find paths to
 // @param {Function} success.
 // @param {Function=} opt_fail Optional fail callback.
-cam.ServerConnection.prototype.pathsOfSignerTarget = function(signer, target, success, opt_fail) {
+cam.ServerConnection.prototype.pathsOfSignerTarget = function(target, success, opt_fail) {
 	var path = goog.uri.utils.appendPath(
 		this.config_.searchRoot, 'camli/search/signerpaths'
 	);
-	path = goog.uri.utils.appendParams(path, 'signer', signer, 'target', target);
+	path = goog.uri.utils.appendParams(path, 'signer', this.config_.signing.publicKeyBlobRef, 'target', target);
 	this.sendXhr_(path,
 		goog.bind(this.genericHandleSearch_, this, success, this.safeFail_(opt_fail)));
 };

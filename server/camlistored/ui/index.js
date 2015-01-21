@@ -20,6 +20,8 @@ goog.require('goog.array');
 goog.require('goog.dom');
 goog.require('goog.dom.classlist');
 goog.require('goog.events.EventHandler');
+goog.require('goog.format');
+goog.require('goog.functions');
 goog.require('goog.labs.Promise');
 goog.require('goog.object');
 goog.require('goog.string');
@@ -44,10 +46,13 @@ goog.require('cam.permanodeUtils');
 goog.require('cam.reactUtil');
 goog.require('cam.SearchSession');
 goog.require('cam.ServerConnection');
+goog.require('cam.Sidebar');
 goog.require('cam.TagsControl');
 
 cam.IndexPage = React.createClass({
 	displayName: 'IndexPage',
+
+	SIDEBAR_OPEN_WIDTH_: 250,
 
 	HEADER_HEIGHT_: 38,
 	SEARCH_PREFIX_: {
@@ -75,6 +80,7 @@ cam.IndexPage = React.createClass({
 		config: React.PropTypes.object.isRequired,
 		eventTarget: React.PropTypes.shape({addEventListener:React.PropTypes.func.isRequired}).isRequired,
 		history: React.PropTypes.shape({pushState:React.PropTypes.func.isRequired, replaceState:React.PropTypes.func.isRequired, go:React.PropTypes.func.isRequired, state:React.PropTypes.object}).isRequired,
+		openWindow: React.PropTypes.func.isRequired,
 		location: React.PropTypes.shape({href:React.PropTypes.string.isRequired, reload:React.PropTypes.func.isRequired}).isRequired,
 		scrolling: cam.BlobItemContainerReact.originalSpec.propTypes.scrolling,
 		serverConnection: React.PropTypes.instanceOf(cam.ServerConnection).isRequired,
@@ -83,7 +89,6 @@ cam.IndexPage = React.createClass({
 
 	componentWillMount: function() {
 		this.baseURL_ = null;
-		this.currentSet_ = null;
 		this.dragEndTimer_ = 0;
 		this.navigator_ = null;
 		this.searchSessionCache_ = [];
@@ -96,9 +101,11 @@ cam.IndexPage = React.createClass({
 		this.baseURL_ = newURL.resolve(new goog.Uri(this.props.config.uiRoot));
 
 		this.navigator_ = new cam.Navigator(this.props.eventTarget, this.props.location, this.props.history);
-		this.navigator_.onNavigate = this.handleNavigate_;
+		this.navigator_.onWillNavigate = this.handleWillNavigate_;
+		this.navigator_.onDidNavigate = this.handleDidNavigate_;
 
-		this.handleNavigate_(newURL);
+		this.handleWillNavigate_(newURL);
+		this.handleDidNavigate_();
 	},
 
 	componentDidMount: function() {
@@ -117,14 +124,17 @@ cam.IndexPage = React.createClass({
 	getInitialState: function() {
 		return {
 			currentURL: null,
+			currentSet: '',
+			dropActive: false,
 			selection: {},
 			serverStatus: null,
-			tagsControlVisible: false,
+
+			// TODO: This should be calculated by whether selection is empty, and not need separate state.
+			sidebarVisible: false,
 
 			uploadDialogVisible: false,
-			dropActive: false,
-			numUploadsTotal: 0,
-			numUploadsComplete: 0,
+			totalBytesToUpload: 0,
+			totalBytesComplete: 0,
 		};
 	},
 
@@ -140,9 +150,8 @@ cam.IndexPage = React.createClass({
 
 		var backwardPiggy = false;
 		var contentSize = new goog.math.Size(this.props.availWidth, this.props.availHeight - this.HEADER_HEIGHT_);
-		return React.DOM.div({onDragEnter:this.handleDragStart_, onDragOver:this.handleDragStart_, onDrop:this.handleDrop_}, [
+		return React.DOM.div({onDragEnter:this.handleDragStart_, onDragOver:this.handleDragStart_, onDrop:this.handleDrop_},
 			this.getHeader_(aspects, selectedAspect),
-			this.getTagsControl_(),
 			React.DOM.div(
 				{
 					className: 'cam-content-wrap',
@@ -152,17 +161,18 @@ cam.IndexPage = React.createClass({
 				},
 				aspects[selectedAspect] && aspects[selectedAspect].createContent(contentSize, backwardPiggy)
 			),
-			this.getUploadDialog_(),
-		]);
+			this.getSidebar_(aspects[selectedAspect]),
+			this.getUploadDialog_()
+		);
 	},
 
 	setSelection_: function(selection) {
-		this.setState({selection: selection});
+		this.props.history.replaceState(cam.object.extend(this.props.history.state, {
+			selection: selection,
+		}), '', this.props.location.href);
 
-		// leave contextual controls open if items are still selected
-		if (goog.object.isEmpty(selection)) {
-			this.setState({tagsControlVisible: false});
-		}
+		this.setState({selection: selection});
+		this.setState({sidebarVisible: !goog.object.isEmpty(selection)});
 	},
 
 	getTargetBlobref_: function(opt_url) {
@@ -175,19 +185,27 @@ cam.IndexPage = React.createClass({
 	},
 
 	getAspects_: function() {
-		var childFrameClickHandler = this.navigator_.navigate.bind(this.navigator_);
-		return [
-			this.getSearchAspect_,
+		var childFrameClickHandler = this.navigator_.navigate.bind(null, this.navigator_);
+		var target = this.getTargetBlobref_();
+		var getAspect = function(f) {
+			return f(target, this.targetSearchSession_);
+		}.bind(this);
+
+		var specificAspects = [
 			cam.ImageDetail.getAspect,
-			cam.PermanodeDetail.getAspect.bind(null, this.props.serverConnection, this.props.timer),
 			cam.DirectoryDetail.getAspect.bind(null, this.baseURL_, childFrameClickHandler),
+		].map(getAspect).filter(goog.functions.identity);
+
+		var generalAspects = [
+			this.getSearchAspect_.bind(null, specificAspects),
+			cam.PermanodeDetail.getAspect.bind(null, this.props.serverConnection, this.props.timer),
 			cam.BlobDetail.getAspect.bind(null, this.getDetailURL_, this.props.serverConnection),
-		].map(function(f) {
-			return f(this.getTargetBlobref_(), this.targetSearchSession_);
-		}, this).filter(goog.functions.identity);
+		].map(getAspect).filter(goog.functions.identity);
+
+		return specificAspects.concat(generalAspects);
 	},
 
-	getSearchAspect_: function(blobref, targetSearchSession) {
+	getSearchAspect_: function(specificAspects, blobref, targetSearchSession) {
 		if (blobref) {
 			var m = targetSearchSession.getMeta(blobref);
 			if (!m || !m.permanode) {
@@ -196,18 +214,16 @@ cam.IndexPage = React.createClass({
 				return null;
 			}
 
-			// This is a hard case: if we're looking at a permanode and it doesn't have any children, should we render a contents view or not?
-			//
-			// If we do render a contents view, then we have this stupid empty contents view for lots of permanodes types that will probably never have children, like images, tweets, or foursquare checkins.
-			//
-			// If we don't render a contents view, then permanodes that are meant to actually be sets, but are currently empty won't have a contents view to drag items on to. And when you delete the last item from a set, the contents view will disappear.
-			//
-			// I'm not sure what the right long term solution is, but not showing a contents view in this case seems less crappy for now.
-			//
-			// TODO(aa): This relies on the fact that the target search session currently returns attributes, even though that is inefficient and we ideally wouldn't want it to. See bug 435 for details.
-			// If we didn't want to rely on this, we'd have to wait for the child search session to come back to know whether we should show this aspect, which is fine, except it causes the UI to stutter -- initially we show no container aspect, then change our mind and show it.
-			// Ideally, I think the target search session should just include whether there are any children at all. We don't need to know their details in the target search session, but we do need to know whether any exist for optimal UI.
-			if (!cam.permanodeUtils.isContainer(m.permanode)) {
+			// If the permanode already has children, we always show the container view.
+			// Otherwise, show the container view only if there is no more specific type.
+			var showSearchAspect = false;
+			if (cam.permanodeUtils.isContainer(m.permanode)) {
+				showSearchAspect = true;
+			} else if (!cam.permanodeUtils.getCamliNodeType(m.permanode) && specificAspects.length == 0) {
+				showSearchAspect = true;
+			}
+
+			if (!showSearchAspect) {
 				return null;
 			}
 		}
@@ -220,7 +236,7 @@ cam.IndexPage = React.createClass({
 		return {
 			title: blobref ? 'Contents' : 'Search',
 			fragment: blobref ? 'contents': 'search',
-			createContent: this.getBlobItemContainer_.bind(this),
+			createContent: this.getBlobItemContainer_.bind(null, this),
 		};
 	},
 
@@ -246,6 +262,38 @@ cam.IndexPage = React.createClass({
 		}
 	},
 
+	onUploadStart_: function(files) {
+		var numFiles = files.length;
+		var totalBytes = Array.prototype.reduce.call(files, function(sum, file) { return sum + file.size; }, 0);
+
+		this.setState({
+			dropActive: false,
+			totalBytesToUpload: totalBytes,
+			totalBytesComplete: 0,
+		});
+
+		console.log('Uploading %d files (%d bytes)...', numFiles, totalBytes);
+	},
+
+	onUploadProgressUpdate_: function(file) {
+		var completedBytes = this.state.totalBytesComplete + file.size;
+
+		this.setState({
+			totalBytesComplete: completedBytes
+		});
+
+		console.log('Uploaded %d of %d bytes', completedBytes, this.state.totalBytesToUpload);
+	},
+
+	onUploadComplete_: function() {
+		console.log('Upload complete!');
+
+		this.setState({
+			totalBytesToUpload: 0,
+			totalBytesComplete: 0,
+		});
+	},
+
 	handleDrop_: function(e) {
 		if (!e.nativeEvent.dataTransfer.files) {
 			return;
@@ -256,39 +304,54 @@ cam.IndexPage = React.createClass({
 		var files = e.nativeEvent.dataTransfer.files;
 		var sc = this.props.serverConnection;
 
-		this.setState({
-			dropActive: false,
-			numUploadsTotal: files.length,
-			numUploadsComplete: 0,
-		});
+		this.onUploadStart_(files);
 
-		console.log('Uploading %d files...', this.state.numUploadsTotal);
-		goog.labs.Promise.all(Array.prototype.map.call(files, function(file) {
-			var upload = new goog.labs.Promise(sc.uploadFile.bind(sc, file));
+		goog.labs.Promise.all(
+			Array.prototype.map.call(files, function(file) {
+				return uploadFileAndCreatePermanode(file)
+					.then(transformResults)
+					.then(createPermanodeAssociations.bind(this))
+					.thenCatch(function(e) {
+						console.error('File upload fall down go boom. file: %s, error: %s', file.name, e);
+					})
+					.then(this.onUploadProgressUpdate_.bind(this, file));
+			}.bind(this))
+		).thenCatch(function(e) {
+			console.error('File upload failed with error: %s', e);
+		}).then(this.onUploadComplete_);
+
+		function uploadFileAndCreatePermanode(file) {
+			var uploadFile = new goog.labs.Promise(sc.uploadFile.bind(sc, file));
 			var createPermanode = new goog.labs.Promise(sc.createPermanode.bind(sc));
-			return goog.labs.Promise.all([upload, createPermanode]).then(function(results) {
-				// TODO(aa): Icky manual destructuring of results. Seems like there must be a better way?
-				var fileRef = results[0];
-				var permanodeRef = results[1];
-				return new goog.labs.Promise(sc.newSetAttributeClaim.bind(sc, permanodeRef, 'camliContent', fileRef));
-			}).thenCatch(function(e) {
-				console.error('File upload fall down go boom. file: %s, error: %s', file.name, e);
-			}).then(function() {
-				console.log('%d of %d files complete.', this.state.numUploadsComplete, this.state.numUploadsTotal);
-				this.setState({
-					numUploadsComplete: this.state.numUploadsComplete + 1,
-				});
-			}.bind(this));
-		}.bind(this))).then(function() {
-			console.log('All complete');
-			this.setState({
-				numUploadsComplete: 0,
-				numUploadsTotal: 0,
-			});
-		}.bind(this));
+
+			return goog.labs.Promise.all([uploadFile, createPermanode]);
+		}
+
+		// 'readable-ify' the blob references returned from upload/create
+		function transformResults(blobIds) {
+			return {
+				'fileRef': blobIds[0],
+				'permanodeRef': blobIds[1]
+			};
+		}
+
+		function createPermanodeAssociations(refs) {
+			// associate uploaded file to new permanode
+			var camliContent = new goog.labs.Promise(sc.newSetAttributeClaim.bind(sc, refs.permanodeRef, 'camliContent', refs.fileRef));
+			var promises = [camliContent];
+
+			// if currently viewing a set, make new permanode a member of the set
+			var parentPermanodeRef = this.getTargetBlobref_();
+			if (parentPermanodeRef) {
+				var camliMember = new goog.labs.Promise(sc.newAddAttributeClaim.bind(sc, parentPermanodeRef, 'camliMember', refs.permanodeRef));
+				promises.push(camliMember);
+			}
+
+			return goog.labs.Promise.all(promises);
+		}
 	},
 
-	handleNavigate_: function(newURL) {
+	handleWillNavigate_: function(newURL) {
 		if (!goog.string.startsWith(newURL.toString(), this.baseURL_.toString())) {
 			return false;
 		}
@@ -298,8 +361,12 @@ cam.IndexPage = React.createClass({
 		this.updateChildSearchSession_(targetBlobref, newURL);
 		this.pruneSearchSessionCache_();
 		this.setState({currentURL: newURL});
-		this.setSelection_({});
 		return true;
+	},
+
+	handleDidNavigate_: function() {
+		var s = this.props.history.state && this.props.history.state.selection;
+		this.setSelection_(s || {});
 	},
 
 	updateTargetSearchSession_: function(targetBlobref) {
@@ -414,6 +481,7 @@ cam.IndexPage = React.createClass({
 				mainControls: aspects.map(function(val, idx) {
 					return React.DOM.a(
 						{
+							key: val.title,
 							className: React.addons.classSet({
 								'cam-header-main-control-active': idx == selectedAspectIndex,
 							}),
@@ -428,14 +496,6 @@ cam.IndexPage = React.createClass({
 				searchRootsURL: this.getSearchRootsURL_(),
 				statusURL: this.baseURL_.resolve(new goog.Uri(this.props.config.statusRoot)),
 				ref: 'header',
-				subControls: [
-					this.getClearSelectionItem_(),
-					this.getCreateSetWithSelectionItem_(),
-					this.getSelectAsCurrentSetItem_(),
-					this.getAddToCurrentSetItem_(),
-					this.getDeleteSelectionItem_(),
-					this.getTagsControlItem_()
-				].filter(function(c) { return c }),
 				timer: this.props.timer,
 				width: this.props.availWidth,
 			}
@@ -461,12 +521,17 @@ cam.IndexPage = React.createClass({
 	},
 
 	handleSelectAsCurrentSet_: function() {
-		this.currentSet_ = goog.object.getAnyKey(this.state.selection);
+		this.setState({
+			currentSet: goog.object.getAnyKey(this.state.selection),
+		});
 		this.setSelection_({});
+		alert('Now, select the items to add to this set and click "Add to picked set" in the sidebar.\n\n' +
+			  'Sorry this is lame, we\'re working on it.');
 	},
 
 	handleAddToSet_: function() {
-		this.addMembersToSet_(this.currentSet_, goog.object.getKeys(this.state.selection));
+		this.addMembersToSet_(this.state.currentSet, goog.object.getKeys(this.state.selection));
+		alert('Done!');
 	},
 
 	handleUpload_: function() {
@@ -490,6 +555,7 @@ cam.IndexPage = React.createClass({
 			if (++numComplete == blobrefs.length) {
 				this.setSelection_({});
 				this.refreshIfNecessary_();
+				this.navigator_.navigate(this.getDetailURL_(permanode));
 			}
 		}.bind(this);
 
@@ -525,6 +591,10 @@ cam.IndexPage = React.createClass({
 				}
 			}.bind(this));
 		}.bind(this));
+	},
+
+	handleOpenWindow_: function(url) {
+		this.props.openWindow(url);
 	},
 
 	handleKeyPress_: function(e) {
@@ -577,88 +647,133 @@ cam.IndexPage = React.createClass({
 		}
 
 		var blobref = goog.object.getAnyKey(this.state.selection);
-		if (this.childSearchSession_.getMeta(blobref).camliType != 'permanode') {
+		var m = this.childSearchSession_.getMeta(blobref);
+		if (!m || m.camliType != 'permanode') {
 			return null;
 		}
 
-		return React.DOM.button({key:'selectascurrent', onClick:this.handleSelectAsCurrentSet_}, 'Select as current set');
+		return React.DOM.button(
+			{
+				key:'selectascurrent',
+				onClick:this.handleSelectAsCurrentSet_
+			},
+			'Add items to set'
+		);
 	},
 
 	getAddToCurrentSetItem_: function() {
-		if (!this.currentSet_ || !goog.object.getAnyKey(this.state.selection)) {
+		if (!this.state.currentSet) {
 			return null;
 		}
-		return React.DOM.button({key:'addtoset', onClick:this.handleAddToSet_}, 'Add to current set');
+
+		return React.DOM.button(
+			{
+				key:'addtoset',
+				onClick:this.handleAddToSet_
+			},
+			'Add to picked set'
+		);
 	},
 
 	getCreateSetWithSelectionItem_: function() {
-		var numItems = goog.object.getCount(this.state.selection);
-		if (numItems == 0) {
-			return null;
-		}
-		var label = 'Create set';
-		if (numItems == 1) {
-			label += ' with item';
-		} else if (numItems > 1) {
-			label += goog.string.subs(' with %s items', numItems);
-		}
-		return React.DOM.button({key:'createsetwithselection', onClick:this.handleCreateSetWithSelection_}, label);
+		return React.DOM.button(
+			{
+				key:'createsetwithselection',
+				onClick:this.handleCreateSetWithSelection_
+			},
+			'Create set with items'
+		);
 	},
 
 	getClearSelectionItem_: function() {
-		if (!goog.object.getAnyKey(this.state.selection)) {
-			return null;
-		}
-		return React.DOM.button({key:'clearselection', onClick:this.handleClearSelection_}, 'Clear selection');
+		return React.DOM.button(
+			{
+				key:'clearselection',
+				onClick:this.handleClearSelection_
+			},
+			'Clear selection'
+		);
 	},
 
 	getDeleteSelectionItem_: function() {
-		if (!goog.object.getAnyKey(this.state.selection)) {
+		return React.DOM.button(
+			{
+				key:'deleteselection',
+				onClick:this.handleDeleteSelection_
+			},
+			'Delete items'
+		);
+	},
+
+	getViewOriginalSelectionItem_: function() {
+		if (goog.object.getCount(this.state.selection) != 1) {
 			return null;
 		}
-		var numItems = goog.object.getCount(this.state.selection);
-		var label = 'Delete';
-		if (numItems == 1) {
-			label += ' selected item';
-		} else if (numItems > 1) {
-			label += goog.string.subs(' (%s) selected items', numItems);
+
+		var blobref = goog.object.getAnyKey(this.state.selection);
+		var rm = this.childSearchSession_.getResolvedMeta(blobref);
+		if (!rm || !rm.file) {
+			return null;
 		}
-		// TODO(mpl): better icon in another CL, with Font Awesome.
-		return React.DOM.button({key:'deleteselection', onClick:this.handleDeleteSelection_}, label);
+
+		var fileName = '';
+		if (rm.file.fileName) {
+			fileName = goog.string.subs('/%s', rm.file.fileName);
+		}
+
+		var downloadUrl = goog.string.subs('%s/%s%s', this.props.config.downloadHelper, rm.blobRef, fileName);
+		return React.DOM.button(
+			{
+				key:'viewSelection',
+				onClick: this.handleOpenWindow_.bind(null, this, downloadUrl),
+			},
+			'View original'
+		);
+	},
+
+	getSidebar_: function(selectedAspect) {
+		if (selectedAspect) {
+			if (selectedAspect.fragment == 'search' || selectedAspect.fragment == 'contents') {
+				return cam.Sidebar( {
+					isExpanded: this.state.sidebarVisible,
+					mainControls: [
+						{
+							"displayTitle": "Update Tags",
+							"control": this.getTagsControl_()
+						}
+					].filter(goog.functions.identity),
+					selectionControls: [
+						this.getClearSelectionItem_(),
+						this.getCreateSetWithSelectionItem_(),
+						this.getSelectAsCurrentSetItem_(),
+						this.getAddToCurrentSetItem_(),
+						this.getDeleteSelectionItem_(),
+						this.getViewOriginalSelectionItem_(),
+					].filter(goog.functions.identity),
+					selectedItems: this.state.selection
+				});
+			}
+		}
+
+		return null;
 	},
 
 	getTagsControl_: function() {
-		if (!this.state.tagsControlVisible) {
-			return null;
-		}
-
 		return cam.TagsControl(
 			{
 				selectedItems: this.state.selection,
 				searchSession: this.childSearchSession_,
-				serverConnection: this.props.serverConnection,
-				onCloseControl: this.handleTagsControlClose_
+				serverConnection: this.props.serverConnection
 			}
 		);
 	},
 
-	getTagsControlItem_: function() {
-		var numItems = goog.object.getCount(this.state.selection);
-		if (numItems == 0) {
-			return null;
-		}
-
-		var label = goog.string.subs('Tag (%s) items', numItems);
-
-		return React.DOM.button({key:'tagselection', onClick:this.handleTagSelection_}, label);
-	},
-
 	isUploading_: function() {
-		return this.state.numUploadsTotal > 0;
+		return this.state.totalBytesToUpload > 0;
 	},
 
 	getUploadDialog_: function() {
-		if (!this.state.uploadDialogVisible && !this.state.dropActive && !this.state.numUploadsTotal) {
+		if (!this.state.uploadDialogVisible && !this.state.dropActive && !this.state.totalBytesToUpload) {
 			return null;
 		}
 
@@ -702,10 +817,20 @@ cam.IndexPage = React.createClass({
 
 		function getText() {
 			if (this.isUploading_()) {
-				return goog.string.subs('Uploading (%s of %s)...', this.state.numUploadsComplete, this.state.numUploadsTotal);
+				return goog.string.subs('Uploaded %s (%s%)',
+					goog.format.numBytesToString(this.state.totalBytesComplete, 2),
+					getUploadProgressPercent.call(this));
 			} else {
 				return 'Drop files here to upload...';
 			}
+		}
+
+		function getUploadProgressPercent() {
+			if (!this.state.totalBytesToUpload) {
+				return 0;
+			}
+
+			return Math.round(100 * (this.state.totalBytesComplete / this.state.totalBytesToUpload));
 		}
 
 		return cam.Dialog(
@@ -721,10 +846,10 @@ cam.IndexPage = React.createClass({
 				{
 					className: 'cam-index-upload-dialog',
 					style: {
-						'line-height': h - borderWidth * 2,
 						'text-align': 'center',
 						position: 'relative',
 						left: -piggyWidth / 2,
+						top: (h - piggyHeight - borderWidth * 2) / 2,
 					},
 				},
 				getIcon.call(this),
@@ -739,32 +864,31 @@ cam.IndexPage = React.createClass({
 		});
 	},
 
-	handleTagSelection_: function() {
-		this.setState({tagsControlVisible: !this.state.tagsControlVisible});
-	},
-
-	handleTagsControlClose_: function() {
-		this.setState({tagsControlVisible: false});
-	},
-
 	handleSelectionChange_: function(newSelection) {
 		this.setSelection_(newSelection);
 	},
 
 	getBlobItemContainer_: function() {
+		var sidebarClosedWidth = this.props.availWidth;
+		var sidebarOpenWidth = sidebarClosedWidth - this.SIDEBAR_OPEN_WIDTH_;
+		var scale = sidebarOpenWidth / sidebarClosedWidth;
+
 		return cam.BlobItemContainerReact({
 			key: 'blobitemcontainer',
 			ref: 'blobItemContainer',
+			availHeight: this.props.availHeight,
+			availWidth: this.props.availWidth,
 			detailURL: this.handleDetailURL_,
 			handlers: this.BLOB_ITEM_HANDLERS_,
 			history: this.props.history,
 			onSelectionChange: this.handleSelectionChange_,
+			scale: scale,
+			scaleEnabled: this.state.sidebarVisible,
 			scrolling: this.props.scrolling,
 			searchSession: this.childSearchSession_,
 			selection: this.state.selection,
 			style: this.getBlobItemContainerStyle_(),
 			thumbnailSize: this.THUMBNAIL_SIZE_,
-			translateY: goog.object.getAnyKey(this.state.selection) ? 36 : 0,
 		});
 	},
 
@@ -774,8 +898,6 @@ cam.IndexPage = React.createClass({
 			overflowY: this.state.dropActive ? 'hidden' : '',
 			position: 'absolute',
 			top: 0,
-			height: this.props.availHeight - this.HEADER_HEIGHT_,
-			width: this.getContentWidth_(),
 		};
 	},
 
@@ -798,7 +920,7 @@ cam.IndexPage = React.createClass({
 			(this.childSearchSession_ && this.childSearchSession_.hasSocketError())) {
 			errors.push({
 				error: 'WebSocket error - click to reload',
-				onClick: this.props.location.reload.bind(this.props.location, true),
+				onClick: this.props.location.reload.bind(null, this.props.location, true),
 			});
 		}
 		return errors;

@@ -39,8 +39,8 @@ import (
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/client/android"
+	"camlistore.org/pkg/hashutil"
 	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/misc"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/schema"
 	"camlistore.org/pkg/search"
@@ -151,6 +151,20 @@ func NewOrFail() *Client {
 		log.Fatal(err)
 	}
 	return c
+}
+
+// NewPathClient returns a new client accessing a subpath of c.
+func (c *Client) NewPathClient(path string) *Client {
+	u, err := url.Parse(c.server)
+	if err != nil {
+		// Better than nothing
+		return New(c.server + path)
+	}
+	u.Path = path
+	pc := New(u.String())
+	pc.authMode = c.authMode
+	pc.discoOnce.Do(noop)
+	return pc
 }
 
 // NewStorageClient returns a Client that doesn't use HTTP, but uses s
@@ -359,8 +373,9 @@ func (c *Client) BlobRoot() (string, error) {
 	return prefix + "/", nil
 }
 
-// ServerKeyID returns the server's GPG public key ID.
-// If the server isn't running a sign handler, the error will be ErrNoSigning.
+// ServerKeyID returns the server's GPG public key ID, in its long (16 capital
+// hex digits) format. If the server isn't running a sign handler, the error
+// will be ErrNoSigning.
 func (c *Client) ServerKeyID() (string, error) {
 	if err := c.condDiscovery(); err != nil {
 		return "", err
@@ -930,7 +945,7 @@ func (c *Client) DialFunc() func(network, addr string) (net.Conn, error) {
 		if certs == nil || len(certs) < 1 {
 			return nil, errors.New("Could not get server's certificate from the TLS connection.")
 		}
-		sig := misc.SHA256Prefix(certs[0].Raw)
+		sig := hashutil.SHA256Prefix(certs[0].Raw)
 		for _, v := range trustedCerts {
 			if v == sig {
 				return conn, nil
@@ -983,11 +998,25 @@ func (c *Client) uploadPublicKey() error {
 	return err
 }
 
+// checkMatchingKeys compares the client's and the server's keys and logs if they differ.
+func (c *Client) checkMatchingKeys() {
+	serverKey, err := c.ServerKeyID()
+	// The server provides the full (16 digit) key fingerprint but schema.Signer only stores
+	// the short (8 digit) key ID.
+	if err == nil && len(serverKey) >= 8 {
+		shortServerKey := serverKey[len(serverKey)-8:]
+		if shortServerKey != c.signer.KeyID() {
+			log.Printf("Warning: client (%s) and server (%s) keys differ.", c.signer.KeyID(), shortServerKey)
+		}
+	}
+}
+
 func (c *Client) UploadAndSignBlob(b schema.AnyBlob) (*PutResult, error) {
 	signed, err := c.signBlob(b.Blob(), time.Time{})
 	if err != nil {
 		return nil, err
 	}
+	c.checkMatchingKeys()
 	if err := c.uploadPublicKey(); err != nil {
 		return nil, err
 	}
@@ -1017,6 +1046,7 @@ func (c *Client) UploadPlannedPermanode(key string, sigTime time.Time) (*PutResu
 	if err != nil {
 		return nil, err
 	}
+	c.checkMatchingKeys()
 	if err := c.uploadPublicKey(); err != nil {
 		return nil, err
 	}

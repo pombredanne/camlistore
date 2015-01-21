@@ -27,6 +27,7 @@ goog.require('goog.style');
 
 goog.require('cam.BlobItemReact');
 goog.require('cam.SearchSession');
+goog.require('cam.SpritedImage');
 
 cam.BlobItemContainerReact = React.createClass({
 	displayName: 'BlobItemContainerReact',
@@ -41,10 +42,14 @@ cam.BlobItemContainerReact = React.createClass({
 	INFINITE_SCROLL_THRESHOLD_PX_: 100,
 
 	propTypes: {
+		availHeight: React.PropTypes.number.isRequired,
+		availWidth: React.PropTypes.number.isRequired,
 		detailURL: React.PropTypes.func.isRequired,  // string->string (blobref->complete detail URL)
 		handlers: React.PropTypes.array.isRequired,
 		history: React.PropTypes.shape({replaceState:React.PropTypes.func.isRequired}).isRequired,
 		onSelectionChange: React.PropTypes.func,
+		scale: React.PropTypes.number.isRequired,
+		scaleEnabled: React.PropTypes.bool.isRequired,
 		scrolling: React.PropTypes.shape({
 			target:React.PropTypes.shape({addEventListener:React.PropTypes.func.isRequired, removeEventListener:React.PropTypes.func.isRequired}),
 			get: React.PropTypes.func.isRequired,
@@ -54,7 +59,6 @@ cam.BlobItemContainerReact = React.createClass({
 		selection: React.PropTypes.object.isRequired,
 		style: React.PropTypes.object,
 		thumbnailSize: React.PropTypes.number.isRequired,
-		translateY: React.PropTypes.number,
 	},
 
 	getDefaultProps: function() {
@@ -129,29 +133,34 @@ cam.BlobItemContainerReact = React.createClass({
 			);
 		}, this);
 
-		childControls.push(React.DOM.div({
-			key: 'marker',
-			style: {
-				position: 'absolute',
-				top: this.layoutHeight_ - 1,
-				left: 0,
-				height: 1,
-				width: 1,
-			},
-		}));
-
 		// If we haven't filled the window with results, add some more.
 		this.fillVisibleAreaWithResults_();
+
+		if (childControls.length == 0 && this.props.searchSession.isComplete()) {
+			childControls.push(this.getNoResultsMessage_());
+		}
+
+		var transformStyle = {};
+		var scale = this.props.scaleEnabled ? this.props.scale : 1;
+		transformStyle[cam.reactUtil.getVendorProp('transform')] = goog.string.subs('scale3d(%s, %s, 1)', scale, scale);
+		transformStyle[cam.reactUtil.getVendorProp('transformOrigin')] = goog.string.subs('left %spx 0', this.state.scroll);
 
 		return React.DOM.div(
 			{
 				className: 'cam-blobitemcontainer',
-				style: cam.object.extend(this.props.style, cam.reactUtil.getVendorProps({
-					transform: 'translateY(' + (this.props.translateY || 0) + 'px)',
-				})),
+				style: cam.object.extend(this.props.style, {
+					height: this.layoutHeight_,
+					width: this.props.availWidth,
+				}),
 				onMouseDown: this.handleMouseDown_,
 			},
-			childControls
+			React.DOM.div(
+				{
+					className: 'cam-blobitemcontainer-transform',
+					style: transformStyle,
+				},
+				childControls
+			)
 		);
 	},
 
@@ -184,7 +193,7 @@ cam.BlobItemContainerReact = React.createClass({
 
 		for (var i = rowStart; i <= lastItem; i++) {
 			var item = items[i];
-			var availWidth = this.props.style.width;
+			var availWidth = this.props.availWidth;
 			var nextWidth = currentWidth + this.props.thumbnailSize * item.handler.getAspectRatio() + this.BLOB_ITEM_MARGIN_;
 			if (i != lastItem && nextWidth < availWidth) {
 				currentWidth = nextWidth;
@@ -228,7 +237,11 @@ cam.BlobItemContainerReact = React.createClass({
 		var rowHeight = Number.POSITIVE_INFINITY;
 
 		var numItems = endIndex - startIndex + 1;
-		var availThumbWidth = availWidth - (this.BLOB_ITEM_MARGIN_ * (numItems + 1));
+
+		// Doesn't seem like this should be necessary. Subpixel bug? Aaron can't math?
+		var fudge = 1;
+
+		var availThumbWidth = availWidth - (this.BLOB_ITEM_MARGIN_ * (numItems + 1)) - fudge;
 		var usedThumbWidth = usedWidth - (this.BLOB_ITEM_MARGIN_ * (numItems + 1));
 
 		for (var i = startIndex; i <= endIndex; i++) {
@@ -257,8 +270,63 @@ cam.BlobItemContainerReact = React.createClass({
 		return rowHeight;
 	},
 
+	getNoResultsMessage_: function() {
+		var piggyWidth = 88;
+		var piggyHeight = 62;
+		var w = 350;
+		var h = 100;
+
+		return React.DOM.div(
+			{
+				key: 'no-results',
+				className: 'cam-blobitemcontainer-no-results',
+				style: {
+					width: w,
+					height: h,
+					left: (this.props.availWidth - w) / 2,
+					top: (this.props.availHeight - h) / 3
+				},
+			},
+			React.DOM.div(null, 'No results found'),
+			cam.SpritedImage(
+				{
+					index: 6,
+					sheetWidth: 10,
+					spriteWidth: piggyWidth,
+					spriteHeight: piggyHeight,
+					src: 'glitch/npc_piggy__x1_rooked1_png_1354829442.png',
+					style: {
+						'margin-left': (w - piggyWidth) / 2
+					}
+				}
+			)
+		);
+	},
+
+	getScrollFraction_: function() {
+		var max = this.layoutHeight_;
+		if (max == 0)
+			return 0;
+		return this.state.scroll / max;
+	},
+
+	getTranslation_: function() {
+		var maxOffset = (1 - this.props.scale) * this.layoutHeight_;
+		var currentOffset = maxOffset * this.getScrollFraction_();
+		return currentOffset;
+	},
+
+	transformY_: function(y) {
+		return y * this.props.scale + this.getTranslation_();
+	},
+
+	getScrollBottom_: function() {
+		return this.state.scroll + this.props.availHeight;
+	},
+
 	isVisible_: function(y) {
-		return y >= this.state.scroll && y < (this.state.scroll + this.props.style.height);
+		y = this.transformY_(y);
+		return y >= this.state.scroll && y < this.getScrollBottom_();
 	},
 
 	handleSearchSessionChanged_: function() {
@@ -299,9 +367,10 @@ cam.BlobItemContainerReact = React.createClass({
 	},
 
 	handleScroll_: function() {
-		this.updateHistoryThrottle_.fire();
-		this.setState({scroll:this.props.scrolling.get()});
-		this.fillVisibleAreaWithResults_();
+		this.setState({scroll:this.props.scrolling.get()}, function() {
+			this.updateHistoryThrottle_.fire();
+			this.fillVisibleAreaWithResults_();
+		}.bind(this));
 	},
 
 	handleChildWheel_: function(child) {
@@ -310,7 +379,7 @@ cam.BlobItemContainerReact = React.createClass({
 
 	// NOTE: This method causes the URL bar to throb for a split second (at least on Chrome), so it should not be called constantly.
 	updateHistory_: function() {
-		this.props.history.replaceState({scroll:this.props.scrolling.get()});
+		this.props.history.replaceState(cam.object.extend(this.props.history.state, {scroll:this.state.scroll}));
 	},
 
 	fillVisibleAreaWithResults_: function() {
@@ -318,7 +387,8 @@ cam.BlobItemContainerReact = React.createClass({
 			return;
 		}
 
-		if ((this.layoutHeight_ - this.state.scroll - this.props.style.height) > this.INFINITE_SCROLL_THRESHOLD_PX_) {
+		var layoutEnd = this.transformY_(this.layoutHeight_);
+		if ((layoutEnd - this.getScrollBottom_()) > this.INFINITE_SCROLL_THRESHOLD_PX_) {
 			return;
 		}
 

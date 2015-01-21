@@ -35,6 +35,7 @@ import (
 	txttemplate "text/template"
 	"time"
 
+	"camlistore.org/pkg/deploy/gce"
 	"camlistore.org/pkg/types/camtypes"
 )
 
@@ -138,7 +139,7 @@ func servePage(w http.ResponseWriter, title, subtitle string, content []byte) {
 		template.HTML(content),
 	}
 
-	if err := pageHTML.Execute(w, &d); err != nil {
+	if err := pageHTML.ExecuteTemplate(w, "page", &d); err != nil {
 		log.Printf("godocHTML.Execute: %s", err)
 	}
 }
@@ -325,6 +326,21 @@ func runAsChild(res string) {
 	}()
 }
 
+func gceDeployHandler(host, prefix string) http.Handler {
+	gceh, err := gce.NewDeployHandler(host, prefix)
+	if err != nil {
+		log.Fatalf("Error initializing gce deploy handler: %v", err)
+	}
+	pageBytes, err := ioutil.ReadFile(filepath.Join(*root, "tmpl", "page.html"))
+	if err != nil {
+		log.Fatalf("Error initializing gce deploy handler: %v", err)
+	}
+	if err := gceh.(*gce.DeployHandler).AddTemplateTheme(string(pageBytes)); err != nil {
+		log.Fatalf("Error initializing gce deploy handler: %v", err)
+	}
+	return gceh
+}
+
 func main() {
 	flag.Parse()
 
@@ -364,6 +380,12 @@ func main() {
 		mux.Handle(bbhpattern, buildbotHandler)
 	}
 
+	if *httpsAddr != "" {
+		if e := os.Getenv("CAMLI_GCE_CLIENTID"); e != "" {
+			mux.Handle("/launch/", gceDeployHandler(*httpsAddr, "/launch/"))
+		}
+	}
+
 	var handler http.Handler = &noWwwHandler{Handler: mux}
 	if *logDir != "" || *logStdout {
 		handler = NewLoggingHandler(handler, *logDir, *logStdout)
@@ -399,7 +421,7 @@ func main() {
 	log.Fatalf("Serve error: %v", <-errc)
 }
 
-var issueNum = regexp.MustCompile(`^/(?:issue(?:s)?|bugs)(/\d*)?$`)
+var issueNum = regexp.MustCompile(`^/(?:issue|bug)s?(/\d*)?$`)
 
 // issueRedirect returns whether the request should be redirected to the
 // issues tracker, and the url for that redirection if yes, the empty
@@ -410,11 +432,11 @@ func issueRedirect(urlPath string) (string, bool) {
 		return "", false
 	}
 	issueNumber := strings.TrimPrefix(m[1], "/")
-	suffix := "list"
+	suffix := ""
 	if issueNumber != "" {
-		suffix = "detail?id=" + issueNumber
+		suffix = "/" + issueNumber
 	}
-	return "https://code.google.com/p/camlistore/issues/" + suffix, true
+	return "https://github.com/camlistore/camlistore/issues" + suffix, true
 }
 
 func gerritRedirect(w http.ResponseWriter, r *http.Request) {
