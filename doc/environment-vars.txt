@@ -46,6 +46,9 @@ CAMLI_DEBUG_CONFIG (bool):
   Causes pkg/serverconfig to dump low-level configuration derived from
   high-level configuation on load.
 
+CAMLI_DEBUG_X (string):
+  String containing magic substring(s) to enable debuggging in code.
+
 CAMLI_DEBUG_UPLOADS (bool):
   Used by pkg/client to enable additional logging.
 
@@ -94,6 +97,17 @@ CAMLI_GCE_DATA (string):
   instances configuration and state. If blank, the "camli-gce-data" default is used
   instead.
 
+CAMLI_GCE_PROJECT (string):
+  See CAMLI_GCE_* first. ID of the Google Project that provides the above client ID and
+  secret. It is used when we query for the list of all the existing zones, since such a
+  query requires a project ID. If blank, a hard-coded list of zones is used instead.
+
+CAMLI_GCE_SERVICE_ACCOUNT (string):
+  See CAMLI_GCE_* first. Path to a Google service account JSON file. This account should
+  have at least compute.readonly permissions on the Google Project wih ID CAMLI_GCE_PROJECT.
+  It is used to authenticate when querying for the list of all the existing zones. If blank,
+  a hard-coded list of zones is used instead.
+
 CAMLI_GCE_XSRFKEY (string):
   See CAMLI_GCE_* first. Used by gce.DeployHandler as the XSRF protection key. If blank,
   gce.NewDeployHandler generates a new random key instead.
@@ -128,6 +142,12 @@ CAMLI_KEYID (string):
 CAMLI_KV_VERIFY (bool):
   Enable all the VerifyDb* options in cznic/kv, to e.g. track down
   corruptions.
+
+CAMLI_KVINDEX_ENABLED (bool):
+  Use cznic/kv as the indexer. Variable used only by devcam server.
+
+CAMLI_LEVELDB_ENABLED (bool):
+  Use syndtr/goleveldb as the indexer. Variable used only by devcam server.
 
 CAMLI_MEMINDEX_ENABLED (bool):
   Use a memory-only indexer. Supported only by devcam server.

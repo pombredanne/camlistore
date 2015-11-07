@@ -45,7 +45,7 @@ func init() {
 	cmdmain.RegisterCommand("test", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		cmd := new(testCmd)
 		flags.BoolVar(&cmd.short, "short", false, "Use '-short' with go test.")
-		flags.BoolVar(&cmd.precommit, "precommit", true, "Run misc/pre-commit.githook as part of tests.")
+		flags.BoolVar(&cmd.precommit, "precommit", true, "Run the pre-commit githook as part of tests.")
 		flags.BoolVar(&cmd.verbose, "v", false, "Use '-v' (for verbose) with go test.")
 		flags.StringVar(&cmd.run, "run", "", "Use '-run' with go test.")
 		return cmd
@@ -91,6 +91,7 @@ func (c *testCmd) env() *Env {
 	env.NoGo()
 	env.Set("GOPATH", c.buildGoPath)
 	env.Set("CAMLI_MAKE_USEGOPATH", "true")
+	env.Set("GO15VENDOREXPERIMENT", "1")
 	return env
 }
 
@@ -130,7 +131,9 @@ func (c *testCmd) buildSelf() error {
 func (c *testCmd) runTests(args []string) error {
 	targs := []string{"test"}
 	if !strings.HasSuffix(c.buildGoPath, "-nosqlite") {
-		targs = append(targs, "--tags=with_sqlite")
+		targs = append(targs, "--tags=with_sqlite fake_android")
+	} else {
+		targs = append(targs, "--tags=fake_android")
 	}
 	if c.short {
 		targs = append(targs, "-short")
@@ -157,7 +160,7 @@ func (c *testCmd) runTests(args []string) error {
 }
 
 func (c *testCmd) runPrecommitHook() error {
-	out, err := exec.Command(filepath.FromSlash("./misc/pre-commit.githook"), "test").CombinedOutput()
+	out, err := exec.Command(filepath.FromSlash("./bin/devcam"), "hook", "pre-commit", "test").CombinedOutput()
 	if err != nil {
 		fmt.Println(string(out))
 	}

@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// IndexPage is the top level React component class that owns all the other
+// components of the web UI.
+// See the React documentation and in particular
+// https://facebook.github.io/react/docs/component-specs.html to learn about
+// components.
 goog.provide('cam.IndexPage');
 
 goog.require('goog.array');
@@ -87,6 +92,9 @@ cam.IndexPage = React.createClass({
 		timer: cam.Header.originalSpec.propTypes.timer,
 	},
 
+	// Invoked once right before initial rendering. This is essentially IndexPage's
+	// constructor. We populate non-React helpers that live for the entire lifetime
+	// of IndexPage here.
 	componentWillMount: function() {
 		this.baseURL_ = null;
 		this.dragEndTimer_ = 0;
@@ -108,12 +116,14 @@ cam.IndexPage = React.createClass({
 		this.handleDidNavigate_();
 	},
 
+	// Invoked right after initial rendering.
 	componentDidMount: function() {
 		// TODO(aa): This supports some of the old iframed pages. We can remove it once they are dead.
 		goog.global.getSearchSession = function() {
 			return this.childSearchSession_;
 		}.bind(this);
 		this.eh_.listen(this.props.eventTarget, 'keypress', this.handleKeyPress_);
+		this.eh_.listen(this.props.eventTarget, 'keyup', this.handleKeyUp_);
 	},
 
 	componentWillUnmount: function() {
@@ -121,8 +131,12 @@ cam.IndexPage = React.createClass({
 		this.clearDragTimer_();
 	},
 
+	// Invoked once before everything else on initial rendering. Values are
+	// subsequently in this.state. We use this to set the initial state and
+	// also to document what state fields are possible
 	getInitialState: function() {
 		return {
+			backwardPiggy: false,
 			currentURL: null,
 			currentSet: '',
 			dropActive: false,
@@ -138,6 +152,9 @@ cam.IndexPage = React.createClass({
 		};
 	},
 
+	// render() is called by React every time a component is determined to need
+	// re-rendering. This is typically caused by a call to setState() or a parent
+	// component re-rendering.
 	render: function() {
 		var aspects = this.getAspects_();
 		var selectedAspect = goog.array.findIndex(aspects, function(v) {
@@ -148,7 +165,6 @@ cam.IndexPage = React.createClass({
 			selectedAspect = 0;
 		}
 
-		var backwardPiggy = false;
 		var contentSize = new goog.math.Size(this.props.availWidth, this.props.availHeight - this.HEADER_HEIGHT_);
 		return React.DOM.div({onDragEnter:this.handleDragStart_, onDragOver:this.handleDragStart_, onDrop:this.handleDrop_},
 			this.getHeader_(aspects, selectedAspect),
@@ -159,7 +175,7 @@ cam.IndexPage = React.createClass({
 						top: this.HEADER_HEIGHT_,
 					},
 				},
-				aspects[selectedAspect] && aspects[selectedAspect].createContent(contentSize, backwardPiggy)
+				aspects[selectedAspect] && aspects[selectedAspect].createContent(contentSize, this.state.backwardPiggy)
 			),
 			this.getSidebar_(aspects[selectedAspect]),
 			this.getUploadDialog_()
@@ -185,7 +201,7 @@ cam.IndexPage = React.createClass({
 	},
 
 	getAspects_: function() {
-		var childFrameClickHandler = this.navigator_.navigate.bind(null, this.navigator_);
+		var childFrameClickHandler = this.navigator_.navigate.bind(this.navigator_);
 		var target = this.getTargetBlobref_();
 		var getAspect = function(f) {
 			return f(target, this.targetSearchSession_);
@@ -308,8 +324,10 @@ cam.IndexPage = React.createClass({
 
 		goog.labs.Promise.all(
 			Array.prototype.map.call(files, function(file) {
-				return uploadFileAndCreatePermanode(file)
-					.then(transformResults)
+				return uploadFile(file)
+					.then(fetchExistingPermanode)
+					.then(createPermanodeIfNotExists)
+					.then(nameResults)
 					.then(createPermanodeAssociations.bind(this))
 					.thenCatch(function(e) {
 						console.error('File upload fall down go boom. file: %s, error: %s', file.name, e);
@@ -320,15 +338,32 @@ cam.IndexPage = React.createClass({
 			console.error('File upload failed with error: %s', e);
 		}).then(this.onUploadComplete_);
 
-		function uploadFileAndCreatePermanode(file) {
+		function uploadFile(file) {
 			var uploadFile = new goog.labs.Promise(sc.uploadFile.bind(sc, file));
-			var createPermanode = new goog.labs.Promise(sc.createPermanode.bind(sc));
+			return goog.labs.Promise.all([uploadFile]);
+		}
 
-			return goog.labs.Promise.all([uploadFile, createPermanode]);
+		function fetchExistingPermanode(blobIds) {
+			var fileRef = blobIds[0];
+			var fileUploaded = new goog.labs.Promise.resolve(fileRef);
+			var getPermanode = new goog.labs.Promise(sc.getPermanodeWithContent.bind(sc, fileRef));
+			return goog.labs.Promise.all([fileUploaded, getPermanode]);
+		}
+
+		function createPermanodeIfNotExists(results) {
+			var fileRef = results[0];
+			var permanode = results[1];
+			if (!permanode) {
+				var fileUploaded = new goog.labs.Promise.resolve(fileRef);
+				var createPermanode = new goog.labs.Promise(sc.createPermanode.bind(sc));
+				return goog.labs.Promise.all([fileUploaded, createPermanode]);
+			}
+			// Empty values so the next in chain knows that we're in the "permanode already exists" case.
+			return goog.labs.Promise.resolve(["", ""]);
 		}
 
 		// 'readable-ify' the blob references returned from upload/create
-		function transformResults(blobIds) {
+		function nameResults(blobIds) {
 			return {
 				'fileRef': blobIds[0],
 				'permanodeRef': blobIds[1]
@@ -336,6 +371,12 @@ cam.IndexPage = React.createClass({
 		}
 
 		function createPermanodeAssociations(refs) {
+			if (refs.permanodeRef == "") {
+				// Any value would do, but boolean helps make it clear that we end
+				// here, by resolving the file upload promise chain.
+				return goog.labs.Promise.resolve(true);
+			}
+
 			// associate uploaded file to new permanode
 			var camliContent = new goog.labs.Promise(sc.newSetAttributeClaim.bind(sc, refs.permanodeRef, 'camliContent', refs.fileRef));
 			var promises = [camliContent];
@@ -357,10 +398,13 @@ cam.IndexPage = React.createClass({
 		}
 
 		var targetBlobref = this.getTargetBlobref_(newURL);
-		this.updateTargetSearchSession_(targetBlobref);
+		this.updateTargetSearchSession_(targetBlobref, newURL);
 		this.updateChildSearchSession_(targetBlobref, newURL);
 		this.pruneSearchSessionCache_();
-		this.setState({currentURL: newURL});
+		this.setState({
+			backwardPiggy: false,
+			currentURL: newURL,
+		});
 		return true;
 	},
 
@@ -369,60 +413,100 @@ cam.IndexPage = React.createClass({
 		this.setSelection_(s || {});
 	},
 
-	updateTargetSearchSession_: function(targetBlobref) {
+	updateTargetSearchSession_: function(targetBlobref, newURL) {
+		this.targetSearchSession_ = null;
 		if (targetBlobref) {
-			this.targetSearchSession_ = this.getSearchSession_(targetBlobref, {blobRefPrefix: targetBlobref});
-		} else {
-			this.targetSearchSession_ = null;
+			var query = this.queryAsBlob_(targetBlobref);
+			var parentPermanode = newURL.getParameterValue('p');
+			if (parentPermanode) {
+				query = this.queryFromParentPermanode_(parentPermanode);
+			} else {
+				var queryString = newURL.getParameterValue('q');
+				if (queryString) {
+					query = this.queryFromSearchParam_(queryString);
+				}
+			}
+			this.targetSearchSession_ = this.getSearchSession_(targetBlobref, query);
 		}
 	},
 
 	updateChildSearchSession_: function(targetBlobref, newURL) {
-		var query = newURL.getParameterValue('q');
-
+		var query = ' ';
 		if (targetBlobref) {
-			query = {
-				permanode: {
-					relation: {
-						relation: 'parent',
-						any: { blobRefPrefix: targetBlobref },
-					},
-				},
-			};
-		} else if (query) {
-			// TODO(aa): Remove this when the server can do something like the 'raw' operator.
-			if (goog.string.startsWith(query, this.SEARCH_PREFIX_.RAW + ':')) {
-				try {
-					query = JSON.parse(query.substring(this.SEARCH_PREFIX_.RAW.length + 1));
-				} catch (e) {
-					console.error('Raw search is invalid JSON', e);
-					query = null;
-				}
+			query = this.queryFromParentPermanode_(targetBlobref);
+		} else {
+			var queryString = newURL.getParameterValue('q');
+			if (queryString) {
+				query = this.queryFromSearchParam_(queryString);
+			}
+		}
+		this.childSearchSession_ = this.getSearchSession_(null, query);
+	},
+
+	queryFromSearchParam_: function(queryString) {
+		// TODO(aa): Remove this when the server can do something like the 'raw' operator.
+		if (goog.string.startsWith(queryString, this.SEARCH_PREFIX_.RAW + ':')) {
+			try {
+				return JSON.parse(queryString.substring(this.SEARCH_PREFIX_.RAW.length + 1));
+			} catch (e) {
+				console.error('Raw search is invalid JSON', e);
+				return null;
 			}
 		} else {
-			query = ' ';
-		}
-
-		if (query) {
-			this.childSearchSession_ = this.getSearchSession_(null, query);
-		} else {
-			this.childSearchSession_ = null;
+			return queryString;
 		}
 	},
 
-	getSearchSession_: function(targetBlobref, query) {
+	queryFromParentPermanode_: function(blobRef) {
+		return {
+			permanode: {
+				relation: {
+					relation: 'parent',
+					any: { blobRefPrefix: blobRef },
+				},
+			},
+		};
+	},
+
+	queryAsBlob_: function(blobRef) {
+		return {
+			blobRefPrefix: blobRef,
+		}
+	},
+
+	// Finds an existing cached SearchSession that meets criteria, or creates a new one.
+	//
+	// If opt_query is present, the returned query must be exactly equivalent.
+	// If opt_targetBlobref is present, the returned query must have current results that contain opt_targetBlobref. Otherwise, the returned query must contain the first result.
+	//
+	// If only opt_targetBlobref is set, then any query that happens to currently contain that blobref is acceptable to the caller.
+	getSearchSession_: function(opt_targetBlobref, opt_query) {
 		// This whole business of reusing search session relies on the assumption that we use the same describe rules for both detail queries and search queries.
-		var queryString = JSON.stringify(query);
-		var cached = goog.array.findIndex(this.searchSessionCache_, function(ss, index) {
-			if (targetBlobref && ss.getMeta(targetBlobref)) {
-				console.log('Found existing SearchSession for blobref %s at position %d', targetBlobref, index);
-				return true;
-			} else if (JSON.stringify(ss.getQuery()) == queryString) {
-				console.log('Found existing SearchSession for query %s at position %d', queryString, index);
-				return true;
-			} else {
+		var queryString = JSON.stringify(opt_query);
+
+		var cached = goog.array.findIndex(this.searchSessionCache_, function(ss) {
+			if (opt_targetBlobref) {
+				if (!ss.getMeta(opt_targetBlobref)) {
+					return false;
+				}
+				if (!opt_query) {
+					return true;
+				}
+			}
+
+			if (JSON.stringify(ss.getQuery()) != queryString) {
 				return false;
 			}
+
+			if (!opt_targetBlobref) {
+				return !ss.getAround();
+			}
+
+			// If there's a targetBlobref, we require that it is not at the very edge of the results so that we can implement lefr/right in detail views.
+			var targetIndex = goog.array.findIndex(ss.getCurrentResults().blobs, function(b) {
+				return b.blob == opt_targetBlobref;
+			});
+			return (targetIndex > 0) && (targetIndex < (ss.getCurrentResults().blobs.length - 1));
 		});
 
 		if (cached > -1) {
@@ -431,7 +515,7 @@ cam.IndexPage = React.createClass({
 		}
 
 		console.log('Creating new search session for query %s', queryString);
-		var ss = new cam.SearchSession(this.props.serverConnection, this.baseURL_.clone(), query);
+		var ss = new cam.SearchSession(this.props.serverConnection, this.baseURL_.clone(), opt_query, opt_targetBlobref);
 		this.eh_.listen(ss, cam.SearchSession.SEARCH_SESSION_CHANGED, function() {
 			this.forceUpdate();
 		});
@@ -476,6 +560,7 @@ cam.IndexPage = React.createClass({
 				currentSearch: query,
 				errors: this.getErrors_(),
 				height: 38,
+				helpURL: this.baseURL_.resolve(new goog.Uri(this.props.config.helpRoot)),
 				homeURL: this.baseURL_,
 				importersURL: this.baseURL_.resolve(new goog.Uri(this.props.config.importerRoot)),
 				mainControls: aspects.map(function(val, idx) {
@@ -622,12 +707,76 @@ cam.IndexPage = React.createClass({
 		}
 	},
 
-	handleDetailURL_: function(blobref) {
-		return this.getDetailURL_(blobref);
+	handleKeyUp_: function(e) {
+		var isEsc = (e.keyCode == 27);
+		var isRight = (e.keyCode == 39);
+		var isLeft = (e.keyCode == 37);
+
+		if (isEsc) {
+			// TODO: This isn't right, it should go back to the context URL if there is one.
+			this.navigator_.navigate(this.baseURL_);
+			return;
+		}
+
+		if (!isRight && !isLeft) {
+			return;
+		}
+
+		if (!this.targetSearchSession_) {
+			return;
+		}
+
+		var blobs = this.targetSearchSession_.getCurrentResults().blobs;
+		var target = this.getTargetBlobref_();
+		var idx = goog.array.findIndex(blobs, function(item) {
+			return item.blob == target;
+		});
+
+		if (isRight) {
+			if (idx >= (blobs.length - 1)) {
+				return;
+			}
+			idx++;
+		} else {
+			if (idx <= 0) {
+				return;
+			}
+			idx--;
+		}
+
+		var url = this.getDetailURL_(blobs[idx].blob, this.state.currentURL.getFragment());
+		['q', 'p'].forEach(function(p) {
+			var v = this.state.currentURL.getParameterValue(p);
+			if (v) {
+				url.setParameterValue(p, v);
+			}
+		}, this);
+		this.navigator_.navigate(url);
+		this.setState({
+			backwardPiggy: isLeft,
+		});
 	},
 
-	getDetailURL_: function(blobref) {
-		return this.baseURL_.clone().setPath(this.baseURL_.getPath() + blobref);
+	handleDetailURL_: function(blobref) {
+		return this.getChildDetailURL_(blobref);
+	},
+
+	getChildDetailURL_: function(blobref, opt_fragment) {
+		var query = this.state.currentURL.getParameterValue('q');
+		var targetBlobref = this.getTargetBlobref_();
+		var url = this.getDetailURL_(blobref, opt_fragment);
+		if (targetBlobref) {
+			url.setParameterValue('p', targetBlobref);
+		} else {
+			url.setParameterValue('q', query || ' ');
+		}
+		return url;
+	},
+
+	getDetailURL_: function(blobref, opt_fragment) {
+		var query = this.state.currentURL.getParameterValue('q');
+		var targetBlobref = this.getTargetBlobref_();
+		return url = this.baseURL_.clone().setPath(this.baseURL_.getPath() + blobref).setFragment(opt_fragment || '');
 	},
 
 	setSearch_: function(query) {
@@ -721,11 +870,11 @@ cam.IndexPage = React.createClass({
 			fileName = goog.string.subs('/%s', rm.file.fileName);
 		}
 
-		var downloadUrl = goog.string.subs('%s/%s%s', this.props.config.downloadHelper, rm.blobRef, fileName);
+		var downloadUrl = goog.string.subs('%s%s%s', this.props.config.downloadHelper, rm.blobRef, fileName);
 		return React.DOM.button(
 			{
 				key:'viewSelection',
-				onClick: this.handleOpenWindow_.bind(null, this, downloadUrl),
+				onClick: this.handleOpenWindow_.bind(null, downloadUrl),
 			},
 			'View original'
 		);
@@ -734,11 +883,18 @@ cam.IndexPage = React.createClass({
 	getSidebar_: function(selectedAspect) {
 		if (selectedAspect) {
 			if (selectedAspect.fragment == 'search' || selectedAspect.fragment == 'contents') {
+				var count = goog.object.getCount(this.state.selection);
 				return cam.Sidebar( {
 					isExpanded: this.state.sidebarVisible,
+					header: React.DOM.span(
+						{
+							className: 'header',
+						},
+						goog.string.subs('%s selected item%s', count, count > 1 ? 's' : '')
+					),
 					mainControls: [
 						{
-							"displayTitle": "Update Tags",
+							"displayTitle": "Update tags",
 							"control": this.getTagsControl_()
 						}
 					].filter(goog.functions.identity),

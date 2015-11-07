@@ -26,8 +26,10 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -45,9 +47,10 @@ import (
 	"camlistore.org/pkg/sorted"
 	"camlistore.org/pkg/sorted/leveldb"
 
-	compute "camlistore.org/third_party/code.google.com/p/google-api-go-client/compute/v1"
 	"camlistore.org/third_party/code.google.com/p/xsrftoken"
-	"camlistore.org/third_party/golang.org/x/oauth2"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+	compute "google.golang.org/api/compute/v1"
 )
 
 const (
@@ -69,6 +72,17 @@ var (
 		"machine": Machine,
 		"zone":    Zone,
 	}
+	machineValues = []string{
+		"g1-small",
+		"n1-highcpu-2",
+	}
+
+	backupZones = map[string][]string{
+		"us-central1":  []string{"-a", "-b", "-f"},
+		"europe-west1": []string{"-b", "-c", "-d"},
+		"asia-east1":   []string{"-a", "-b", "-c"},
+	}
+
 	// DevHandler: if true, use HTTP instead of HTTPS, force permissions prompt for OAuth,
 	// do not actually create an instance. It has no effect if set after NewHandler is
 	// called.
@@ -84,7 +98,7 @@ type DeployHandler struct {
 	prefix   string                   // prefix is the pattern for which this handler is registered as an http.Handler.
 	help     map[string]template.HTML // various help bits used in the served pages, keyed by relevant names.
 	xsrfKey  string                   // for XSRF protection.
-	piggygif string                   // path to the piggy gif file, defaults to /static/piggy.gif
+	piggyGIF string                   // path to the piggy gif file, defaults to /static/piggy.gif
 	mux      *http.ServeMux
 
 	tplMu sync.RWMutex
@@ -98,7 +112,7 @@ type DeployHandler struct {
 	// stores the user submitted configuration as a JSON-encoded InstanceConf
 	instConf blobserver.Storage
 	// key is blobRef of the relevant InstanceConf, value is the current state of
-	// the instance creation process, as json encoded creationState
+	// the instance creation process, as JSON-encoded creationState
 	instState sorted.KeyValue
 
 	recordStateErrMu sync.RWMutex
@@ -106,13 +120,53 @@ type DeployHandler struct {
 	// that occurred when recording the creation state.
 	recordStateErr map[string]error
 
+	zonesMu sync.RWMutex
+	// maps a region to all its zones suffixes (e.g. "asia-east1" -> "-a","-b"). updated in the
+	// background every 24 hours. defaults to backupZones.
+	zones   map[string][]string
+	regions []string
+
 	*log.Logger
+}
+
+// Config is the set of parameters to initialize the DeployHandler.
+type Config struct {
+	ClientID       string `json:"clientID"`       // handler's credentials for OAuth. required.
+	ClientSecret   string `json:"clientSecret"`   // handler's credentials for OAuth. required.
+	Project        string `json:"project"`        // any Google Cloud project we can query to get the valid Google Cloud zones. optional.
+	ServiceAccount string `json:"serviceAccount"` // JSON file with credentials to Project. optional.
+	DataDir        string `json:"dataDir"`        // where to store the instances configurations and states. optional.
+}
+
+// NewDeployHandlerFromConfig initializes a DeployHandler from the JSON config file.
+// Host and prefix have the same meaning as for NewDeployHandler.
+func NewDeployHandlerFromConfig(host, prefix, configFile string) (http.Handler, error) {
+	var cfg Config
+	data, err := ioutil.ReadFile(configFile)
+	if err != nil {
+		return nil, fmt.Errorf("Could not read handler's config at %v: %v", configFile, err)
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("Could not JSON decode config at %v: %v", configFile, err)
+	}
+	if cfg.ClientID == "" {
+		return nil, errors.New("oauth2 clientID required in config")
+	}
+	if cfg.ClientSecret == "" {
+		return nil, errors.New("oauth2 clientSecret required in config")
+	}
+	os.Setenv("CAMLI_GCE_CLIENTID", cfg.ClientID)
+	os.Setenv("CAMLI_GCE_CLIENTSECRET", cfg.ClientSecret)
+	os.Setenv("CAMLI_GCE_PROJECT", cfg.Project)
+	os.Setenv("CAMLI_GCE_SERVICE_ACCOUNT", cfg.ServiceAccount)
+	os.Setenv("CAMLI_GCE_DATA", cfg.DataDir)
+	return NewDeployHandler(host, prefix)
 }
 
 // NewDeployHandler initializes a DeployHandler that serves at https://host/prefix/ and returns it.
 // A Google account client ID should be set in CAMLI_GCE_CLIENTID with its corresponding client
 // secret in CAMLI_GCE_CLIENTSECRET.
-func NewDeployHandler(host string, prefix string) (http.Handler, error) {
+func NewDeployHandler(host, prefix string) (http.Handler, error) {
 	clientID := os.Getenv("CAMLI_GCE_CLIENTID")
 	if clientID == "" {
 		return nil, errors.New("Need an oauth2 client ID defined in CAMLI_GCE_CLIENTID")
@@ -150,19 +204,21 @@ func NewDeployHandler(host string, prefix string) (http.Handler, error) {
 		scheme:         scheme,
 		prefix:         prefix,
 		help: map[string]template.HTML{
-			"createProject": template.HTML(googURLPattern.ReplaceAllString(HelpCreateProject, toHyperlink)),
-			"enableAPIs":    template.HTML(HelpEnableAPIs),
-			"genCert":       template.HTML(helpGenCert),
-			"domainName":    template.HTML(helpDomainName),
-			"machineTypes":  template.HTML(helpMachineTypes),
-			"zones":         template.HTML(helpZones),
-			"ssh":           template.HTML(helpSSH),
-			"changeCert":    template.HTML(helpChangeCert),
+			"createProject":   template.HTML(googURLPattern.ReplaceAllString(HelpCreateProject, toHyperlink)),
+			"enableAPIs":      template.HTML(HelpEnableAPIs),
+			"genCert":         template.HTML(helpGenCert),
+			"domainName":      template.HTML(helpDomainName),
+			"machineTypes":    template.HTML(helpMachineTypes),
+			"zones":           template.HTML(helpZones),
+			"ssh":             template.HTML(helpSSH),
+			"changeCert":      template.HTML(helpChangeCert),
+			"changeSSH":       template.HTML(HelpManageSSHKeys),
+			"changeHTTPCreds": template.HTML(HelpManageHTTPCreds),
 		},
 		clientID:     clientID,
 		clientSecret: clientSecret,
 		tpl:          tpl,
-		piggygif:     "/static/piggy.gif",
+		piggyGIF:     "/static/piggy.gif",
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(prefix+"/callback", func(w http.ResponseWriter, r *http.Request) {
@@ -176,6 +232,18 @@ func NewDeployHandler(host string, prefix string) (http.Handler, error) {
 	})
 	h.mux = mux
 	h.Logger = log.New(os.Stderr, "", log.LstdFlags)
+	h.zones = backupZones
+	// TODO(mpl): use time.AfterFunc and avoid having a goroutine running all the time almost
+	// doing nothing.
+	refreshZonesFn := func() {
+		for {
+			if err := h.refreshZones(); err != nil {
+				h.Printf("error while refreshing zones: %v", err)
+			}
+			time.Sleep(24 * time.Hour)
+		}
+	}
+	go refreshZonesFn()
 	return h, nil
 }
 
@@ -185,6 +253,67 @@ func (h *DeployHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.mux.ServeHTTP(w, r)
+}
+
+func (h *DeployHandler) refreshZones() error {
+	h.zonesMu.Lock()
+	defer h.zonesMu.Unlock()
+	defer func() {
+		h.regions = make([]string, 0, len(h.zones))
+		for r, _ := range h.zones {
+			h.regions = append(h.regions, r)
+		}
+	}()
+	// TODO(mpl): get projectID and access tokens from metadata once camweb is on GCE.
+	accountFile := os.Getenv("CAMLI_GCE_SERVICE_ACCOUNT")
+	if accountFile == "" {
+		h.Printf("No service account to query for the zones, using hard-coded ones instead.")
+		h.zones = backupZones
+		return nil
+	}
+	project := os.Getenv("CAMLI_GCE_PROJECT")
+	if project == "" {
+		h.Printf("No project we can query on to get the zones, using hard-coded ones instead.")
+		h.zones = backupZones
+		return nil
+	}
+	data, err := ioutil.ReadFile(accountFile)
+	if err != nil {
+		return err
+	}
+	conf, err := google.JWTConfigFromJSON(data, "https://www.googleapis.com/auth/compute.readonly")
+	if err != nil {
+		return err
+	}
+	s, err := compute.New(conf.Client(oauth2.NoContext))
+	if err != nil {
+		return err
+	}
+	rl, err := compute.NewRegionsService(s).List(project).Do()
+	if err != nil {
+		return fmt.Errorf("could not get a list of regions: %v", err)
+	}
+	h.zones = make(map[string][]string)
+	for _, r := range rl.Items {
+		zones := make([]string, 0, len(r.Zones))
+		for _, z := range r.Zones {
+			zone := path.Base(z)
+			if zone == "europe-west1-a" {
+				// Because even though the docs mark it as deprecated, it still shows up here, go figure.
+				continue
+			}
+			zone = strings.Replace(zone, r.Name, "", 1)
+			zones = append(zones, zone)
+		}
+		h.zones[r.Name] = zones
+	}
+	return nil
+}
+
+func (h *DeployHandler) zoneValues() []string {
+	h.zonesMu.RLock()
+	defer h.zonesMu.RUnlock()
+	return h.regions
 }
 
 func (h *DeployHandler) serveRoot(w http.ResponseWriter, r *http.Request) {
@@ -199,9 +328,11 @@ func (h *DeployHandler) serveRoot(w http.ResponseWriter, r *http.Request) {
 	h.tplMu.RLock()
 	defer h.tplMu.RUnlock()
 	if err := h.tpl.ExecuteTemplate(w, "withform", &TemplateData{
-		Prefix:   h.prefix,
-		Help:     h.help,
-		Defaults: formDefaults,
+		Prefix:        h.prefix,
+		Help:          h.help,
+		Defaults:      formDefaults,
+		ZoneValues:    h.zoneValues(),
+		MachineValues: machineValues,
 	}); err != nil {
 		h.Print(err)
 	}
@@ -219,7 +350,7 @@ func (h *DeployHandler) serveSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	instConf, err := confFromForm(r)
+	instConf, err := h.confFromForm(r)
 	if err != nil {
 		h.serveFormError(w, err)
 		return
@@ -282,14 +413,11 @@ func (h *DeployHandler) serveCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	depl := &Deployer{
-		Cl:   oAuthConf.Client(oauth2.NoContext, tok),
-		Conf: instConf,
+		Client: oAuthConf.Client(oauth2.NoContext, tok),
+		Conf:   instConf,
 	}
-	if inst, err := depl.Get(context.TODO()); err == nil {
-		h.serveError(w,
-			fmt.Errorf("Instance already running at %v. You need to manually delete the old one before creating a new one.", addr(inst)),
-			HelpDeleteInstance,
-		)
+
+	if found := h.serveOldInstance(w, br, depl); found {
 		return
 	}
 
@@ -308,10 +436,11 @@ func (h *DeployHandler) serveCallback(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			time.Sleep(7 * time.Second)
 			if err := h.recordState(br, &creationState{
-				InstConf:        br,
-				InstAddr:        "fake.instance.com",
-				Success:         true,
-				CertFingerprint: "XXXXXXXXXXXXXXXXXXXX",
+				InstConf:              br,
+				InstAddr:              "fake.instance.com",
+				Success:               true,
+				CertFingerprintSHA1:   "XXXXXXXXXXXXXXXXXXXX",
+				CertFingerprintSHA256: "YYYYYYYYYYYYYYYYYYYY",
 			}); err != nil {
 				h.Printf("Could not record creation state for %v: %v", br, err)
 				h.recordStateErrMu.Lock()
@@ -330,11 +459,19 @@ func (h *DeployHandler) serveCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			h.Printf("could not create instance: %v", err)
-			state.Err = err
+			switch e := err.(type) {
+			case instanceExistsError:
+				state.Err = fmt.Sprintf("%v %v", e, helpDeleteInstance)
+			case projectIDError:
+				state.Err = fmt.Sprintf("%v", e)
+			default:
+				state.Err = fmt.Sprintf("%v. %v", err, fileIssue(br.String()))
+			}
 		} else {
 			state.InstAddr = addr(inst)
 			state.Success = true
-			state.CertFingerprint = depl.CertFingerprint()
+			state.CertFingerprintSHA1 = depl.certFingerprints["SHA-1"]
+			state.CertFingerprintSHA256 = depl.certFingerprints["SHA-256"]
 		}
 		if err := h.recordState(br, state); err != nil {
 			h.Printf("Could not record creation state for %v: %v", br, err)
@@ -346,6 +483,62 @@ func (h *DeployHandler) serveCallback(w http.ResponseWriter, r *http.Request) {
 	h.serveProgress(w, br)
 }
 
+// serveOldInstance looks on GCE for an instance such as defined in depl.Conf, and if
+// found, serves the appropriate page depending on whether the instance is usable. It does
+// not serve anything if the instance is not found.
+func (h *DeployHandler) serveOldInstance(w http.ResponseWriter, br blob.Ref, depl *Deployer) (found bool) {
+	if inst, err := depl.Get(); err == nil {
+		var sigs map[string]string
+		cert, _, err := depl.getInstalledTLS()
+		if err == nil {
+			sigs, err = httputil.CertFingerprints(cert)
+			if err != nil {
+				err = fmt.Errorf("could not get fingerprints of certificate: %v", err)
+			}
+		}
+		if err != nil {
+			h.Printf("Instance (%v, %v, %v) already exists, but error getting its certificate: %v",
+				depl.Conf.Project, depl.Conf.Name, depl.Conf.Zone, err)
+			h.serveError(w,
+				fmt.Errorf("Instance already running at %v. You need to manually delete the old one before creating a new one.", addr(inst)),
+				helpDeleteInstance,
+			)
+			return true
+		}
+		password := depl.Conf.Password
+		for _, item := range inst.Metadata.Items {
+			if item.Key == "camlistore-password" {
+				password = item.Value
+			}
+		}
+		if password != depl.Conf.Password {
+			h.Printf("Instance (%v, %v, %v) already exists, but with different password: %v",
+				depl.Conf.Project, depl.Conf.Name, depl.Conf.Zone, password)
+			h.serveError(w,
+				fmt.Errorf("Instance already running at %v. You need to manually delete the old one before creating a new one.", addr(inst)),
+				helpDeleteInstance,
+			)
+			return true
+		}
+		h.Printf("Reusing existing instance for (%v, %v, %v)", depl.Conf.Project, depl.Conf.Name, depl.Conf.Zone)
+
+		if err := h.recordState(br, &creationState{
+			InstConf:              br,
+			InstAddr:              addr(inst),
+			CertFingerprintSHA1:   sigs["SHA-1"],
+			CertFingerprintSHA256: sigs["SHA-256"],
+			Exists:                true,
+		}); err != nil {
+			h.Printf("Could not record creation state for %v: %v", br, err)
+			h.serveError(w, fmt.Errorf("An error occurred while recording the state of your instance. %v", fileIssue(br.String())))
+			return true
+		}
+		h.serveProgress(w, br)
+		return true
+	}
+	return false
+}
+
 func (h *DeployHandler) serveFormError(w http.ResponseWriter, err error, hints ...string) {
 	var topHints []string
 	for _, v := range hints {
@@ -355,14 +548,20 @@ func (h *DeployHandler) serveFormError(w http.ResponseWriter, err error, hints .
 	h.tplMu.RLock()
 	defer h.tplMu.RUnlock()
 	if tplErr := h.tpl.ExecuteTemplate(w, "withform", &TemplateData{
-		Prefix:   h.prefix,
-		Help:     h.help,
-		Err:      err,
-		Hints:    topHints,
-		Defaults: formDefaults,
+		Prefix:        h.prefix,
+		Help:          h.help,
+		Err:           err,
+		Hints:         topHints,
+		Defaults:      formDefaults,
+		ZoneValues:    h.zoneValues(),
+		MachineValues: machineValues,
 	}); tplErr != nil {
 		h.Printf("Could not serve form error %q because: %v", err, tplErr)
 	}
+}
+
+func fileIssue(br string) string {
+	return fmt.Sprintf("Please file an issue with your instance key (%v) at https://camlistore.org/issue", br)
 }
 
 // serveInstanceState serves the state of the requested Google Cloud Engine VM creation
@@ -384,27 +583,30 @@ func (h *DeployHandler) serveInstanceState(w http.ResponseWriter, r *http.Reques
 		httputil.ServeError(w, r, fmt.Errorf("could not json decode instance state: %v", err))
 		return
 	}
-	if state.Err != nil {
+	if state.Err != "" {
 		// No need to log that error here since we're already doing it in serveCallback
-		h.serveError(w, fmt.Errorf("An error occurred while creating your instance: %q. Please file an issue with your instance key (%v) at https://camlistore.org/issue", state.Err, br))
+		// TODO(mpl): fix overescaping of double quotes.
+		h.serveError(w, fmt.Errorf("An error occurred while creating your instance: %q. ", state.Err))
 		return
 	}
-	if state.Success {
+	if state.Success || state.Exists {
 		conf, err := h.instanceConf(state.InstConf)
 		if err != nil {
 			h.Printf("Could not get parameters for success message: %v", err)
-			h.serveError(w, fmt.Errorf("Your instance was created and should soon be up at https://%s but there might have been a problem in the creation process. Please file an issue with your instance key (%v) at https://camlistore.org/issue", state.Err, br))
+			h.serveError(w, fmt.Errorf("Your instance was created and should soon be up at https://%s but there might have been a problem in the creation process. %v", state.Err, fileIssue(br)))
 			return
 		}
 		h.serveSuccess(w, &TemplateData{
-			Prefix:            h.prefix,
-			Help:              h.help,
-			InstanceIP:        state.InstAddr,
-			ProjectConsoleURL: fmt.Sprintf("%s/project/%s/compute", ConsoleURL, conf.Project),
-			Hostname:          conf.Hostname,
-			CertFingerprint:   state.CertFingerprint,
-			Project:           conf.Project,
-			Defaults:          formDefaults,
+			Prefix:                h.prefix,
+			Help:                  h.help,
+			InstanceIP:            state.InstAddr,
+			ProjectConsoleURL:     fmt.Sprintf("%s/project/%s/compute", ConsoleURL, conf.Project),
+			Conf:                  conf,
+			CertFingerprintSHA1:   state.CertFingerprintSHA1,
+			CertFingerprintSHA256: state.CertFingerprintSHA256,
+			Defaults:              formDefaults,
+			ZoneValues:            h.zoneValues(),
+			MachineValues:         machineValues,
 		})
 		return
 	}
@@ -412,7 +614,7 @@ func (h *DeployHandler) serveInstanceState(w http.ResponseWriter, r *http.Reques
 	defer h.recordStateErrMu.RUnlock()
 	if _, ok := h.recordStateErr[br]; ok {
 		// No need to log that error here since we're already doing it in serveCallback
-		h.serveError(w, fmt.Errorf("An error occurred while recording the state of your instance. Please file an issue with your instance key (%v) at https://camlistore.org/issue", br))
+		h.serveError(w, fmt.Errorf("An error occurred while recording the state of your instance. %v", fileIssue(br)))
 		return
 	}
 	fmt.Fprintf(w, "running")
@@ -427,7 +629,7 @@ func (h *DeployHandler) serveProgress(w http.ResponseWriter, instanceKey blob.Re
 	if err := h.tpl.ExecuteTemplate(w, "withform", &TemplateData{
 		Prefix:      h.prefix,
 		InstanceKey: instanceKey.String(),
-		Piggygif:    h.piggygif,
+		PiggyGIF:    h.piggyGIF,
 	}); err != nil {
 		h.Printf("Could not serve progress: %v", err)
 	}
@@ -478,20 +680,43 @@ func formValueOrDefault(r *http.Request, formField, defValue string) string {
 	return val
 }
 
-func confFromForm(r *http.Request) (*InstanceConf, error) {
+func (h *DeployHandler) confFromForm(r *http.Request) (*InstanceConf, error) {
 	project := r.FormValue("project")
 	if project == "" {
 		return nil, errors.New("missing project parameter")
+	}
+	zone := formValueOrDefault(r, "zone", Zone)
+	// heuristics for region vs zone: region has 1 dash in it, while zone has 2.
+	switch dash := strings.Count(zone, "-"); dash {
+	case 1:
+		zone = h.randomZone(zone)
+	case 2:
+	default:
+		return nil, errors.New("invalid zone")
 	}
 	return &InstanceConf{
 		Name:     formValueOrDefault(r, "name", InstanceName),
 		Project:  project,
 		Machine:  formValueOrDefault(r, "machine", Machine),
-		Zone:     formValueOrDefault(r, "zone", Zone),
+		Zone:     zone,
 		Hostname: formValueOrDefault(r, "hostname", "localhost"),
 		SSHPub:   formValueOrDefault(r, "sshPub", ""),
+		Password: formValueOrDefault(r, "password", project),
 		Ctime:    time.Now(),
 	}, nil
+}
+
+// randomZone picks one of the zone suffixes for region and returns it
+// appended to region, as a fully-qualified zone name.
+// If the given region is invalid, the default Zone is returned instead.
+func (h *DeployHandler) randomZone(region string) string {
+	h.zonesMu.RLock()
+	defer h.zonesMu.RUnlock()
+	zones, ok := h.zones[region]
+	if !ok {
+		return Zone
+	}
+	return region + zones[rand.Intn(len(zones))]
 }
 
 func (h *DeployHandler) SetLogger(logger *log.Logger) {
@@ -583,12 +808,13 @@ func addr(inst *compute.Instance) string {
 // creationState keeps information all along the creation process of the instance. The
 // fields are only exported because we json encode them.
 type creationState struct {
-	Err             error     // if non nil, creation failed.
-	Ctime           time.Time // so we can drop each creationState from the state kv after a while.
-	InstConf        blob.Ref  // key to the user provided instance configuration.
-	InstAddr        string    // ip address of the instance.
-	CertFingerprint string    // SHA256 prefix fingerprint of the self-signed HTTPS certificate.
-	Success         bool      // whether creation was successful.
+	Err                   string   `json:",omitempty"` // if non blank, creation failed.
+	InstConf              blob.Ref // key to the user provided instance configuration.
+	InstAddr              string   // ip address of the instance.
+	CertFingerprintSHA1   string   // SHA-1 prefix fingerprint of the self-signed HTTPS certificate.
+	CertFingerprintSHA256 string   // SHA-256 prefix fingerprint of the self-signed HTTPS certificate.
+	Success               bool     // whether new instance creation was successful.
+	Exists                bool     // true if an instance with same zone, same project name, and same instance name already exists.
 }
 
 // dataStores returns the blobserver that stores the instances configurations, and the kv
@@ -599,7 +825,7 @@ func dataStores() (blobserver.Storage, sorted.KeyValue, error) {
 	}
 	dataDir := os.Getenv("CAMLI_GCE_DATA")
 	if dataDir == "" {
-		dataDir = "camli-data"
+		dataDir = "camli-gce-data"
 		log.Printf("data dir not provided as env var CAMLI_GCE_DATA, so defaulting to %v", dataDir)
 	}
 	blobsDir := filepath.Join(dataDir, "instance-conf")
@@ -633,19 +859,21 @@ func (h *DeployHandler) AddTemplateTheme(text string) error {
 
 // TemplateData is the data passed for templates of tplHTML.
 type TemplateData struct {
-	Title             string
-	Help              map[string]template.HTML // help bits within the form.
-	Hints             []string                 // helping hints printed in case of an error.
-	Defaults          map[string]string        // defaults values for the form fields.
-	Err               error
-	Prefix            string // handler prefix.
-	InstanceKey       string // instance creation identifier, for the JS code to regularly poll for progress.
-	Piggygif          string // URI to the piggy gif for progress animation.
-	Project           string // Project name provided by the user.
-	Hostname          string // FQDN provided by the user.
-	InstanceIP        string // instance IP address that we display after successful creation.
-	CertFingerprint   string // SHA-256 fingerprint of the self-signed HTTPS certificate.
-	ProjectConsoleURL string
+	Title                 string
+	Help                  map[string]template.HTML // help bits within the form.
+	Hints                 []string                 // helping hints printed in case of an error.
+	Defaults              map[string]string        // defaults values for the form fields.
+	Err                   error
+	Prefix                string        // handler prefix.
+	InstanceKey           string        // instance creation identifier, for the JS code to regularly poll for progress.
+	PiggyGIF              string        // URI to the piggy gif for progress animation.
+	Conf                  *InstanceConf // Configuration requested by the user
+	InstanceIP            string        // instance IP address that we display after successful creation.
+	CertFingerprintSHA1   string        // SHA-1 fingerprint of the self-signed HTTPS certificate.
+	CertFingerprintSHA256 string        // SHA-256 fingerprint of the self-signed HTTPS certificate.
+	ProjectConsoleURL     string
+	ZoneValues            []string
+	MachineValues         []string
 }
 
 const toHyperlink = `<a href="$1$3">$1$3</a>`
@@ -703,10 +931,10 @@ var tplHTML = `
 		imgDiv.style.overflow = 'hidden';
 
 		var img = document.createElement('img');
-		img.src = {{.Piggygif}};
+		img.src = {{.PiggyGIF}};
 
 		var msg = document.createElement('span');
-		msg.innerHTML = 'Please wait (up to a couple of minutes) while piggy creates your instance...';
+		msg.innerHTML = 'Please wait (up to a couple of minutes) while we create your instance...';
 		msg.style.boxSizing = 'border-box';
 		msg.style.color = '#444';
 		msg.style.display = 'block';
@@ -752,18 +980,34 @@ var tplHTML = `
 	<h1><a href="{{.Prefix}}">Camlistore on Google Cloud</a></h1>
 
 	{{if .InstanceIP}}
-		<p>Creation successful. Your Camlistore instance should soon be up at <a href="https://{{.InstanceIP}}">https://{{.InstanceIP}}</a></p>
-	{{end}}
-	{{if .ProjectConsoleURL}}
-		<p>Manage your instance at <a href="{{.ProjectConsoleURL}}">{{.ProjectConsoleURL}}</a></p>
-	{{end}}
-	{{if and .InstanceIP (and .Project (and .Hostname .CertFingerprint))}}
+		<p>Success. Your Camlistore instance should be up at <a href="https://{{.InstanceIP}}">https://{{.InstanceIP}}</a>. It can take a couple of minutes to be ready.</p>
+		<p>Please save the information on this page in case you need to come back for the instruction.</p>
+
+		<h4>First connection</h4>
 		<p>
-		A self-signed HTTPS certificate was automatically generated with "{{.Hostname}}" as the common name.<br>
-		You will need to add an exception for it in your browser when you get a security warning the first time you connect. At which point you should check that the prefix of the SHA-256 fingerprint of the certificate is indeed <code style="color:blue">{{.CertFingerprint}}</code>.
+		A self-signed HTTPS certificate was automatically generated with "{{.Conf.Hostname}}" as the common name.<br>
+		You will need to add an exception for it in your browser when you get a security warning the first time you connect. At which point you should check that the certificate fingerprint matches one of:
+		<table>
+			<tr><td align=right>SHA-1</td><td><code style="color:blue">{{.CertFingerprintSHA1}}</code></td></tr>
+			<tr><td align=right>SHA-256</td><td><code style="color:blue">{{.CertFingerprintSHA256}}</code></td></tr>
+		</table>
 		</p>
+
+		<h4>Further configuration</h4>
 		<p>
-		If you want to use your own HTTPS certificate and key: {{printf (print .Help.changeCert) .Project}} Then <a href="https://{{.InstanceIP}}/status">restart</a> Camlistore.
+		Manage your instance at <a href="{{.ProjectConsoleURL}}">{{.ProjectConsoleURL}}</a>.
+		</p>
+
+		<p>
+		To change your login and password, go to the <a href="{{.ProjectConsoleURL}}/instancesDetail/zones/{{.Conf.Zone}}/instances/camlistore-server">camlistore-server instance</a> page. Set camlistore-username and/or camlistore-password in the custom metadata section. Then <a href="https://{{.InstanceIP}}/status">restart</a> Camlistore.
+		</p>
+
+		<p>
+		If you want to use your own HTTPS certificate and key, go to <a href="https://console.developers.google.com/project/{{.Conf.Project}}/storage/browser/{{.Conf.Project}}-camlistore/config/">the storage browser</a>. Delete "<b>` + certFilename + `</b>", "<b>` + keyFilename + `</b>", and replace them by uploading your own files (with the same names). Then <a href="https://{{.InstanceIP}}/status">restart</a> Camlistore.
+		</p>
+
+		<p>
+		To manage/add SSH keys, go to the <a href="{{.ProjectConsoleURL}}/instancesDetail/zones/{{.Conf.Zone}}/instances/camlistore-server">camlistore-server instance</a> page. Scroll down to the SSH Keys section.
 		</p>
 	{{end}}
 	{{if .Err}}
@@ -788,24 +1032,46 @@ var tplHTML = `
 	<form method="post" enctype="multipart/form-data">
 		<input type='hidden' name="mode" value="setupproject">
 
-		<h3>Create a new Google Cloud project</h3>
+		<h3>Deploy Camlistore on Google Cloud</h3>
 
-		<p> {{.Help.createProject}} </p>
-		<p> {{.Help.enableAPIs}} </p>
-
-		<h3>Configure Google Compute Engine</h3>
-
-		<p> {{.Help.genCert}} </p>
+		<p>
+This tool helps you create your own private Camlistore instance running on Google's cloud. Be sure to understand <a href="https://cloud.google.com/compute/pricing#machinetype">Google Compute Engine's pricing</a> before proceeding. To delete your instance and stop paying Google for the virtual machine, visit the <a href="https://console.developers.google.com/">Google Cloud console</a>.
+		</p>
 
 		<table border=0 cellpadding=3>
-			<tr><td align=right>Project name</td><td><input name="project" size=50 value=""></td></tr>
-			<tr><td align=right><a href="{{.Help.domainName}}">Domain name</a></td><td><input name="hostname" size=50 value=""></td></tr>
-			<tr><td align=right><a href="{{.Help.zones}}">Zone</a></td><td><input name="zone" size=50 value="{{.Defaults.zone}}"></td></tr>
-			<tr><td align=right>Instance name</td><td><input name="name" size=50 value="{{.Defaults.name}}"></td></tr>
-			<tr><td align=right><a href="{{.Help.machineTypes}}">Machine type</a></td><td><input name="machine" size=50 value="{{.Defaults.machine}}"></td></tr>
-			<tr><td align=right><a href="{{.Help.ssh}}">SSH public key</a></td><td><input name="sshPub" size=50 value=""></td></tr>
+			<tr valign=top><td align=right>Project ID</td><td margin=left><input name="project" size=30 value=""><br>
+		<ul style="padding-left:0;margin-left:0;font-size:75%">
+			<li>Select a <a href="` + ConsoleURL + `">Google Project</a> in which to create the VM. If it doesn't already exist, <a href="` + ConsoleURL + `">create it</a> first before using this Camlistore creation tool.</li>
+			<li>Requirements:</li>
+			<ul>
+				<li>Enable billing. (Billing & settings)</li>
+				<li>APIs and auth &gt APIs &gt Google Cloud Storage</li>
+				<li>APIs and auth &gt APIs &gt Google Cloud Storage JSON API</li>
+				<li>APIs and auth &gt APIs &gt Google Compute Engine</li>
+				<li>APIs and auth &gt APIs &gt Google Cloud Logging API</li>
+			</ul>
+		</ul>
+		</td></tr>
+			<tr><td align=right>New password</td><td><input name="password" size=30 value="{{.Defaults.password}}"></td><td></td></tr>
+			<tr><td align=right></td><td style="font-size:75%">New password for your Camlistore server.</td><td></td></tr>
+			<tr><td align=right><a href="{{.Help.zones}}">Zone</a></td><td>
+				<input name="zone" list="regions" value="` + Zone + `">
+				<datalist id="regions">
+				{{range $k, $v := .ZoneValues}}
+					<option value={{$v}}>{{$v}}</option>
+				{{end}}
+				</datalist>
+			</td></tr>
+			<tr><td align=right><a href="{{.Help.machineTypes}}">Machine type</a></td><td>
+				<input name="machine" list="machines" value="g1-small">
+				<datalist id="machines">
+				{{range $k, $v := .MachineValues}}
+					<option value={{$v}}>{{$v}}</option>
+				{{end}}
+				</datalist>
+			</td></tr>
+			<tr><td></td><td><input type='submit' value="Create instance"><br><span style="font-size:75%">(it will ask for permissions)</span></td></tr>
 		</table>
-		<input type='submit' value="Create instance">
 	</form>
 	</div>
 	{{template "footer" .}}

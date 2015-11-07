@@ -31,10 +31,12 @@ import (
 // MaxBlobSize is the size of a single blob in Camlistore.
 const MaxBlobSize = constants.MaxBlobSize
 
-var ErrCorruptBlob = errors.New("corrupt blob; digest doesn't match")
+var (
+	ErrCorruptBlob = errors.New("corrupt blob; digest doesn't match")
 
-// ErrNotImplemented should be returned in methods where the function is not implemented
-var ErrNotImplemented = errors.New("not implemented")
+	// ErrNotImplemented should be returned in methods where the function is not implemented
+	ErrNotImplemented = errors.New("not implemented")
+)
 
 // BlobReceiver is the interface for receiving
 type BlobReceiver interface {
@@ -193,6 +195,21 @@ type StorageHandler interface {
 type ShutdownStorage interface {
 	Storage
 	io.Closer
+}
+
+// WholeRefFetcher is an optional fast-path interface exposed by the
+// 'blobpacked' blob storage implementation, which packs pieces of
+// files together and can efficiently serve them contigously.
+type WholeRefFetcher interface {
+	// OpenWholeRef returns a ReadCloser reading from offset bytes
+	// into wholeRef (the blobref of an entire file).
+	//
+	// The returned wholeSize is the size of the file, without
+	// subtracting any offset.
+	//
+	// The err will be os.ErrNotExist if the wholeref is not
+	// known.
+	OpenWholeRef(wholeRef blob.Ref, offset int64) (rc io.ReadCloser, wholeSize int64, err error)
 }
 
 // A GenerationNotSupportedError explains why a Storage

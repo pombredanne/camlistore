@@ -36,8 +36,20 @@ import (
 	"time"
 
 	"camlistore.org/pkg/deploy/gce"
+	"camlistore.org/pkg/netutil"
 	"camlistore.org/pkg/types/camtypes"
+
+	"camlistore.org/third_party/github.com/russross/blackfriday"
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+
+	"google.golang.org/cloud"
+	"google.golang.org/cloud/compute/metadata"
+	"google.golang.org/cloud/logging"
 )
+
+const usingCamlistoreCopy = logging.IsCamlistoreDevFork
 
 const defaultAddr = ":31798" // default webserver address
 
@@ -54,6 +66,10 @@ var (
 	buildbotBackend = flag.String("buildbot_backend", "", "Build bot status backend URL")
 	buildbotHost    = flag.String("buildbot_host", "", "Hostname to map to the buildbot_backend. If an HTTP request with this hostname is received, it proxies to buildbot_backend.")
 	alsoRun         = flag.String("also_run", "", "Optional path to run as a child process. (Used to run camlistore.org's ./scripts/run-blob-server)")
+
+	gceProjectID = flag.String("gce_project_id", "", "GCE project ID; required if not running on GCE and gce_log_name is specified.")
+	gceLogName   = flag.String("gce_log_name", "", "GCE Cloud Logging log name; if non-empty, logs go to Cloud Logging instead of Apache-style local disk log files")
+	gceJWTFile   = flag.String("gce_jwt_file", "", "If non-empty, a filename to the GCE Service Account's JWT (JSON) config file.")
 
 	pageHTML, errorHTML, camliErrorHTML *template.Template
 	packageHTML                         *txttemplate.Template
@@ -266,6 +282,8 @@ func serveFile(rw http.ResponseWriter, req *http.Request, relPath, absPath strin
 		return
 	}
 
+	data = blackfriday.MarkdownCommon(data)
+
 	title := ""
 	if m := h1TitlePattern.FindSubmatch(data); len(m) > 1 {
 		title = string(m[1])
@@ -326,8 +344,30 @@ func runAsChild(res string) {
 	}()
 }
 
-func gceDeployHandler(host, prefix string) http.Handler {
-	gceh, err := gce.NewDeployHandler(host, prefix)
+// gceDeployHandler conditionally returns an http.Handler for a GCE launcher,
+// configured to run at /prefix/ (the trailing slash can be omitted).
+// If CAMLI_GCE_CLIENTID is not set, the launcher-config.json file, if present,
+// is used instead of environment variables to initialize the launcher. If a
+// launcher isn't enabled, gceDeployHandler returns nil. If another error occurs,
+// log.Fatal is called.
+func gceDeployHandler(prefix string) http.Handler {
+	hostPort, err := netutil.HostPort("https://" + *httpsAddr)
+	if err != nil {
+		hostPort = "camlistore.org:443"
+	}
+	var gceh http.Handler
+	if e := os.Getenv("CAMLI_GCE_CLIENTID"); e != "" {
+		gceh, err = gce.NewDeployHandler(hostPort, prefix)
+	} else {
+		config := filepath.Join(*root, "launcher-config.json")
+		if _, err := os.Stat(config); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			log.Fatalf("Could not stat launcher-config.json: %v", err)
+		}
+		gceh, err = gce.NewDeployHandlerFromConfig(hostPort, prefix, config)
+	}
 	if err != nil {
 		log.Fatalf("Error initializing gce deploy handler: %v", err)
 	}
@@ -338,6 +378,7 @@ func gceDeployHandler(host, prefix string) http.Handler {
 	if err := gceh.(*gce.DeployHandler).AddTemplateTheme(string(pageBytes)); err != nil {
 		log.Fatalf("Error initializing gce deploy handler: %v", err)
 	}
+	log.Printf("Starting Camlistore launcher on https://%s%s", hostPort, prefix)
 	return gceh
 }
 
@@ -363,6 +404,7 @@ func main() {
 	mux.HandleFunc(errPattern, errHandler)
 
 	mux.HandleFunc("/r/", gerritRedirect)
+	mux.HandleFunc("/dl/", releaseRedirect)
 	mux.HandleFunc("/debugz/ip", ipHandler)
 	mux.Handle("/docs/contributing", redirTo("/code#contributing"))
 	mux.Handle("/lists", redirTo("/community"))
@@ -381,14 +423,54 @@ func main() {
 	}
 
 	if *httpsAddr != "" {
-		if e := os.Getenv("CAMLI_GCE_CLIENTID"); e != "" {
-			mux.Handle("/launch/", gceDeployHandler(*httpsAddr, "/launch/"))
+		if launcher := gceDeployHandler("/launch/"); launcher != nil {
+			mux.Handle("/launch/", launcher)
 		}
 	}
 
 	var handler http.Handler = &noWwwHandler{Handler: mux}
 	if *logDir != "" || *logStdout {
-		handler = NewLoggingHandler(handler, *logDir, *logStdout)
+		handler = NewLoggingHandler(handler, NewApacheLogger(*logDir, *logStdout))
+	}
+	if *gceLogName != "" {
+		projID := *gceProjectID
+		if projID == "" {
+			if v, err := metadata.ProjectID(); v == "" || err != nil {
+				log.Fatalf("Use of --gce_log_name without specifying --gce_project_id (and not running on GCE); metadata error: %v", err)
+			} else {
+				projID = v
+			}
+		}
+		var hc *http.Client
+		if *gceJWTFile != "" {
+			jsonSlurp, err := ioutil.ReadFile(*gceJWTFile)
+			if err != nil {
+				log.Fatalf("Error reading --gce_jwt_file value: %v", err)
+			}
+			jwtConf, err := google.JWTConfigFromJSON(jsonSlurp, logging.Scope)
+			if err != nil {
+				log.Fatalf("Error reading --gce_jwt_file value: %v", err)
+			}
+			hc = jwtConf.Client(context.Background())
+		} else {
+			if !metadata.OnGCE() {
+				log.Fatal("No --gce_jwt_file and not running on GCE.")
+			}
+			var err error
+			hc, err = google.DefaultClient(oauth2.NoContext)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+		ctx := cloud.NewContext(projID, hc)
+		logc, err := logging.NewClient(ctx, *gceLogName)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := logc.Ping(); err != nil {
+			log.Fatalf("Failed to ping Google Cloud Logging: %v", err)
+		}
+		handler = NewLoggingHandler(handler, gceLogger{logc})
 	}
 
 	errc := make(chan error)
@@ -442,6 +524,14 @@ func issueRedirect(urlPath string) (string, bool) {
 func gerritRedirect(w http.ResponseWriter, r *http.Request) {
 	dest := "https://camlistore-review.googlesource.com/"
 	if len(r.URL.Path) > len("/r/") {
+		dest += r.URL.Path[1:]
+	}
+	http.Redirect(w, r, dest, http.StatusFound)
+}
+
+func releaseRedirect(w http.ResponseWriter, r *http.Request) {
+	dest := "https://storage.googleapis.com/camlistore-release/"
+	if len(r.URL.Path) > len("/dl/") {
 		dest += r.URL.Path[1:]
 	}
 	http.Redirect(w, r, dest, http.StatusFound)

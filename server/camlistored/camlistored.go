@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"camlistore.org/pkg/buildinfo"
+	"camlistore.org/pkg/env"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/legal/legalprint"
 	"camlistore.org/pkg/netutil"
@@ -44,8 +45,7 @@ import (
 	"camlistore.org/pkg/wkfs"
 
 	// VM environments:
-	_ "camlistore.org/pkg/osutil/gce"
-	"camlistore.org/third_party/github.com/bradfitz/gce"
+	"camlistore.org/pkg/osutil/gce" // for init side-effects + LogWriter
 
 	// Storage options:
 	_ "camlistore.org/pkg/blobserver/blobpacked"
@@ -322,6 +322,10 @@ func Main(up chan<- struct{}, down <-chan struct{}) {
 	if legalprint.MaybePrint(os.Stderr) {
 		return
 	}
+	if env.OnGCE() {
+		log.SetOutput(gce.LogWriter())
+	}
+
 	if *flagReindex {
 		index.SetImpendingReindex()
 	}
@@ -400,7 +404,7 @@ func Main(up chan<- struct{}, down <-chan struct{}) {
 	}
 	log.Printf("Available on %s", urlToOpen)
 
-	if gce.OnGCE() && strings.HasPrefix(baseURL, "https://") {
+	if env.OnGCE() && strings.HasPrefix(baseURL, "https://") {
 		go redirectFromHTTP(baseURL)
 	}
 

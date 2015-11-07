@@ -31,6 +31,7 @@ import (
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/buildinfo"
 	"camlistore.org/pkg/client/android"
+	"camlistore.org/pkg/env"
 	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/jsonsign"
 	"camlistore.org/pkg/osutil"
@@ -294,8 +295,7 @@ func (c *Client) serverOrDefault() string {
 }
 
 func (c *Client) useTLS() bool {
-	// TODO(mpl): I think this might be wrong, because sometimes c.server is not the one being used?
-	return strings.HasPrefix(c.server, "https://")
+	return strings.HasPrefix(c.discoRoot(), "https://")
 }
 
 // SetupAuth sets the client's authMode. It tries from the environment first if we're on android or in dev mode, and then from the client configuration.
@@ -311,7 +311,7 @@ func (c *Client) SetupAuth() error {
 	// env var takes precedence, but only if we're in dev mode or on android.
 	// Too risky otherwise.
 	if android.OnAndroid() ||
-		os.Getenv("CAMLI_DEV_CAMLI_ROOT") != "" ||
+		env.IsDev() ||
 		configDisabled {
 		authMode, err := auth.FromEnv()
 		if err == nil {

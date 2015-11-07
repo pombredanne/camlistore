@@ -68,6 +68,7 @@ type Client struct {
 	storageGen     string      // storage generation, or "" if not reported
 	syncHandlers   []*SyncInfo // "from" and "to" url prefix for each syncHandler
 	serverKeyID    string      // Server's GPG public key ID.
+	helpRoot       string      // Handler prefix, or "" if none
 
 	signerOnce sync.Once
 	signer     *schema.Signer
@@ -197,18 +198,14 @@ func (c *Client) TransportForConfig(tc *TransportConfig) http.RoundTripper {
 	if c == nil {
 		return nil
 	}
-	tlsConfig, err := c.TLSConfig()
-	if err != nil {
-		log.Fatalf("Error while configuring TLS for client: %v", err)
-	}
 	var transport http.RoundTripper
 	proxy := http.ProxyFromEnvironment
 	if tc != nil && tc.Proxy != nil {
 		proxy = tc.Proxy
 	}
 	transport = &http.Transport{
+		DialTLS:             c.DialTLSFunc(),
 		Dial:                c.DialFunc(),
-		TLSClientConfig:     tlsConfig,
 		Proxy:               proxy,
 		MaxIdleConnsPerHost: maxParallelHTTP,
 	}
@@ -351,6 +348,9 @@ func (c *Client) Stats() Stats {
 // ErrNoSearchRoot is returned by SearchRoot if the server doesn't support search.
 var ErrNoSearchRoot = errors.New("client: server doesn't support search")
 
+// ErrNoHelpRoot is returned by HelpRoot if the server doesn't have a help handler.
+var ErrNoHelpRoot = errors.New("client: server does not have a help handler")
+
 // ErrNoSigning is returned by ServerKeyID if the server doesn't support signing.
 var ErrNoSigning = fmt.Errorf("client: server doesn't support signing")
 
@@ -399,6 +399,19 @@ func (c *Client) SearchRoot() (string, error) {
 	return c.searchRoot, nil
 }
 
+// HelpRoot returns the server's help handler.
+// If the server isn't running a help handler, the error will be
+// ErrNoHelpRoot.
+func (c *Client) HelpRoot() (string, error) {
+	if err := c.condDiscovery(); err != nil {
+		return "", err
+	}
+	if c.helpRoot == "" {
+		return "", ErrNoHelpRoot
+	}
+	return c.helpRoot, nil
+}
+
 // StorageGeneration returns the server's unique ID for its storage
 // generation, reset whenever storage is reset, moved, or partially
 // lost.
@@ -440,9 +453,9 @@ func (c *Client) SyncHandlers() ([]*SyncInfo, error) {
 	return c.syncHandlers, nil
 }
 
-var _ search.IGetRecentPermanodes = (*Client)(nil)
+var _ search.GetRecentPermanoder = (*Client)(nil)
 
-// GetRecentPermanodes implements search.IGetRecentPermanodes against a remote server over HTTP.
+// GetRecentPermanodes implements search.GetRecentPermanoder against a remote server over HTTP.
 func (c *Client) GetRecentPermanodes(req *search.RecentRequest) (*search.RecentResponse, error) {
 	sr, err := c.SearchRoot()
 	if err != nil {
@@ -725,67 +738,59 @@ func (c *Client) doDiscovery() error {
 		return err
 	}
 
-	// TODO: make a proper struct type for this in another package somewhere:
-	m := make(map[string]interface{})
-	if err := httputil.DecodeJSON(res, &m); err != nil {
+	var disco camtypes.Discovery
+	if err := httputil.DecodeJSON(res, &disco); err != nil {
 		return err
 	}
 
-	searchRoot, ok := m["searchRoot"].(string)
-	if ok {
-		u, err := root.Parse(searchRoot)
-		if err != nil {
-			return fmt.Errorf("client: invalid searchRoot %q; failed to resolve", searchRoot)
-		}
-		c.searchRoot = u.String()
+	u, err := root.Parse(disco.SearchRoot)
+	if err != nil {
+		return fmt.Errorf("client: invalid searchRoot %q; failed to resolve", disco.SearchRoot)
 	}
+	c.searchRoot = u.String()
 
-	downloadHelper, ok := m["downloadHelper"].(string)
-	if ok {
-		u, err := root.Parse(downloadHelper)
-		if err != nil {
-			return fmt.Errorf("client: invalid downloadHelper %q; failed to resolve", downloadHelper)
-		}
-		c.downloadHelper = u.String()
+	u, err = root.Parse(disco.HelpRoot)
+	if err != nil {
+		return fmt.Errorf("client: invalid helpRoot %q; failed to resolve", disco.HelpRoot)
 	}
+	c.helpRoot = u.String()
 
-	c.storageGen, _ = m["storageGeneration"].(string)
+	c.storageGen = disco.StorageGeneration
 
-	blobRoot, ok := m["blobRoot"].(string)
-	if !ok {
-		return fmt.Errorf("No blobRoot in config discovery response")
-	}
-	u, err := root.Parse(blobRoot)
+	u, err = root.Parse(disco.BlobRoot)
 	if err != nil {
 		return fmt.Errorf("client: error resolving blobRoot: %v", err)
 	}
 	c.prefixv = strings.TrimRight(u.String(), "/")
 
-	syncHandlers, ok := m["syncHandlers"].([]interface{})
-	if ok {
-		for _, v := range syncHandlers {
-			vmap := v.(map[string]interface{})
-			from := vmap["from"].(string)
-			ufrom, err := root.Parse(from)
+	if disco.UIDiscovery != nil {
+		u, err = root.Parse(disco.DownloadHelper)
+		if err != nil {
+			return fmt.Errorf("client: invalid downloadHelper %q; failed to resolve", disco.DownloadHelper)
+		}
+		c.downloadHelper = u.String()
+	}
+
+	if disco.SyncHandlers != nil {
+		for _, v := range disco.SyncHandlers {
+			ufrom, err := root.Parse(v.From)
 			if err != nil {
-				return fmt.Errorf("client: invalid %q \"from\" sync; failed to resolve", from)
+				return fmt.Errorf("client: invalid %q \"from\" sync; failed to resolve", v.From)
 			}
-			to := vmap["to"].(string)
-			uto, err := root.Parse(to)
+			uto, err := root.Parse(v.To)
 			if err != nil {
-				return fmt.Errorf("client: invalid %q \"to\" sync; failed to resolve", to)
+				return fmt.Errorf("client: invalid %q \"to\" sync; failed to resolve", v.To)
 			}
-			toIndex, _ := vmap["toIndex"].(bool)
 			c.syncHandlers = append(c.syncHandlers, &SyncInfo{
 				From:    ufrom.String(),
 				To:      uto.String(),
-				ToIndex: toIndex,
+				ToIndex: v.ToIndex,
 			})
 		}
 	}
-	serverSigning, ok := m["signing"].(map[string]interface{})
-	if ok {
-		c.serverKeyID = serverSigning["publicKeyId"].(string)
+
+	if disco.Signing != nil {
+		c.serverKeyID = disco.Signing.PublicKeyID
 	}
 	return nil
 }
@@ -821,6 +826,8 @@ func (c *Client) Post(url string, bodyType string, body io.Reader) error {
 	return res.Body.Close()
 }
 
+// newRequests creates a request with the authentication header, and with the
+// appropriate scheme and port in the case of self-signed TLS.
 func (c *Client) newRequest(method, url string, body ...io.Reader) *http.Request {
 	var bodyR io.Reader
 	if len(body) > 0 {
@@ -829,7 +836,7 @@ func (c *Client) newRequest(method, url string, body ...io.Reader) *http.Request
 	if len(body) > 1 {
 		panic("too many body arguments")
 	}
-	req, err := http.NewRequest(method, c.condRewriteURL(url), bodyR)
+	req, err := http.NewRequest(method, url, bodyR)
 	if err != nil {
 		panic(err.Error())
 	}
@@ -866,58 +873,37 @@ func (c *Client) insecureTLS() bool {
 	return c.useTLS() && c.InsecureTLS
 }
 
-// selfVerifiedSSL returns whether the client config has fingerprints for
-// (self-signed) trusted certificates.
-// When true, we run with InsecureSkipVerify and it is our responsibility
-// to check the server's cert against our trusted certs.
-func (c *Client) selfVerifiedSSL() bool {
-	return c.useTLS() && len(c.getTrustedCerts()) > 0
-}
-
-// condRewriteURL changes "https://" to "http://" if we are in
-// selfVerifiedSSL mode. We need to do that because we do the TLS
-// dialing ourselves, and we do not want the http transport layer
-// to redo it.
-func (c *Client) condRewriteURL(url string) string {
-	if c.selfVerifiedSSL() || c.insecureTLS() {
-		return strings.Replace(url, "https://", "http://", 1)
-	}
-	return url
-}
-
-// TLSConfig returns the correct tls.Config depending on whether
-// SSL is required, the client's config has some trusted certs,
-// and we're on android.
-func (c *Client) TLSConfig() (*tls.Config, error) {
-	if !c.useTLS() {
-		return nil, nil
-	}
-	trustedCerts := c.getTrustedCerts()
-	if len(trustedCerts) > 0 {
-		return &tls.Config{InsecureSkipVerify: true}, nil
-	}
-	if !android.OnAndroid() {
-		return nil, nil
-	}
-	return android.TLSConfig()
-}
-
-// DialFunc returns the adequate dial function, depending on
-// whether SSL is required, the client's config has some trusted
-// certs, and we're on android.
-// If the client's config has some trusted certs, the server's
-// certificate will be checked against those in the config after
-// the TLS handshake.
+// DialFunc returns the adequate dial function when we're on android.
 func (c *Client) DialFunc() func(network, addr string) (net.Conn, error) {
-	trustedCerts := c.getTrustedCerts()
-	if !c.useTLS() || (!c.InsecureTLS && len(trustedCerts) == 0) {
-		// No TLS, or TLS with normal/full verification
-		if android.IsChild() {
-			return func(network, addr string) (net.Conn, error) {
-				return android.Dial(network, addr)
-			}
-		}
+	if c.useTLS() {
 		return nil
+	}
+	if android.IsChild() {
+		return func(network, addr string) (net.Conn, error) {
+			return android.Dial(network, addr)
+		}
+	}
+	return nil
+}
+
+// DialTLSFunc returns the adequate dial function, when using SSL, depending on
+// whether we're using insecure TLS (certificate verification is disabled), or we
+// have some trusted certs, or we're on android.
+// If the client's config has some trusted certs, the server's certificate will
+// be checked against those in the config after the TLS handshake.
+func (c *Client) DialTLSFunc() func(network, addr string) (net.Conn, error) {
+	if !c.useTLS() {
+		return nil
+	}
+	trustedCerts := c.getTrustedCerts()
+	var stdTLS bool
+	if !c.InsecureTLS && len(trustedCerts) == 0 {
+		// TLS with normal/full verification
+		stdTLS = true
+		if !android.IsChild() {
+			// Not android, so let the stdlib deal with it
+			return nil
+		}
 	}
 
 	return func(network, addr string) (net.Conn, error) {
@@ -928,7 +914,16 @@ func (c *Client) DialFunc() func(network, addr string) (net.Conn, error) {
 			if err != nil {
 				return nil, err
 			}
-			conn = tls.Client(con, &tls.Config{InsecureSkipVerify: true})
+			var tlsConfig *tls.Config
+			if stdTLS {
+				tlsConfig, err = android.TLSConfig()
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				tlsConfig = &tls.Config{InsecureSkipVerify: true}
+			}
+			conn = tls.Client(con, tlsConfig)
 			if err = conn.Handshake(); err != nil {
 				return nil, err
 			}
