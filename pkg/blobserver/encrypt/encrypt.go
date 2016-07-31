@@ -27,7 +27,7 @@ limitations under the License.
 // and configuration details, which are currently subject to change.
 //
 // WARNING: work in progress as of 2013-07-13.
-package encrypt
+package encrypt // import "camlistore.org/pkg/blobserver/encrypt"
 
 import (
 	"bufio"
@@ -43,6 +43,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -51,10 +52,10 @@ import (
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/context"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/types"
+	"go4.org/jsonconfig"
+	"go4.org/types"
+	"golang.org/x/net/context"
 )
 
 // Compaction constants
@@ -231,10 +232,7 @@ func (s *storage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
 		if !ok {
 			continue
 		}
-		if err != nil {
-			continue
-		}
-		dest <- blob.SizedRef{br, plainSize}
+		dest <- blob.SizedRef{Ref: br, Size: plainSize}
 	}
 	return nil
 }
@@ -276,7 +274,7 @@ func (s *storage) ReceiveBlob(plainBR blob.Ref, source io.Reader) (sb blob.Sized
 		return sb, fmt.Errorf("encrypt: error updating index for encrypted %v (plaintext %v): %v", encBR, plainBR, err)
 	}
 
-	return blob.SizedRef{plainBR, uint32(plainSize)}, nil
+	return blob.SizedRef{Ref: plainBR, Size: uint32(plainSize)}, nil
 }
 
 func (s *storage) Fetch(plainBR blob.Ref) (file io.ReadCloser, size uint32, err error) {
@@ -316,7 +314,7 @@ func (s *storage) Fetch(plainBR blob.Ref) (file io.ReadCloser, size uint32, err 
 	if err != nil {
 		return nil, 0, err
 	}
-	size = types.U32(plainSize)
+	size = u32(plainSize)
 	if !plainBR.HashMatches(plainHash) {
 		return nil, 0, blobserver.ErrCorruptBlob
 	}
@@ -326,10 +324,18 @@ func (s *storage) Fetch(plainBR blob.Ref) (file io.ReadCloser, size uint32, err 
 	}{
 		bytes.NewReader(plain.Bytes()),
 		types.NopCloser,
-	}, uint32(plainSize), nil
+	}, size, nil
 }
 
-func (s *storage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+// u32 converts n to an uint32, or panics if n is out of range
+func u32(n int64) uint32 {
+	if n < 0 || n > math.MaxUint32 {
+		panic("bad size " + fmt.Sprint(n))
+	}
+	return uint32(n)
+}
+
+func (s *storage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	defer close(dest)
 	iter := s.index.Find(after, "")
 	n := 0
@@ -346,9 +352,9 @@ func (s *storage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef
 			panic("Bogus encrypt index value: " + iter.Value())
 		}
 		select {
-		case dest <- blob.SizedRef{br, plainSize}:
+		case dest <- blob.SizedRef{Ref: br, Size: plainSize}:
 		case <-ctx.Done():
-			return context.ErrCanceled
+			return ctx.Err()
 		}
 		n++
 		if limit != 0 && n >= limit {
@@ -463,7 +469,7 @@ func (s *storage) readAllMetaBlobs() error {
 		if err != nil {
 			close(stopEnumerate)
 			go func() {
-				for _ = range metac {
+				for range metac {
 				}
 			}()
 			// TODO: advertise in this error message a new option or environment variable

@@ -23,18 +23,20 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 
 	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/jsonsign"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/sorted"
 	"camlistore.org/pkg/types/serverconfig"
-	"camlistore.org/pkg/wkfs"
+	"go4.org/jsonconfig"
+
+	"go4.org/wkfs"
 )
 
 var (
@@ -108,6 +110,9 @@ func (b *lowBuilder) dbName(of string) string {
 		}
 		return "camli" + username
 	}
+	if of == "blobpacked_index" {
+		return of
+	}
 	return ""
 }
 
@@ -132,13 +137,16 @@ func (b *lowBuilder) searchOwner() (br blob.Ref, err error) {
 func (b *lowBuilder) addPublishedConfig(tlsO *tlsOpts) error {
 	published := b.high.Publish
 	for k, v := range published {
+		// trick in case all of the fields of v.App were omitted, which would leave v.App nil.
+		if v.App == nil {
+			v.App = &serverconfig.App{}
+		}
 		if v.CamliRoot == "" {
 			return fmt.Errorf("Missing \"camliRoot\" key in configuration for %s.", k)
 		}
 		if v.GoTemplate == "" {
 			return fmt.Errorf("Missing \"goTemplate\" key in configuration for %s.", k)
 		}
-
 		appConfig := map[string]interface{}{
 			"camliRoot":  v.CamliRoot,
 			"cacheRoot":  v.CacheRoot,
@@ -155,21 +163,53 @@ func (b *lowBuilder) addPublishedConfig(tlsO *tlsOpts) error {
 				appConfig["httpsKey"] = tlsO.httpsKey
 			}
 		}
-		a := args{
-			"program":   v.Program,
-			"appConfig": appConfig,
-		}
-		if v.BaseURL != "" {
-			a["baseURL"] = v.BaseURL
-		}
 		program := "publisher"
 		if v.Program != "" {
 			program = v.Program
 		}
-		a["program"] = program
+		a := args{
+			"prefix":    k,
+			"program":   program,
+			"appConfig": appConfig,
+		}
+		if v.Listen != "" {
+			a["listen"] = v.Listen
+		}
+		if v.APIHost != "" {
+			a["apiHost"] = v.APIHost
+		}
+		if v.BackendURL != "" {
+			a["backendURL"] = v.BackendURL
+		}
+		if b.low["listen"] != nil && b.low["listen"].(string) != "" {
+			a["serverListen"] = b.low["listen"].(string)
+		}
+		if b.low["baseURL"] != nil && b.low["baseURL"].(string) != "" {
+			a["serverBaseURL"] = b.low["baseURL"].(string)
+		}
 		b.addPrefix(k, "app", a)
 	}
 	return nil
+}
+
+func (b *lowBuilder) sortedName() string {
+	switch {
+	case b.high.MySQL != "":
+		return "MySQL"
+	case b.high.PostgreSQL != "":
+		return "PostgreSQL"
+	case b.high.Mongo != "":
+		return "MongoDB"
+	case b.high.MemoryIndex:
+		return "in memory LevelDB"
+	case b.high.SQLite != "":
+		return "SQLite"
+	case b.high.KVFile != "":
+		return "cznic/kv"
+	case b.high.LevelDB != "":
+		return "LevelDB"
+	}
+	panic("internal error: sortedName didn't find a sorted implementation")
 }
 
 // kvFileType returns the file based sorted type defined for index storage, if
@@ -304,7 +344,7 @@ func (b *lowBuilder) sortedStorageAt(sortedType, filePrefix string) (map[string]
 		}, nil
 	}
 	if sortedType != "index" && filePrefix == "" {
-		return nil, fmt.Errorf("internal error: use of sortedStorageAt with a non-index type and no file location for non-database sorted implementation")
+		return nil, fmt.Errorf("internal error: use of sortedStorageAt with a non-index type (%v) and no file location for non-database sorted implementation", sortedType)
 	}
 	// dbFile returns path directly if sortedType == "index", else it returns filePrefix+"."+ext.
 	dbFile := func(path, ext string) string {
@@ -346,39 +386,26 @@ func (b *lowBuilder) thatQueueUnlessMemory(thatQueue map[string]interface{}) (qu
 func (b *lowBuilder) addS3Config(s3 string) error {
 	f := strings.SplitN(s3, ":", 4)
 	if len(f) < 3 {
-		return errors.New(`genconfig: expected "s3" field to be of form "access_key_id:secret_access_key:bucket"`)
+		return errors.New(`genconfig: expected "s3" field to be of form "access_key_id:secret_access_key:bucket[/optional/dir][:hostname]"`)
 	}
 	accessKey, secret, bucket := f[0], f[1], f[2]
 	var hostname string
 	if len(f) == 4 {
 		hostname = f[3]
 	}
-	isPrimary := !b.hasPrefix("/bs/")
+	isReplica := b.hasPrefix("/bs/")
 	s3Prefix := ""
-	if isPrimary {
-		s3Prefix = "/bs/"
-		if b.high.PackRelated {
-			return errors.New("TODO: finish packRelated support for S3")
-		}
-	} else {
-		s3Prefix = "/sto-s3/"
-	}
-	a := args{
+	s3Args := args{
 		"aws_access_key":        accessKey,
 		"aws_secret_access_key": secret,
 		"bucket":                bucket,
 	}
 	if hostname != "" {
-		a["hostname"] = hostname
+		s3Args["hostname"] = hostname
 	}
-	b.addPrefix(s3Prefix, "storage-s3", a)
-	if isPrimary {
-		// TODO(mpl): s3CacheBucket
-		// See https://camlistore.org/issue/85
-		b.addPrefix("/cache/", "storage-filesystem", args{
-			"path": filepath.Join(tempDir(), "camli-cache"),
-		})
-	} else {
+	if isReplica {
+		s3Prefix = "/sto-s3/"
+		b.addPrefix(s3Prefix, "storage-s3", s3Args)
 		if b.high.BlobPath == "" && !b.high.MemoryStorage {
 			panic("unexpected empty blobpath with sync-to-s3")
 		}
@@ -391,7 +418,50 @@ func (b *lowBuilder) addS3Config(s3 string) error {
 					"file": filepath.Join(b.high.BlobPath, "sync-to-s3-queue."+b.kvFileType()),
 				}),
 		})
+		return nil
 	}
+
+	// TODO(mpl): s3CacheBucket
+	// See https://camlistore.org/issue/85
+	b.addPrefix("/cache/", "storage-filesystem", args{
+		"path": filepath.Join(tempDir(), "camli-cache"),
+	})
+
+	s3Prefix = "/bs/"
+	if !b.high.PackRelated {
+		b.addPrefix(s3Prefix, "storage-s3", s3Args)
+		return nil
+	}
+	packedS3Args := func(bucket string) args {
+		a := args{
+			"bucket":                bucket,
+			"aws_access_key":        accessKey,
+			"aws_secret_access_key": secret,
+		}
+		if hostname != "" {
+			a["hostname"] = hostname
+		}
+		return a
+	}
+
+	b.addPrefix("/bs-loose/", "storage-s3", packedS3Args(path.Join(bucket, "loose")))
+	b.addPrefix("/bs-packed/", "storage-s3", packedS3Args(path.Join(bucket, "packed")))
+
+	// If index is DBMS, then blobPackedIndex is in DBMS too, with
+	// whatever dbname is defined for "blobpacked_index", or defaulting
+	// to "blobpacked_index". Otherwise blobPackedIndex is same
+	// file-based DB as the index, in same dir, but named
+	// packindex.dbtype.
+	blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", filepath.Join(b.indexFileDir(), "packindex"))
+	if err != nil {
+		return err
+	}
+	b.addPrefix(s3Prefix, "storage-blobpacked", args{
+		"smallBlobs": "/bs-loose/",
+		"largeBlobs": "/bs-packed/",
+		"metaIndex":  blobPackedIndex,
+	})
+
 	return nil
 }
 
@@ -503,7 +573,12 @@ func (b *lowBuilder) addGoogleCloudStorageConfig(v string) error {
 				"refresh_token": refreshToken,
 			},
 		})
-		blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", "")
+		// If index is DBMS, then blobPackedIndex is in DBMS too, with
+		// whatever dbname is defined for "blobpacked_index", or defaulting
+		// to "blobpacked_index". Otherwise blobPackedIndex is same
+		// file-based DB as the index, in same dir, but named
+		// packindex.dbtype.
+		blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", filepath.Join(b.indexFileDir(), "packindex"))
 		if err != nil {
 			return err
 		}
@@ -655,12 +730,13 @@ func (b *lowBuilder) genLowLevelPrefixes() error {
 				"metaIndex":  blobPackedIndex,
 			})
 		} else if b.high.PackBlobs {
+			diskpackedIndex, err := b.sortedStorageAt("diskpacked_index", filepath.Join(b.high.BlobPath, "diskpacked-index"))
+			if err != nil {
+				return err
+			}
 			b.addPrefix("/bs/", "storage-"+storageType, args{
-				"path": b.high.BlobPath,
-				"metaIndex": map[string]interface{}{
-					"type": b.kvFileType(),
-					"file": filepath.Join(b.high.BlobPath, "index."+b.kvFileType()),
-				},
+				"path":      b.high.BlobPath,
+				"metaIndex": diskpackedIndex,
 			})
 		} else {
 			b.addPrefix("/bs/", "storage-"+storageType, args{
@@ -765,7 +841,7 @@ func (b *lowBuilder) build() (*Config, error) {
 	case b.runIndex() && numIndexers != 1:
 		return nil, fmt.Errorf("With runIndex set true, you can only pick exactly one indexer (mongo, mysql, postgres, sqlite, kvIndexFile, leveldb, memoryIndex).")
 	case !b.runIndex() && numIndexers != 0:
-		return nil, fmt.Errorf("With runIndex disabled, you can't specify any of mongo, mysql, postgres, sqlite.")
+		log.Printf("Indexer disabled, but %v will be used for other indexes, queues, caches, etc.", b.sortedName())
 	}
 
 	if conf.Identity == "" {
@@ -889,7 +965,7 @@ var defaultBaseConfig = serverconfig.Config{
 
 // WriteDefaultConfigFile generates a new default high-level server configuration
 // file at filePath. If useSQLite, the default indexer will use SQLite, otherwise
-// kv. If filePath already exists, it is overwritten.
+// leveldb. If filePath already exists, it is overwritten.
 func WriteDefaultConfigFile(filePath string, useSQLite bool) error {
 	conf := defaultBaseConfig
 	blobDir := osutil.CamliBlobRoot()
@@ -897,10 +973,11 @@ func WriteDefaultConfigFile(filePath string, useSQLite bool) error {
 		return fmt.Errorf("Could not create default blobs directory: %v", err)
 	}
 	conf.BlobPath = blobDir
+	conf.PackRelated = true
 	if useSQLite {
-		conf.SQLite = filepath.Join(osutil.CamliVarDir(), "camli-index.db")
+		conf.SQLite = filepath.Join(osutil.CamliVarDir(), "index.sqlite")
 	} else {
-		conf.KVFile = filepath.Join(osutil.CamliVarDir(), "camli-index.kvdb")
+		conf.LevelDB = filepath.Join(osutil.CamliVarDir(), "index.leveldb")
 	}
 
 	keyID, secretRing, err := getOrMakeKeyring()

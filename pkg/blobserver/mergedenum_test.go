@@ -17,12 +17,13 @@ limitations under the License.
 package blobserver
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
 
 	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/context"
+	"golang.org/x/net/context"
 )
 
 var mergedTests = []struct {
@@ -76,6 +77,17 @@ var mergedTests = []struct {
 		want:  []string{"foo-a", "foo-b", "foo-c"},
 	},
 	{
+		// Illustrates deadlock bugfix from
+		// https://camlistore-review.googlesource.com/5946
+		name: "limit2",
+		srcs: []BlobEnumerator{
+			enumBlobRange("foo", 0, buffered+10),
+			enumBlobRange("bar", 0, buffered+10),
+		},
+		limit: buffered + 10,
+		want:  strRange("bar", 0, buffered+10),
+	},
+	{
 		name: "no sources",
 		srcs: []BlobEnumerator{},
 	},
@@ -92,7 +104,7 @@ var mergedTests = []struct {
 
 func TestMergedEnumerate(t *testing.T) {
 	for _, tt := range mergedTests {
-		ctx := context.New()
+		ctx := context.TODO()
 		var got []string
 		ch := make(chan blob.SizedRef)
 		errc := make(chan error)
@@ -122,11 +134,23 @@ func enumBlobs(v ...string) BlobEnumerator {
 	return testEnum{v}
 }
 
+func enumBlobRange(base string, start, count int) BlobEnumerator {
+	return testEnum{strRange(base, start, count)}
+}
+
+func strRange(base string, start, count int) []string {
+	v := make([]string, count)
+	for i := 0; i < count; i++ {
+		v[i] = fmt.Sprintf("%s-%04d", base, start+i)
+	}
+	return v
+}
+
 type testEnum struct {
 	blobs []string
 }
 
-func (te testEnum) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+func (te testEnum) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	defer close(dest)
 	done := 0
 	for _, bs := range te.blobs {

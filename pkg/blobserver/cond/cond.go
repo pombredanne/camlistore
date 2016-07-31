@@ -35,24 +35,21 @@ Example usage:
 	}
   }
 */
-package cond
+package cond // import "camlistore.org/pkg/blobserver/cond"
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"time"
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/context"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/schema"
+	"go4.org/jsonconfig"
+	"golang.org/x/net/context"
 )
-
-const buffered = 8
 
 // A storageFunc selects a destination for a given blob. It may consume from src but must always return
 // a newSrc that is identical to the original src passed in.
@@ -62,8 +59,6 @@ type condStorage struct {
 	storageForReceive storageFunc
 	read              blobserver.Storage
 	remove            blobserver.Storage
-
-	ctx *http.Request // optional per-request context
 }
 
 func (sto *condStorage) StorageGeneration() (initTime time.Time, random string, err error) {
@@ -194,7 +189,7 @@ func (sto *condStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) e
 	return errors.New("cond: Read not configured")
 }
 
-func (sto *condStorage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+func (sto *condStorage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	if sto.read != nil {
 		return sto.read.EnumerateBlobs(ctx, dest, after, limit)
 	}

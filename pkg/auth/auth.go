@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package auth implements Camlistore authentication.
-package auth
+package auth // import "camlistore.org/pkg/auth"
 
 import (
 	"crypto/rand"
@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -39,12 +40,17 @@ const (
 	OpEnumerate
 	OpRemove
 	OpSign
+	// OpDiscovery note: since we disclose an OpAll token in the discovery
+	// response, please bear in mind that granting OpDiscovery is in effect the
+	// same as granting OpAll for now.
 	OpDiscovery
 	OpRead   = OpEnumerate | OpStat | OpGet | OpDiscovery
 	OpRW     = OpUpload | OpEnumerate | OpStat | OpGet // Not Remove
 	OpVivify = OpUpload | OpStat | OpGet | OpDiscovery
 	OpAll    = OpUpload | OpEnumerate | OpStat | OpRemove | OpGet | OpSign | OpDiscovery
 )
+
+const OmitAuthToken = "OmitAuthToken"
 
 var (
 	// Each mode defines an auth logic which depends on the choosen auth mechanism.
@@ -106,9 +112,10 @@ func newLocalhostAuth(string) (AuthMode, error) {
 
 func newDevAuth(pw string) (AuthMode, error) {
 	// the vivify mode password is automatically set to "vivi" + Password
+	vp := "vivi" + pw
 	return &DevAuth{
 		Password:   pw,
-		VivifyPass: "vivi" + pw,
+		VivifyPass: &vp,
 	}, nil
 }
 
@@ -126,7 +133,8 @@ func newUserPassAuth(arg string) (AuthMode, error) {
 			mode.OrLocalhost = true
 		case strings.HasPrefix(opt, "vivify="):
 			// optional vivify mode password: "userpass:joe:ponies:vivify=rainbowdash"
-			mode.VivifyPass = strings.Replace(opt, "vivify=", "", -1)
+			vp := strings.Replace(opt, "vivify=", "", -1)
+			mode.VivifyPass = &vp
 		default:
 			return nil, fmt.Errorf("Unknown userpass option %q", opt)
 		}
@@ -186,8 +194,8 @@ func SetMode(m AuthMode) {
 	modes = []AuthMode{m}
 }
 
-// AddMode adds the given authentication mode to the list of modes that
-// future requests can authenticate against.
+// AddMode adds the given authentication mode to the list of modes that future
+// requests can authenticate against.
 func AddMode(am AuthMode) {
 	modes = append(modes, am)
 }
@@ -200,9 +208,10 @@ func AddMode(am AuthMode) {
 type UserPass struct {
 	Username, Password string
 	OrLocalhost        bool // if true, allow localhost ident auth too
-	// Alternative password used (only) for the vivify operation.
+
+	// VivifyPass, if not nil, is the alternative password used (only) for the vivify operation.
 	// It is checked when uploading, but Password takes precedence.
-	VivifyPass string
+	VivifyPass *string
 }
 
 func (up *UserPass) AllowedAccess(req *http.Request) Operation {
@@ -212,12 +221,15 @@ func (up *UserPass) AllowedAccess(req *http.Request) Operation {
 			if pass == up.Password {
 				return OpAll
 			}
-			if pass == up.VivifyPass {
+			if up.VivifyPass != nil && pass == *up.VivifyPass {
 				return OpVivify
 			}
 		}
 	}
 
+	if authTokenHeaderMatches(req) {
+		return OpAll
+	}
 	if websocketTokenMatches(req) {
 		return OpAll
 	}
@@ -258,7 +270,7 @@ func (Localhost) AllowedAccess(req *http.Request) (out Operation) {
 type DevAuth struct {
 	Password string
 	// Password for the vivify mode, automatically set to "vivi" + Password
-	VivifyPass string
+	VivifyPass *string
 }
 
 func (da *DevAuth) AllowedAccess(req *http.Request) Operation {
@@ -267,11 +279,14 @@ func (da *DevAuth) AllowedAccess(req *http.Request) Operation {
 		if pass == da.Password {
 			return OpAll
 		}
-		if pass == da.VivifyPass {
+		if da.VivifyPass != nil && pass == *da.VivifyPass {
 			return OpVivify
 		}
 	}
 
+	if authTokenHeaderMatches(req) {
+		return OpAll
+	}
 	if websocketTokenMatches(req) {
 		return OpAll
 	}
@@ -316,10 +331,24 @@ func Allowed(req *http.Request, op Operation) bool {
 	return false
 }
 
+var uiTokenPattern = regexp.MustCompile(`^Token ([a-zA-Z0-9]+)`)
+
+func authTokenHeaderMatches(req *http.Request) bool {
+	authHeader := req.Header.Get("Authorization")
+	if authHeader == "" {
+		return false
+	}
+	matches := uiTokenPattern.FindStringSubmatch(authHeader)
+	if len(matches) != 2 {
+		return false
+	}
+	return matches[1] == Token()
+}
+
 func websocketTokenMatches(req *http.Request) bool {
 	return req.Method == "GET" &&
 		req.Header.Get("Upgrade") == "websocket" &&
-		req.FormValue("authtoken") == ProcessRandom()
+		req.FormValue("authtoken") == Token()
 }
 
 func TriedAuthorization(req *http.Request) bool {
@@ -390,9 +419,24 @@ var (
 	processRandOnce sync.Once
 )
 
-func ProcessRandom() string {
+// Token returns a 20 byte token generated (only once, then cached) with RandToken.
+// This token is used for authentication by the Camlistore web UI and its
+// websockets, therefore it should be handled with care.
+func Token() string {
 	processRandOnce.Do(genProcessRand)
 	return processRand
+}
+
+// DiscoveryToken returns OmitAuthToken if the first registered auth mode is of
+// type None, and Token() otherwise.
+func DiscoveryToken() string {
+	if len(modes) == 0 {
+		return Token()
+	}
+	if _, ok := modes[0].(None); ok {
+		return OmitAuthToken
+	}
+	return Token()
 }
 
 func genProcessRand() {

@@ -209,7 +209,8 @@ cam.IndexPage = React.createClass({
 
 		var specificAspects = [
 			cam.ImageDetail.getAspect,
-			cam.DirectoryDetail.getAspect.bind(null, this.baseURL_, childFrameClickHandler),
+			// TODO(mpl): think about whether DirectoryDetail should stay a specificAspect
+			cam.DirectoryDetail.getAspect.bind(null, this.baseURL_, this.props.serverConnection),
 		].map(getAspect).filter(goog.functions.identity);
 
 		var generalAspects = [
@@ -298,7 +299,7 @@ cam.IndexPage = React.createClass({
 			totalBytesComplete: completedBytes
 		});
 
-		console.log('Uploaded %d of %d bytes', completedBytes, this.state.totalBytesToUpload);
+		console.log('Completed %d of %d bytes', completedBytes, this.state.totalBytesToUpload);
 	},
 
 	onUploadComplete_: function() {
@@ -319,16 +320,18 @@ cam.IndexPage = React.createClass({
 
 		var files = e.nativeEvent.dataTransfer.files;
 		var sc = this.props.serverConnection;
+		var parent = this.getTargetBlobref_();
 
 		this.onUploadStart_(files);
 
 		goog.labs.Promise.all(
 			Array.prototype.map.call(files, function(file) {
 				return uploadFile(file)
-					.then(fetchExistingPermanode)
+					.then(fetchPermanodeIfExists)
 					.then(createPermanodeIfNotExists)
-					.then(nameResults)
-					.then(createPermanodeAssociations.bind(this))
+					.then(updatePermanodeRef)
+					.then(checkExistingCamliMembership)
+					.then(createPermanodeAssociations)
 					.thenCatch(function(e) {
 						console.error('File upload fall down go boom. file: %s, error: %s', file.name, e);
 					})
@@ -339,53 +342,92 @@ cam.IndexPage = React.createClass({
 		}).then(this.onUploadComplete_);
 
 		function uploadFile(file) {
+
+			// capture status of upload promise chain
+			var status = {
+				fileRef: '',
+				isCamliMemberOfParent: false,
+				parentRef: parent,
+				permanodeRef: '',
+				permanodeCreated: false
+			};
+
 			var uploadFile = new goog.labs.Promise(sc.uploadFile.bind(sc, file));
-			return goog.labs.Promise.all([uploadFile]);
+
+			return goog.labs.Promise.all([new goog.labs.Promise.resolve(status), uploadFile]);
 		}
 
-		function fetchExistingPermanode(blobIds) {
-			var fileRef = blobIds[0];
-			var fileUploaded = new goog.labs.Promise.resolve(fileRef);
-			var getPermanode = new goog.labs.Promise(sc.getPermanodeWithContent.bind(sc, fileRef));
-			return goog.labs.Promise.all([fileUploaded, getPermanode]);
+		function fetchPermanodeIfExists(results) {
+			var status = results[0];
+			status.fileRef = results[1];
+
+			var getPermanode = new goog.labs.Promise(sc.getPermanodeWithContent.bind(sc, status.fileRef));
+
+			return goog.labs.Promise.all([new goog.labs.Promise.resolve(status), getPermanode]);
 		}
 
 		function createPermanodeIfNotExists(results) {
-			var fileRef = results[0];
-			var permanode = results[1];
-			if (!permanode) {
-				var fileUploaded = new goog.labs.Promise.resolve(fileRef);
+			var status = results[0];
+			var permanodeRef = results[1];
+
+			if (!permanodeRef) {
+				status.permanodeCreated = true;
+
 				var createPermanode = new goog.labs.Promise(sc.createPermanode.bind(sc));
-				return goog.labs.Promise.all([fileUploaded, createPermanode]);
+				return goog.labs.Promise.all([new goog.labs.Promise.resolve(status), createPermanode]);
 			}
-			// Empty values so the next in chain knows that we're in the "permanode already exists" case.
-			return goog.labs.Promise.resolve(["", ""]);
+
+			return goog.labs.Promise.all([new goog.labs.Promise.resolve(status), new goog.labs.Promise.resolve(permanodeRef)]);
 		}
 
-		// 'readable-ify' the blob references returned from upload/create
-		function nameResults(blobIds) {
-			return {
-				'fileRef': blobIds[0],
-				'permanodeRef': blobIds[1]
-			};
+		function updatePermanodeRef(results) {
+			var status = results[0];
+			status.permanodeRef = results[1];
+
+			return goog.labs.Promise.all([new goog.labs.Promise.resolve(status)]);
 		}
 
-		function createPermanodeAssociations(refs) {
-			if (refs.permanodeRef == "") {
-				// Any value would do, but boolean helps make it clear that we end
-				// here, by resolving the file upload promise chain.
-				return goog.labs.Promise.resolve(true);
+		// TODO(mpl): this implementation means that when we're dropping on a set, we send
+		// one additional query for each permanode that already exists. So in the worst case,
+		// it amounts to one additional query per dropped item (with a small payload/response).
+		// Alternatively, we could ask (either by tweaking the search session, or
+		// "manually") the server for all the set members and cache the response, which means
+		// only one additional query, and we can then do all the tests locally. However, the
+		// response size scales with the number of members in the set, so I don't know if it's
+		// better. A working example is at
+		// https://camlistore-review.googlesource.com/#/c/5345/2 . We should benchmark and/or
+		// ask Brad.
+
+		// check, when appropriate, if the permanode is already part of the set we're dropping in.
+		function checkExistingCamliMembership(results) {
+			var status = results[0];
+
+			// Permanode did not exist before, so it couldn't be a member of any set.
+			if (!status.parentRef || status.permanodeCreated) {
+				return goog.labs.Promise.all([new goog.labs.Promise.resolve(status), new goog.labs.Promise.resolve(false)]);
 			}
+
+			console.log('checking membership');
+			var hasMembership = new goog.labs.Promise(sc.isCamliMember.bind(sc, status.permanodeRef, status.parentRef));
+			return goog.labs.Promise.all([new goog.labs.Promise.resolve(status), hasMembership]);
+		}
+
+		function createPermanodeAssociations(results) {
+			var status = results[0];
+			status.isCamliMemberOfParent = results[1];
+
+			var promises = [];
 
 			// associate uploaded file to new permanode
-			var camliContent = new goog.labs.Promise(sc.newSetAttributeClaim.bind(sc, refs.permanodeRef, 'camliContent', refs.fileRef));
-			var promises = [camliContent];
+			if (status.permanodeCreated) {
+				var setCamliContent = new goog.labs.Promise(sc.newSetAttributeClaim.bind(sc, status.permanodeRef, 'camliContent', status.fileRef));
+				promises.push(setCamliContent);
+			}
 
-			// if currently viewing a set, make new permanode a member of the set
-			var parentPermanodeRef = this.getTargetBlobref_();
-			if (parentPermanodeRef) {
-				var camliMember = new goog.labs.Promise(sc.newAddAttributeClaim.bind(sc, parentPermanodeRef, 'camliMember', refs.permanodeRef));
-				promises.push(camliMember);
+			// add CamliMember relationship if viewing a set
+			if (status.parentRef && !status.isCamliMemberOfParent) {
+				var setCamliMember = new goog.labs.Promise(sc.newAddAttributeClaim.bind(sc, status.parentRef, 'camliMember', status.permanodeRef));
+				promises.push(setCamliMember);
 			}
 
 			return goog.labs.Promise.all(promises);
@@ -578,7 +620,7 @@ cam.IndexPage = React.createClass({
 				onUpload: this.handleUpload_,
 				onNewPermanode: this.handleCreateSetWithSelection_,
 				onSearch: this.setSearch_,
-				searchRootsURL: this.getSearchRootsURL_(),
+				favoritesURL: this.getFavoritesURL_(),
 				statusURL: this.baseURL_.resolve(new goog.Uri(this.props.config.statusRoot)),
 				ref: 'header',
 				timer: this.props.timer,
@@ -591,7 +633,7 @@ cam.IndexPage = React.createClass({
 		this.props.serverConnection.createPermanode(this.getDetailURL_.bind(this));
 	},
 
-	getSearchRootsURL_: function() {
+	getFavoritesURL_: function() {
 		return this.baseURL_.clone().setParameterValue(
 			'q',
 			this.SEARCH_PREFIX_.RAW + ':' + JSON.stringify({
@@ -656,6 +698,7 @@ cam.IndexPage = React.createClass({
 	},
 
 	handleDeleteSelection_: function() {
+		// TODO(aa): Use promises.
 		var blobrefs = goog.object.getKeys(this.state.selection);
 		var msg = 'Delete';
 		if (blobrefs.length > 1) {
@@ -676,6 +719,28 @@ cam.IndexPage = React.createClass({
 				}
 			}.bind(this));
 		}.bind(this));
+	},
+
+	handleRemoveSelectionFromSet_: function() {
+		var target = this.getTargetBlobref_();
+		var permanode = this.targetSearchSession_.getMeta(target).permanode;
+		var sc = this.props.serverConnection;
+		var changes = [];
+
+		for (var k in permanode.attr) {
+			var values = permanode.attr[k];
+			for (var i = 0; i < values.length; i++) {
+				if (this.state.selection[values[i]]) {
+					if (k == 'camliMember' || goog.string.startsWith(k, 'camliPath:')) {
+						changes.push(new goog.labs.Promise(sc.newDelAttributeClaim.bind(sc, target, k, values[i])));
+					} else {
+						console.error('Unexpected attribute: ', k);
+					}
+				}
+			}
+		}
+
+		goog.labs.Promise.all(changes).then(this.refreshIfNecessary_);
 	},
 
 	handleOpenWindow_: function(url) {
@@ -854,6 +919,34 @@ cam.IndexPage = React.createClass({
 		);
 	},
 
+	getRemoveSelectionFromSetItem_: function() {
+		if (!goog.object.getAnyKey(this.state.selection)) {
+			return null;
+		}
+
+		var target = this.getTargetBlobref_();
+		if (!target) {
+			return null;
+		}
+
+		var meta = this.targetSearchSession_.getMeta(target);
+		if (!meta || !meta.permanode) {
+			return null;
+		}
+
+		if (!cam.permanodeUtils.isContainer(meta.permanode)) {
+			return null;
+		}
+
+		return React.DOM.button(
+			{
+				key: 'removeSelectionFromSet',
+				onClick: this.handleRemoveSelectionFromSet_,
+			},
+			'Remove from set'
+		);
+	},
+
 	getViewOriginalSelectionItem_: function() {
 		if (goog.object.getCount(this.state.selection) != 1) {
 			return null;
@@ -903,6 +996,7 @@ cam.IndexPage = React.createClass({
 						this.getCreateSetWithSelectionItem_(),
 						this.getSelectAsCurrentSetItem_(),
 						this.getAddToCurrentSetItem_(),
+						this.getRemoveSelectionFromSetItem_(),
 						this.getDeleteSelectionItem_(),
 						this.getViewOriginalSelectionItem_(),
 					].filter(goog.functions.identity),
@@ -1076,7 +1170,7 @@ cam.IndexPage = React.createClass({
 			(this.childSearchSession_ && this.childSearchSession_.hasSocketError())) {
 			errors.push({
 				error: 'WebSocket error - click to reload',
-				onClick: this.props.location.reload.bind(null, this.props.location, true),
+				onClick: this.props.location.reload.bind(this.props.location, true),
 			});
 		}
 		return errors;

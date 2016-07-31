@@ -22,6 +22,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +32,7 @@ import (
 	"camlistore.org/pkg/blobserver/localdisk"
 	"camlistore.org/pkg/client"
 	"camlistore.org/pkg/cmdmain"
-	"camlistore.org/pkg/context"
+	"golang.org/x/net/context"
 )
 
 type syncCmd struct {
@@ -184,14 +185,10 @@ func (c *syncCmd) storageFromParam(which storageType, val string) (blobserver.St
 		c.oneIsDisk = true
 		return disk, nil
 	}
-	cl := client.New(val)
-	cl.InsecureTLS = c.insecureTLS
-	if httpClient == nil {
-		httpClient = &http.Client{
-			Transport: cl.TransportForConfig(nil),
-		}
+	cl := client.New(val, client.OptionInsecure(c.insecureTLS))
+	if httpClient != nil {
+		cl.SetHTTPClient(httpClient)
 	}
-	cl.SetHTTPClient(httpClient)
 	if err := cl.SetupAuth(); err != nil {
 		return nil, fmt.Errorf("could not setup auth for connecting to %v: %v", val, err)
 	}
@@ -210,8 +207,8 @@ func (c *syncCmd) storageFromParam(which storageType, val string) (blobserver.St
 }
 
 func looksLikePath(v string) bool {
-	prefix := func(s string) bool { return strings.HasPrefix(v, s) }
-	return prefix("./") || prefix("/") || prefix("../")
+	prefix := func(s string) bool { return strings.HasPrefix(filepath.ToSlash(v), s) }
+	return prefix("./") || prefix("/") || prefix("../") || filepath.VolumeName(v) != ""
 }
 
 type SyncStats struct {
@@ -244,21 +241,13 @@ func (c *syncCmd) syncAll() error {
 		}
 	}
 	for _, sh := range syncHandlers {
-		from := client.New(sh.From)
+		from := client.New(sh.From, client.OptionInsecure(c.insecureTLS))
 		from.SetLogger(c.logger)
-		from.InsecureTLS = c.insecureTLS
-		from.SetHTTPClient(&http.Client{
-			Transport: from.TransportForConfig(nil),
-		})
 		if err := from.SetupAuth(); err != nil {
 			return fmt.Errorf("could not setup auth for connecting to %v: %v", sh.From, err)
 		}
-		to := client.New(sh.To)
+		to := client.New(sh.To, client.OptionInsecure(c.insecureTLS))
 		to.SetLogger(c.logger)
-		to.InsecureTLS = c.insecureTLS
-		to.SetHTTPClient(&http.Client{
-			Transport: to.TransportForConfig(nil),
-		})
 		if err := to.SetupAuth(); err != nil {
 			return fmt.Errorf("could not setup auth for connecting to %v: %v", sh.To, err)
 		}
@@ -281,13 +270,12 @@ func (c *syncCmd) syncAll() error {
 // is blank. The returned client can then be used to discover
 // the blobRoot and syncHandlers.
 func (c *syncCmd) discoClient() *client.Client {
-	cl := newClient(c.src)
+	cl := newClient(c.src, client.OptionInsecure(c.insecureTLS))
 	cl.SetLogger(c.logger)
-	cl.InsecureTLS = c.insecureTLS
 	return cl
 }
 
-func enumerateAllBlobs(ctx *context.Context, s blobserver.Storage, destc chan<- blob.SizedRef) error {
+func enumerateAllBlobs(ctx context.Context, s blobserver.Storage, destc chan<- blob.SizedRef) error {
 	// Use *client.Client's support for enumerating all blobs if
 	// possible, since it could probably do a better job knowing
 	// HTTP boundaries and such.
@@ -300,7 +288,7 @@ func enumerateAllBlobs(ctx *context.Context, s blobserver.Storage, destc chan<- 
 		select {
 		case destc <- sb:
 		case <-ctx.Done():
-			return context.ErrCanceled
+			return ctx.Err()
 		}
 		return nil
 	})
@@ -319,19 +307,19 @@ func (c *syncCmd) doPass(src, dest, thirdLeg blobserver.Storage) (stats SyncStat
 	destErr := make(chan error, 1)
 
 	ctx := context.TODO()
-	enumCtx := ctx.New() // used for all (2 or 3) enumerates
-	defer enumCtx.Cancel()
+	enumCtx, cancel := context.WithCancel(ctx) // used for all (2 or 3) enumerates
+	defer cancel()
 	enumerate := func(errc chan<- error, sto blobserver.Storage, blobc chan<- blob.SizedRef) {
 		err := enumerateAllBlobs(enumCtx, sto, blobc)
 		if err != nil {
-			enumCtx.Cancel()
+			cancel()
 		}
 		errc <- err
 	}
 
 	go enumerate(srcErr, src, srcBlobs)
 	checkSourceError := func() {
-		if err := <-srcErr; err != nil && err != context.ErrCanceled {
+		if err := <-srcErr; err != nil && err != context.Canceled {
 			retErr = fmt.Errorf("Enumerate error from source: %v", err)
 		}
 	}
@@ -352,7 +340,7 @@ func (c *syncCmd) doPass(src, dest, thirdLeg blobserver.Storage) (stats SyncStat
 
 	go enumerate(destErr, dest, destBlobs)
 	checkDestError := func() {
-		if err := <-destErr; err != nil && err != context.ErrCanceled {
+		if err := <-destErr; err != nil && err != context.Canceled {
 			retErr = fmt.Errorf("Enumerate error from destination: %v", err)
 		}
 	}
@@ -383,7 +371,7 @@ func (c *syncCmd) doPass(src, dest, thirdLeg blobserver.Storage) (stats SyncStat
 		thirdErr := make(chan error, 1)
 		go enumerate(thirdErr, thirdLeg, thirdBlobs)
 		checkThirdError = func() {
-			if err := <-thirdErr; err != nil && err != context.ErrCanceled {
+			if err := <-thirdErr; err != nil && err != context.Canceled {
 				retErr = fmt.Errorf("Enumerate error from third leg: %v", err)
 			}
 		}

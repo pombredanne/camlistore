@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package cmdmain contains the shared implementation for camget,
 // camput, camtool, and other Camlistore command-line tools.
-package cmdmain
+package cmdmain // import "camlistore.org/pkg/cmdmain"
 
 import (
 	"flag"
@@ -25,17 +25,18 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 
 	"camlistore.org/pkg/buildinfo"
-	"camlistore.org/pkg/legal/legalprint"
+
+	"go4.org/legal"
 )
 
 var (
 	FlagVersion = flag.Bool("version", false, "show version")
 	FlagHelp    = flag.Bool("help", false, "print usage")
 	FlagVerbose = flag.Bool("verbose", false, "extra debug logging")
+	FlagLegal   = flag.Bool("legal", false, "show licenses")
 )
 
 var (
@@ -114,41 +115,6 @@ func RegisterCommand(mode string, makeCmd func(Flags *flag.FlagSet) CommandRunne
 	wantHelp[mode] = &cmdHelp
 	modeFlags[mode] = flags
 	modeCommand[mode] = makeCmd(flags)
-}
-
-type namedMode struct {
-	Name    string
-	Command CommandRunner
-}
-
-// TODO(mpl): do we actually need this? I changed usage
-// to simply iterate over all of modeCommand and it seems
-// fine.
-func allModes(startModes []string) <-chan namedMode {
-	ch := make(chan namedMode)
-	go func() {
-		defer close(ch)
-		done := map[string]bool{}
-		for _, name := range startModes {
-			done[name] = true
-			cmd := modeCommand[name]
-			if cmd == nil {
-				panic("bogus mode: " + name)
-			}
-			ch <- namedMode{name, cmd}
-		}
-		var rest []string
-		for name := range modeCommand {
-			if !done[name] {
-				rest = append(rest, name)
-			}
-		}
-		sort.Strings(rest)
-		for _, name := range rest {
-			ch <- namedMode{name, modeCommand[name]}
-		}
-	}()
-	return ch
 }
 
 func hasFlags(flags *flag.FlagSet) bool {
@@ -232,6 +198,13 @@ var registerFlagOnce sync.Once
 
 var setCommandLineOutput func(io.Writer) // or nil if before Go 1.2
 
+// PrintLicenses prints all the licences registered by go4.org/legal for this program.
+func PrintLicenses() {
+	for _, text := range legal.Licenses() {
+		fmt.Fprintln(Stderr, text)
+	}
+}
+
 // Main is meant to be the core of a command that has
 // subcommands (modes), such as camput or camtool.
 func Main() {
@@ -254,7 +227,8 @@ func Main() {
 	if *FlagHelp {
 		usage("")
 	}
-	if legalprint.MaybePrint(Stderr) {
+	if *FlagLegal {
+		PrintLicenses()
 		return
 	}
 	if len(args) == 0 {

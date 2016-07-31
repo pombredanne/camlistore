@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // The camlistored binary is the Camlistore server.
-package main
+package main // import "camlistore.org/server/camlistored"
 
 import (
 	"flag"
@@ -37,18 +37,16 @@ import (
 	"camlistore.org/pkg/buildinfo"
 	"camlistore.org/pkg/env"
 	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/legal/legalprint"
 	"camlistore.org/pkg/netutil"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/serverinit"
 	"camlistore.org/pkg/webserver"
-	"camlistore.org/pkg/wkfs"
 
 	// VM environments:
 	"camlistore.org/pkg/osutil/gce" // for init side-effects + LogWriter
 
 	// Storage options:
-	_ "camlistore.org/pkg/blobserver/blobpacked"
+	"camlistore.org/pkg/blobserver/blobpacked"
 	_ "camlistore.org/pkg/blobserver/cond"
 	_ "camlistore.org/pkg/blobserver/diskpacked"
 	_ "camlistore.org/pkg/blobserver/encrypt"
@@ -77,10 +75,22 @@ import (
 
 	// Importers:
 	_ "camlistore.org/pkg/importer/allimporters"
+
+	// Licence:
+	_ "camlistore.org/pkg/camlegal"
+
+	"go4.org/legal"
+	"go4.org/wkfs"
+
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/cloud"
+	"google.golang.org/cloud/logging"
 )
 
 var (
 	flagVersion    = flag.Bool("version", false, "show version")
+	flagLegal      = flag.Bool("legal", false, "show licenses")
 	flagConfigFile = flag.String("configfile", "",
 		"Config file to use, relative to the Camlistore configuration directory root. "+
 			"If blank, the default is used or auto-generated. "+
@@ -88,12 +98,24 @@ var (
 	flagListen      = flag.String("listen", "", "host:port to listen on, or :0 to auto-select. If blank, the value in the config will be used instead.")
 	flagOpenBrowser = flag.Bool("openbrowser", true, "Launches the UI on startup")
 	flagReindex     = flag.Bool("reindex", false, "Reindex all blobs on startup")
+	flagRecovery    = flag.Bool("recovery", false, "Recovery mode: rebuild the blobpacked meta index if needed. The tasks performed by the recovery mode might change in the future.")
 	flagPollParent  bool
+)
+
+// For logging on Google Cloud Logging when not running on Google Compute Engine
+// (for debugging).
+var (
+	flagGCEProjectID string
+	flagGCELogName   string
+	flagGCEJWTFile   string
 )
 
 func init() {
 	if debug, _ := strconv.ParseBool(os.Getenv("CAMLI_DEBUG")); debug {
 		flag.BoolVar(&flagPollParent, "pollparent", false, "Camlistored regularly polls its parent process to detect if it has been orphaned, and terminates in that case. Mainly useful for tests.")
+		flag.StringVar(&flagGCEProjectID, "gce_project_id", "", "GCE project ID; required by --gce_log_name.")
+		flag.StringVar(&flagGCELogName, "gce_log_name", "", "log all messages to that log name on Google Cloud Logging as well.")
+		flag.StringVar(&flagGCEJWTFile, "gce_jwt_file", "", "Filename to the GCE Service Account's JWT (JSON) config file; required by --gce_log_name.")
 	}
 }
 
@@ -305,6 +327,29 @@ func certHostname(listen, baseURL string) (string, error) {
 	return hostname, nil
 }
 
+func maybeSetupGoogleCloudLogging() {
+	if flagGCEProjectID == "" && flagGCELogName == "" && flagGCEJWTFile == "" {
+		return
+	}
+	if flagGCEProjectID == "" || flagGCELogName == "" || flagGCEJWTFile == "" {
+		exitf("All of --gce_project_id, --gce_log_name, and --gce_jwt_file must be specified for logging on Google Cloud Logging.")
+	}
+	jsonSlurp, err := ioutil.ReadFile(flagGCEJWTFile)
+	if err != nil {
+		exitf("Error reading --gce_jwt_file value: %v", err)
+	}
+	jwtConf, err := google.JWTConfigFromJSON(jsonSlurp, logging.Scope)
+	if err != nil {
+		exitf("Error reading --gce_jwt_file value: %v", err)
+	}
+	ctx := cloud.NewContext(flagGCEProjectID, jwtConf.Client(context.Background()))
+	logc, err := logging.NewClient(ctx, flagGCEProjectID, flagGCELogName)
+	if err != nil {
+		exitf("Error creating GCL client: %v", err)
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, logc.Writer(logging.Debug)))
+}
+
 // main wraps Main so tests (which generate their own func main) can still run Main.
 func main() {
 	Main(nil, nil)
@@ -319,11 +364,19 @@ func Main(up chan<- struct{}, down <-chan struct{}) {
 			buildinfo.Version(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		return
 	}
-	if legalprint.MaybePrint(os.Stderr) {
+	if *flagLegal {
+		for _, l := range legal.Licenses() {
+			fmt.Fprintln(os.Stderr, l)
+		}
 		return
+	}
+	if *flagRecovery {
+		blobpacked.SetRecovery()
 	}
 	if env.OnGCE() {
 		log.SetOutput(gce.LogWriter())
+	} else {
+		maybeSetupGoogleCloudLogging()
 	}
 
 	if *flagReindex {
@@ -386,6 +439,10 @@ func Main(up chan<- struct{}, down <-chan struct{}) {
 	go ws.Serve()
 	if flagPollParent {
 		osutil.DieOnParentDeath()
+	}
+
+	if err := config.UploadPublicKey(); err != nil {
+		exitf("Error uploading public key on startup: %v", err)
 	}
 
 	if err := config.StartApps(); err != nil {

@@ -25,19 +25,18 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
-	"sort"
 	"strings"
 	"testing"
 
 	"camlistore.org/pkg/auth"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/importer"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/jsonsign/signhandler"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/search"
@@ -46,6 +45,7 @@ import (
 	"camlistore.org/pkg/test"
 	"camlistore.org/pkg/types/clientconfig"
 	"camlistore.org/pkg/types/serverconfig"
+	"go4.org/jsonconfig"
 
 	// For registering all the handler constructors needed in TestInstallHandlers
 	_ "camlistore.org/pkg/blobserver/cond"
@@ -72,14 +72,6 @@ func init() {
 	// Avoid Linux vs. OS X differences in tests.
 	serverinit.SetTempDirFunc(func() string { return "/tmp" })
 	serverinit.SetNoMkdir(true)
-}
-
-func sortedKeys(m map[string]interface{}) (keys []string) {
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return
 }
 
 func prettyPrint(t *testing.T, w io.Writer, v interface{}) {
@@ -261,6 +253,9 @@ func TestExpansionsInHighlevelConfig(t *testing.T) {
 	const keyID = "26F5ABDA"
 	os.Setenv("TMP_EXPANSION_TEST", keyID)
 	os.Setenv("TMP_EXPANSION_SECRING", filepath.Join(camroot, filepath.FromSlash("pkg/jsonsign/testdata/test-secring.gpg")))
+	// Setting CAMLI_CONFIG_DIR to avoid triggering failInTests in osutil.CamliConfigDir
+	defer os.Setenv("CAMLI_CONFIG_DIR", os.Getenv("CAMLI_CONFIG_DIR")) // restore after test
+	os.Setenv("CAMLI_CONFIG_DIR", "whatever")
 	conf, err := serverinit.Load([]byte(`
 {
     "auth": "localhost",
@@ -297,6 +292,9 @@ func TestInstallHandlers(t *testing.T) {
 		t.Fatalf("Could not json encode config: %v", err)
 	}
 
+	// Setting CAMLI_CONFIG_DIR to avoid triggering failInTests in osutil.CamliConfigDir
+	defer os.Setenv("CAMLI_CONFIG_DIR", os.Getenv("CAMLI_CONFIG_DIR")) // restore after test
+	os.Setenv("CAMLI_CONFIG_DIR", "whatever")
 	lowConf, err := serverinit.Load(confData)
 	if err != nil {
 		t.Fatal(err)
@@ -475,4 +473,57 @@ func TestGenerateClientConfig(t *testing.T) {
 	}
 
 	compareConfigurations(t, inName, generatedConf, wantConf)
+}
+
+// TestConfigHandlerRedaction validates that configHandler redacts sensitive
+// values, still resulting in a valid JSON document.
+func TestConfigHandlerRedaction(t *testing.T) {
+	config := &serverinit.Config{
+		Obj: jsonconfig.Obj{
+			"auth":                  "secret",
+			"aws_secret_access_key": "secret",
+			"password":              "secret",
+			"client_secret":         "secret",
+		},
+	}
+
+	rr := httptest.NewRecorder()
+	serverinit.ConfigHandler(config).ServeHTTP(rr, nil)
+	got := make(map[string]string)
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("Failed to unmarshal configHandler response: %v", err)
+	}
+	want := map[string]string{
+		"auth":                  "REDACTED",
+		"aws_secret_access_key": "REDACTED",
+		"password":              "REDACTED",
+		"client_secret":         "REDACTED",
+	}
+
+	compareConfigurations(t, "configHandlerRedaction", got, want)
+}
+
+// TestConfigHandlerRemoveKnownKeys validates that configHandler removes
+// "knowkeys" keys properly, still resulting in a valid JSON document.
+func TestConfigHandlerRemoveKnownKeys(t *testing.T) {
+	config := &serverinit.Config{
+		Obj: jsonconfig.Obj{
+			"/ui/": "",
+			"_knownkeys": map[string]string{
+				"key": "value",
+			},
+		},
+	}
+
+	rr := httptest.NewRecorder()
+	serverinit.ConfigHandler(config).ServeHTTP(rr, nil)
+	got := make(map[string]string)
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("Failed to unmarshal configHandler response: %v", err)
+	}
+	want := map[string]string{
+		"/ui/": "",
+	}
+
+	compareConfigurations(t, "configHandlerRemoveKnownKeys", got, want)
 }

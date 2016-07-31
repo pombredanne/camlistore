@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package flickr implements an importer for flickr.com accounts.
-package flickr
+package flickr // import "camlistore.org/pkg/importer/flickr"
 
 import (
 	"bytes"
@@ -28,12 +28,14 @@ import (
 	"strconv"
 	"time"
 
-	"camlistore.org/pkg/context"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/importer"
 	"camlistore.org/pkg/schema"
 	"camlistore.org/pkg/schema/nodeattr"
-	"camlistore.org/third_party/github.com/garyburd/go-oauth/oauth"
+
+	"github.com/garyburd/go-oauth/oauth"
+
+	"go4.org/ctxutil"
 )
 
 const (
@@ -192,9 +194,11 @@ func (r *run) importPhotosets() error {
 	log.Printf("Importing %d sets", len(resp.Photosets.Photoset))
 
 	for _, item := range resp.Photosets.Photoset {
-		if r.Context.IsCanceled() {
+		select {
+		case <-r.Context().Done():
 			log.Printf("Flickr importer: interrupted")
-			return context.ErrCanceled
+			return r.Context().Err()
+		default:
 		}
 		for page := 1; page >= 1; {
 			page, err = r.importPhotoset(setsNode, item, page)
@@ -490,14 +494,14 @@ func (r *run) getTopLevelNode(path string, title string) (*importer.Object, erro
 func (r *run) flickrAPIRequest(result interface{}, method string, keyval ...string) error {
 	keyval = append([]string{"method", method, "format", "json", "nojsoncallback", "1"}, keyval...)
 	return importer.OAuthContext{
-		r.Context,
+		r.Context(),
 		r.oauthClient,
 		r.accessCreds}.PopulateJSONFromURL(result, apiURL, keyval...)
 }
 
 func (r *run) fetch(url string, form url.Values) (*http.Response, error) {
 	return importer.OAuthContext{
-		r.Context,
+		r.Context(),
 		r.oauthClient,
 		r.accessCreds}.Get(url, form)
 }
@@ -510,7 +514,7 @@ func (imp) ServeSetup(w http.ResponseWriter, r *http.Request, ctx *importer.Setu
 		httputil.ServeError(w, r, err)
 		return err
 	}
-	tempCred, err := oauthClient.RequestTemporaryCredentials(ctx.HTTPClient(), ctx.CallbackURL(), nil)
+	tempCred, err := oauthClient.RequestTemporaryCredentials(ctxutil.Client(ctx), ctx.CallbackURL(), nil)
 	if err != nil {
 		err = fmt.Errorf("Error getting temp cred: %v", err)
 		httputil.ServeError(w, r, err)
@@ -550,7 +554,7 @@ func (imp) ServeCallback(w http.ResponseWriter, r *http.Request, ctx *importer.S
 		return
 	}
 	tokenCred, vals, err := oauthClient.RequestToken(
-		ctx.Context.HTTPClient(),
+		ctxutil.Client(ctx),
 		&oauth.Credentials{
 			Token:  tempToken,
 			Secret: tempSecret,

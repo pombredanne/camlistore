@@ -30,7 +30,7 @@ Example low-level config:
      },
 
 */
-package diskpacked
+package diskpacked // import "camlistore.org/pkg/blobserver/diskpacked"
 
 import (
 	"bufio"
@@ -50,13 +50,15 @@ import (
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/blobserver/local"
-	"camlistore.org/pkg/context"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/strutil"
-	"camlistore.org/pkg/syncutil"
-	"camlistore.org/pkg/types"
-	"camlistore.org/third_party/github.com/camlistore/lock"
+
+	"go4.org/jsonconfig"
+	"go4.org/lock"
+	"go4.org/readerutil"
+	"go4.org/strutil"
+	"go4.org/syncutil"
+	"go4.org/types"
+	"golang.org/x/net/context"
 )
 
 // TODO(wathiede): replace with glog.V(2) when we decide our logging story.
@@ -250,6 +252,24 @@ func (s *storage) openForWrite(n int) error {
 	return nil
 }
 
+// closePack opens any pack file currently open for writing.
+func (s *storage) closePack() error {
+	var err error
+	if s.writer != nil {
+		err = s.writer.Close()
+		openFdsVar.Add(s.root, -1)
+		s.writer = nil
+	}
+	if s.writeLock != nil {
+		lerr := s.writeLock.Close()
+		if err == nil {
+			err = lerr
+		}
+		s.writeLock = nil
+	}
+	return err
+}
+
 // nextPack will close the current writer and release its lock if open,
 // open the next pack file in sequence for writing, grab its lock, set it
 // to the currently active writer, and open another copy for read-only use.
@@ -257,20 +277,9 @@ func (s *storage) openForWrite(n int) error {
 func (s *storage) nextPack() error {
 	debug.Println("diskpacked: nextPack")
 	s.size = 0
-	if s.writeLock != nil {
-		err := s.writeLock.Close()
-		if err != nil {
-			return err
-		}
-		s.writeLock = nil
+	if err := s.closePack(); err != nil {
+		return err
 	}
-	if s.writer != nil {
-		if err := s.writer.Close(); err != nil {
-			return err
-		}
-		openFdsVar.Add(s.root, -1)
-	}
-
 	n := len(s.fds)
 	if err := s.openForWrite(n); err != nil {
 		return err
@@ -315,18 +324,14 @@ func (s *storage) Close() error {
 			log.Println("diskpacked: closing index:", err)
 		}
 		for _, f := range s.fds {
-			if err := f.Close(); err != nil {
-				closeErr = err
-			}
+			err := f.Close()
 			openFdsVar.Add(s.root, -1)
-		}
-		s.writer = nil
-		if l := s.writeLock; l != nil {
-			err := l.Close()
-			if closeErr == nil {
+			if err != nil {
 				closeErr = err
 			}
-			s.writeLock = nil
+		}
+		if err := s.closePack(); err != nil && closeErr == nil {
+			closeErr = err
 		}
 	}
 	return closeErr
@@ -371,11 +376,11 @@ func (s *storage) fetch(br blob.Ref, offset, length int64) (rc io.ReadCloser, si
 	// Ensure entry is in map.
 	readVar.Add(fn, 0)
 	if v, ok := readVar.Get(fn).(*expvar.Int); ok {
-		rs = types.NewStatsReadSeeker(v, rs)
+		rs = readerutil.NewStatsReadSeeker(v, rs)
 	}
 	readTotVar.Add(s.root, 0)
 	if v, ok := readTotVar.Get(s.root).(*expvar.Int); ok {
-		rs = types.NewStatsReadSeeker(v, rs)
+		rs = readerutil.NewStatsReadSeeker(v, rs)
 	}
 	rsc := struct {
 		io.ReadSeeker
@@ -403,7 +408,7 @@ func (s *storage) RemoveBlobs(blobs []blob.Ref) error {
 		batch.Delete(br.String())
 		wg.Go(func() error {
 			defer removeGate.Done()
-			if err := s.delete(br); err != nil {
+			if err := s.delete(br); err != nil && err != os.ErrNotExist {
 				return err
 			}
 			return nil
@@ -442,7 +447,7 @@ func (s *storage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) (err er
 	return wg.Err()
 }
 
-func (s *storage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) (err error) {
+func (s *storage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) (err error) {
 	defer close(dest)
 
 	t := s.index.Find(after, "")
@@ -469,7 +474,7 @@ func (s *storage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef
 		select {
 		case dest <- m.SizedRef(br):
 		case <-ctx.Done():
-			return context.ErrCanceled
+			return ctx.Err()
 		}
 		i++
 	}
@@ -516,7 +521,7 @@ type readSeekNopCloser struct {
 
 func (readSeekNopCloser) Close() error { return nil }
 
-func newReadSeekNopCloser(rs io.ReadSeeker) types.ReadSeekCloser {
+func newReadSeekNopCloser(rs io.ReadSeeker) readerutil.ReadSeekCloser {
 	return readSeekNopCloser{rs}
 }
 
@@ -527,7 +532,7 @@ var deletedBlobRef = regexp.MustCompile(`^x+-0+$`)
 var _ blobserver.BlobStreamer = (*storage)(nil)
 
 // StreamBlobs Implements the blobserver.StreamBlobs interface.
-func (s *storage) StreamBlobs(ctx *context.Context, dest chan<- blobserver.BlobAndToken, contToken string) error {
+func (s *storage) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAndToken, contToken string) error {
 	defer close(dest)
 
 	fileNum, offset, err := parseContToken(contToken)
@@ -619,7 +624,7 @@ func (s *storage) StreamBlobs(ctx *context.Context, dest chan<- blobserver.BlobA
 		if !ok {
 			return fmt.Errorf("diskpacked: Invalid blobref %q", digest)
 		}
-		newReader := func() types.ReadSeekCloser {
+		newReader := func() readerutil.ReadSeekCloser {
 			return newReadSeekNopCloser(bytes.NewReader(data))
 		}
 		blob := blob.NewBlob(ref, size, newReader)
@@ -630,7 +635,7 @@ func (s *storage) StreamBlobs(ctx *context.Context, dest chan<- blobserver.BlobA
 		}:
 			// Nothing.
 		case <-ctx.Done():
-			return context.ErrCanceled
+			return ctx.Err()
 		}
 	}
 }

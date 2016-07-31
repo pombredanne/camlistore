@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// The publisher command is a server application to publish items from a
+// Camlistore server. See also https://camlistore.org/doc/publishing
 package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"html"
@@ -32,6 +33,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,11 +50,12 @@ import (
 	"camlistore.org/pkg/search"
 	"camlistore.org/pkg/server"
 	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/syncutil"
+	_ "camlistore.org/pkg/sorted/kvfile"
 	"camlistore.org/pkg/types/camtypes"
 	"camlistore.org/pkg/webserver"
 
-	_ "camlistore.org/pkg/sorted/kvfile"
+	"go4.org/syncutil"
+	"golang.org/x/net/context"
 )
 
 var (
@@ -137,7 +140,7 @@ func newPublishHandler(conf *config) *publishHandler {
 	if maxResizeBytes == 0 {
 		maxResizeBytes = constants.DefaultMaxResizeMem
 	}
-	var CSSFiles []string
+	var CSSFiles, JSDeps []string
 	if conf.SourceRoot != "" {
 		appRoot := filepath.Join(conf.SourceRoot, "app", "publisher")
 		Files = &fileembed.Files{
@@ -157,8 +160,17 @@ func newPublishHandler(conf *config) *publishHandler {
 		for _, v := range names {
 			if strings.HasSuffix(v, ".css") {
 				CSSFiles = append(CSSFiles, v)
+				continue
+			}
+			// TODO(mpl): document or fix (use a map?) the ordering
+			// problem: i.e. jquery.js must be sourced before
+			// publisher.js. For now, just cheat by sorting the
+			// slice.
+			if strings.HasSuffix(v, ".js") {
+				JSDeps = append(JSDeps, v)
 			}
 		}
+		sort.Strings(JSDeps)
 	} else {
 		Files.Listable = true
 		dir, err := Files.Open("/")
@@ -174,8 +186,13 @@ func newPublishHandler(conf *config) *publishHandler {
 			name := v.Name()
 			if strings.HasSuffix(name, ".css") {
 				CSSFiles = append(CSSFiles, name)
+				continue
+			}
+			if strings.HasSuffix(name, ".js") {
+				JSDeps = append(JSDeps, name)
 			}
 		}
+		sort.Strings(JSDeps)
 	}
 	// TODO(mpl): add all htmls found in Files to the template if none specified?
 	if conf.GoTemplate == "" {
@@ -185,10 +202,7 @@ func newPublishHandler(conf *config) *publishHandler {
 	if err != nil {
 		logger.Fatal(err)
 	}
-	serverURL := os.Getenv("CAMLI_API_HOST")
-	if serverURL == "" {
-		logger.Fatal("CAMLI_API_HOST var not set")
-	}
+
 	var cache blobserver.Storage
 	var thumbMeta *server.ThumbMeta
 	if conf.CacheRoot != "" {
@@ -217,6 +231,7 @@ func newPublishHandler(conf *config) *publishHandler {
 		staticFiles:    Files,
 		goTemplate:     goTemplate,
 		CSSFiles:       CSSFiles,
+		JSDeps:         JSDeps,
 		describedCache: make(map[string]*search.DescribedBlob),
 		cache:          cache,
 		thumbMeta:      thumbMeta,
@@ -256,6 +271,7 @@ type publishHandler struct {
 	staticFiles *fileembed.Files   // For static resources.
 	goTemplate  *template.Template // For publishing/rendering.
 	CSSFiles    []string
+	JSDeps      []string
 	resizeSem   *syncutil.Sem // Limit peak RAM used by concurrent image thumbnail calls.
 
 	describedCacheMu sync.RWMutex
@@ -397,12 +413,17 @@ func (ph *publishHandler) describe(br blob.Ref) (*search.DescribedBlob, error) {
 		return des, nil
 	}
 	ph.describedCacheMu.RUnlock()
-	res, err := ph.cl.Describe(&search.DescribeRequest{
+	ctx := context.TODO()
+	res, err := ph.cl.Describe(ctx, &search.DescribeRequest{
 		BlobRef: br,
 		Depth:   1,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("Could not describe %v: %v", br, err)
+	}
+	// TODO(mpl): check why Describe is not giving us an error when br is invalid.
+	if res == nil || res.Meta == nil || res.Meta[br.String()] == nil {
+		return nil, fmt.Errorf("Could not describe %v", br)
 	}
 	return res.Meta[br.String()], nil
 }
@@ -443,12 +464,13 @@ type publishRequest struct {
 	subject              blob.Ref
 	inSubjectChain       map[string]bool // blobref -> true
 	subjectBasePath      string
+	publishedRoot        blob.Ref // on camliRoot, camliPath:somePath = publishedRoot
 }
 
-func (ph *publishHandler) NewRequest(rw http.ResponseWriter, req *http.Request) (*publishRequest, error) {
+func (ph *publishHandler) NewRequest(w http.ResponseWriter, r *http.Request) (*publishRequest, error) {
 	// splits a path request into its suffix and subresource parts.
 	// e.g. /blog/foo/camli/res/file/xxx -> ("foo", "file/xxx")
-	suffix, res := httputil.PathSuffix(req), ""
+	suffix, res := strings.TrimPrefix(r.URL.Path, "/"), ""
 	if strings.HasPrefix(suffix, "-/") {
 		suffix, res = "", suffix[2:]
 	} else if s := strings.SplitN(suffix, "/-/", 2); len(s) == 2 {
@@ -457,10 +479,10 @@ func (ph *publishHandler) NewRequest(rw http.ResponseWriter, req *http.Request) 
 
 	return &publishRequest{
 		ph:              ph,
-		rw:              rw,
-		req:             req,
+		rw:              w,
+		req:             r,
 		suffix:          suffix,
-		base:            httputil.PathBase(req),
+		base:            app.PathPrefix(r),
 		subres:          res,
 		rootpn:          ph.rootNode,
 		inSubjectChain:  make(map[string]bool),
@@ -536,6 +558,7 @@ func (pr *publishRequest) findSubject() error {
 	if err != nil {
 		return err
 	}
+	pr.publishedRoot = subject
 	if strings.HasPrefix(pr.subres, "=z/") {
 		// this happens when we are at the root of the published path,
 		// e.g /base/suffix/-/=z/foo.zip
@@ -737,14 +760,20 @@ func (pr *publishRequest) fileSchemaRefFromBlob(des *search.DescribedBlob) (file
 // subjectHeader returns the PageHeader corresponding to the described subject.
 func (pr *publishRequest) subjectHeader(described map[string]*search.DescribedBlob) *publish.PageHeader {
 	subdes := described[pr.subject.String()]
+	scheme := "http"
+	if pr.req.TLS != nil {
+		scheme = "https"
+	}
 	header := &publish.PageHeader{
-		Title:    html.EscapeString(getTitle(subdes.BlobRef, described)),
-		CSSFiles: pr.cssFiles(),
-		Meta: func() string {
-			jsonRes, _ := json.MarshalIndent(described, "", "  ")
-			return string(jsonRes)
-		}(),
-		Subject: pr.subject.String(),
+		Title:           html.EscapeString(getTitle(subdes.BlobRef, described)),
+		CSSFiles:        pr.cssFiles(),
+		JSDeps:          pr.jsDeps(),
+		Subject:         pr.subject,
+		Host:            pr.req.Host,
+		Scheme:          scheme,
+		SubjectBasePath: pr.subjectBasePath,
+		PathPrefix:      pr.base,
+		PublishedRoot:   pr.publishedRoot,
 	}
 	return header
 }
@@ -752,6 +781,14 @@ func (pr *publishRequest) subjectHeader(described map[string]*search.DescribedBl
 func (pr *publishRequest) cssFiles() []string {
 	files := []string{}
 	for _, filename := range pr.ph.CSSFiles {
+		files = append(files, pr.staticPath(filename))
+	}
+	return files
+}
+
+func (pr *publishRequest) jsDeps() []string {
+	files := []string{}
+	for _, filename := range pr.ph.JSDeps {
 		files = append(files, pr.staticPath(filename))
 	}
 	return files

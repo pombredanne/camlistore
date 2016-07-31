@@ -24,13 +24,14 @@ import (
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/context"
-	"camlistore.org/pkg/types"
+
+	"go4.org/readerutil"
+	"golang.org/x/net/context"
 )
 
 // StreamBlobs impl.
 
-func (s *storage) StreamBlobs(ctx *context.Context, dest chan<- blobserver.BlobAndToken, contToken string) (err error) {
+func (s *storage) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAndToken, contToken string) (err error) {
 	return blobserver.NewMultiBlobStreamer(
 		smallBlobStreamer{s},
 		largeBlobStreamer{s},
@@ -41,7 +42,7 @@ type smallBlobStreamer struct{ sto *storage }
 type largeBlobStreamer struct{ sto *storage }
 
 // stream the loose blobs
-func (st smallBlobStreamer) StreamBlobs(ctx *context.Context, dest chan<- blobserver.BlobAndToken, contToken string) (err error) {
+func (st smallBlobStreamer) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAndToken, contToken string) (err error) {
 	small := st.sto.small
 	if bs, ok := small.(blobserver.BlobStreamer); ok {
 		return bs.StreamBlobs(ctx, dest, contToken)
@@ -51,14 +52,14 @@ func (st smallBlobStreamer) StreamBlobs(ctx *context.Context, dest chan<- blobse
 	return blobserver.EnumerateAllFrom(ctx, small, contToken, func(sb blob.SizedRef) error {
 		select {
 		case dest <- blobserver.BlobAndToken{
-			Blob: blob.NewBlob(sb.Ref, sb.Size, func() types.ReadSeekCloser {
+			Blob: blob.NewBlob(sb.Ref, sb.Size, func() readerutil.ReadSeekCloser {
 				return blob.NewLazyReadSeekCloser(small, sb.Ref)
 			}),
 			Token: sb.Ref.StringMinusOne(), // streamer is >=, enumerate is >
 		}:
 			return nil
 		case <-donec:
-			return context.ErrCanceled
+			return ctx.Err()
 		}
 	})
 }
@@ -68,7 +69,7 @@ var errContToken = errors.New("blobpacked: bad continuation token")
 // contToken is of forms:
 //    ""                : start from beginning of zip files
 //    "sha1-xxxxx:n"    : start at == (sha1-xxxx, file n), else next zip
-func (st largeBlobStreamer) StreamBlobs(ctx *context.Context, dest chan<- blobserver.BlobAndToken, contToken string) (err error) {
+func (st largeBlobStreamer) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAndToken, contToken string) (err error) {
 	defer close(dest)
 	s := st.sto
 	large := s.large
@@ -111,7 +112,7 @@ func (st largeBlobStreamer) StreamBlobs(ctx *context.Context, dest chan<- blobse
 			}
 			select {
 			case dest <- blobserver.BlobAndToken{
-				Blob: blob.NewBlob(bap.Ref, bap.Size, func() types.ReadSeekCloser {
+				Blob: blob.NewBlob(bap.Ref, bap.Size, func() readerutil.ReadSeekCloser {
 					return blob.NewLazyReadSeekCloser(s, bap.Ref)
 				}),
 				Token: fmt.Sprintf("%s:%d", sb.Ref, fileN),
@@ -119,7 +120,7 @@ func (st largeBlobStreamer) StreamBlobs(ctx *context.Context, dest chan<- blobse
 				fileN++
 				return nil
 			case <-ctx.Done():
-				return context.ErrCanceled
+				return ctx.Err()
 			}
 		})
 	})

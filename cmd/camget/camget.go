@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 
@@ -31,17 +30,19 @@ import (
 	"camlistore.org/pkg/buildinfo"
 	"camlistore.org/pkg/cacher"
 	"camlistore.org/pkg/client"
-	"camlistore.org/pkg/httputil"
+	"camlistore.org/pkg/cmdmain"
 	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/legal/legalprint"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/types"
+	"go4.org/types"
 )
 
 var (
-	flagVersion       = flag.Bool("version", false, "show version")
-	flagVerbose       = flag.Bool("verbose", false, "be verbose")
+	// Keeping flagVersion and flagVerbose declared like this, so we don't forget and
+	// erroneously redeclare them again in conflict with the cmdmain ones, which is not
+	// caught at build time.
+	flagVersion       = cmdmain.FlagVersion
+	flagVerbose       = cmdmain.FlagVerbose
 	flagHTTP          = flag.Bool("verbose_http", false, "show HTTP request summaries")
 	flagCheck         = flag.Bool("check", false, "just check for the existence of listed blobs; returning 0 if all are present")
 	flagOutput        = flag.String("o", "-", "Output file/directory to create.  Use -f to overwrite.")
@@ -57,12 +58,17 @@ func main() {
 	client.AddFlags()
 	flag.Parse()
 
+	if *cmdmain.FlagHelp {
+		flag.PrintDefaults()
+	}
+
 	if *flagVersion {
 		fmt.Fprintf(os.Stderr, "camget version: %s\n", buildinfo.Version())
 		return
 	}
 
-	if legalprint.MaybePrint(os.Stderr) {
+	if *cmdmain.FlagLegal {
+		cmdmain.PrintLicenses()
 		return
 	}
 
@@ -73,6 +79,10 @@ func main() {
 	var cl *client.Client
 	var items []blob.Ref
 
+	optTransportConfig := client.OptionTransportConfig(&client.TransportConfig{
+		Verbose: *flagHTTP,
+	})
+
 	if *flagShared != "" {
 		if client.ExplicitServer() != "" {
 			log.Fatal("Can't use --shared with an explicit blobserver; blobserver is implicit from the --shared URL.")
@@ -82,7 +92,9 @@ func main() {
 		}
 		cl1, target, err := client.NewFromShareRoot(*flagShared,
 			client.OptionInsecure(*flagInsecureTLS),
-			client.OptionTrustedCert(*flagTrustedCert))
+			client.OptionTrustedCert(*flagTrustedCert),
+			optTransportConfig,
+		)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -92,7 +104,7 @@ func main() {
 		if *flagTrustedCert != "" {
 			log.Fatal("Can't use --cert without --shared.")
 		}
-		cl = client.NewOrFail()
+		cl = client.NewOrFail(client.OptionInsecure(*flagInsecureTLS), optTransportConfig)
 		for n := 0; n < flag.NArg(); n++ {
 			arg := flag.Arg(n)
 			br, ok := blob.Parse(arg)
@@ -103,12 +115,7 @@ func main() {
 		}
 	}
 
-	cl.InsecureTLS = *flagInsecureTLS
-	tr := cl.TransportForConfig(&client.TransportConfig{
-		Verbose: *flagHTTP,
-	})
-	httpStats, _ := tr.(*httputil.StatsTransport)
-	cl.SetHTTPClient(&http.Client{Transport: tr})
+	httpStats := cl.HTTPStats()
 
 	diskCacheFetcher, err := cacher.NewDiskCache(cl)
 	if err != nil {
@@ -156,6 +163,8 @@ func main() {
 
 	if *flagVerbose {
 		log.Printf("HTTP requests: %d\n", httpStats.Requests())
+		h1, h2 := httpStats.ProtoVersions()
+		log.Printf("    responses: %d (h1), %d (h2)\n", h1, h2)
 	}
 }
 

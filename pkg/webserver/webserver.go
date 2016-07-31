@@ -19,7 +19,7 @@ limitations under the License.
 // Among other things, it can throttle its connections, inherit its
 // listening socket from a file descriptor in the environment, and
 // log all activity.
-package webserver
+package webserver // import "camlistore.org/pkg/webserver"
 
 import (
 	"bufio"
@@ -36,10 +36,11 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/throttle"
-	"camlistore.org/pkg/wkfs"
-	"camlistore.org/third_party/github.com/bradfitz/runsit/listen"
-	"github.com/bradfitz/http2"
+	"github.com/bradfitz/runsit/listen"
+
+	"go4.org/net/throttle"
+	"go4.org/wkfs"
+	"golang.org/x/net/http2"
 )
 
 type Server struct {
@@ -175,6 +176,7 @@ func (s *Server) Listen(addr string) error {
 			Rand:       rand.Reader,
 			Time:       time.Now,
 			NextProtos: []string{http2.NextProtoTLS, "http/1.1"},
+			MinVersion: tls.VersionTLS12,
 		}
 		config.Certificates = make([]tls.Certificate, 1)
 

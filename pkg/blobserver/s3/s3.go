@@ -31,7 +31,7 @@ Example low-level config:
      },
 
 */
-package s3
+package s3 // import "camlistore.org/pkg/blobserver/s3"
 
 import (
 	"fmt"
@@ -41,9 +41,11 @@ import (
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/blobserver/memory"
-	"camlistore.org/pkg/fault"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/misc/amazon/s3"
+
+	"go4.org/fault"
+	"go4.org/jsonconfig"
+	"go4.org/syncutil"
 )
 
 var (
@@ -58,14 +60,25 @@ var (
 	faultGet       = fault.NewInjector("s3_get")
 )
 
+const maxParallelHTTP = 5
+
 type s3Storage struct {
 	s3Client *s3.Client
 	bucket   string
-	hostname string
-	cache    *memory.Storage // or nil for no cache
+	// optional "directory" where the blobs are stored, instead of at the root of the bucket.
+	// S3 is actually flat, which in effect just means that all the objects should have this
+	// dirPrefix as a prefix of their key.
+	// If non empty, it should be a slash separated path with a trailing slash and no starting
+	// slash.
+	dirPrefix string
+	hostname  string
+	cache     *memory.Storage // or nil for no cache
 }
 
 func (s *s3Storage) String() string {
+	if s.dirPrefix != "" {
+		return fmt.Sprintf("\"s3\" blob storage at host %q, bucket %q, directory %q", s.hostname, s.bucket, s.dirPrefix)
+	}
 	return fmt.Sprintf("\"s3\" blob storage at host %q, bucket %q", s.hostname, s.bucket)
 }
 
@@ -78,11 +91,22 @@ func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (blobserver.Stora
 			SecretAccessKey: config.RequiredString("aws_secret_access_key"),
 			Hostname:        hostname,
 		},
+		PutGate: syncutil.NewGate(maxParallelHTTP),
+	}
+	bucket := config.RequiredString("bucket")
+	var dirPrefix string
+	if parts := strings.SplitN(bucket, "/", 2); len(parts) > 1 {
+		dirPrefix = parts[1]
+		bucket = parts[0]
+	}
+	if dirPrefix != "" && !strings.HasSuffix(dirPrefix, "/") {
+		dirPrefix += "/"
 	}
 	sto := &s3Storage{
-		s3Client: client,
-		bucket:   config.RequiredString("bucket"),
-		hostname: hostname,
+		s3Client:  client,
+		bucket:    bucket,
+		dirPrefix: dirPrefix,
+		hostname:  hostname,
 	}
 	skipStartupCheck := config.OptionalBool("skipStartupCheck", false)
 	if err := config.Validate(); err != nil {

@@ -29,13 +29,16 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/context"
+	"google.golang.org/cloud/datastore"
+
 	"camlistore.org/pkg/osutil"
 )
 
 var (
-	emailNow   = flag.String("email_now", "", "If non-empty, this commit hash is emailed immediately, without starting the webserver.")
-	smtpServer = flag.String("smtp_server", "127.0.0.1:25", "SMTP server")
-	emailsTo   = flag.String("email_dest", "", "If non-empty, the email address to email commit emails.")
+	emailNow   = flag.String("email_now", "", "[debug] if non-empty, this commit hash is emailed immediately, without starting the webserver.")
+	smtpServer = flag.String("smtp_server", "127.0.0.1:25", "[optional] SMTP server for sending emails on new commits.")
+	emailsTo   = flag.String("email_dest", "", "[optional] The email address for new commit emails.")
 )
 
 func startEmailCommitLoop(errc chan<- error) {
@@ -71,8 +74,7 @@ var knownCommit = map[string]bool{} // commit -> true
 var diffMarker = []byte("diff --git a/")
 
 func emailCommit(dir, hash string) (err error) {
-	cmd := exec.Command("git", "show", hash)
-	cmd.Dir = dir
+	cmd := execGit(dir, nil, "show", hash)
 	body, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("Error runnning git show: %v\n%s", err, body)
@@ -82,8 +84,7 @@ func emailCommit(dir, hash string) (err error) {
 		return nil
 	}
 
-	cmd = exec.Command("git", "show", "--pretty=oneline", hash)
-	cmd.Dir = dir
+	cmd = execGit(dir, nil, "show", "--pretty=oneline", hash)
 	out, err := cmd.Output()
 	if err != nil {
 		return
@@ -130,8 +131,16 @@ var latestHash struct {
 	s string // hash of the most recent camlistore revision
 }
 
+// dsClient is our datastore client to track which commits we've
+// emailed about. It's only non-nil in production.
+var dsClient *datastore.Client
+
 func commitEmailLoop() error {
 	http.HandleFunc("/mailnow", mailNowHandler)
+
+	var err error
+	dsClient, err = datastore.NewClient(context.Background(), "camlistore-website")
+	log.Printf("datastore = %v, %v", dsClient, err)
 
 	go func() {
 		for {
@@ -143,22 +152,12 @@ func commitEmailLoop() error {
 		}
 	}()
 
-	dir, err := osutil.GoPackagePath("camlistore.org")
-	if err != nil {
-		return err
-	}
+	dir := camSrcDir()
 
-	hashes, err := recentCommits(dir)
-	if err != nil {
-		return err
-	}
-	for _, commit := range hashes {
-		knownCommit[commit] = true
-	}
-	latestHash.Lock()
-	latestHash.s = hashes[0]
-	latestHash.Unlock()
 	http.HandleFunc("/latesthash", latestHashHandler)
+	http.HandleFunc("/debug/email", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "ds = %v, %v", dsClient, err)
+	})
 
 	for {
 		pollCommits(dir)
@@ -173,16 +172,46 @@ func commitEmailLoop() error {
 	}
 }
 
+func execGit(workdir string, mounts map[string]string, gitArgs ...string) *exec.Cmd {
+	var cmd *exec.Cmd
+	if *gitContainer {
+		args := []string{
+			"run",
+			"--rm",
+		}
+		for host, container := range mounts {
+			args = append(args, "-v", host+":"+container+":ro")
+		}
+		args = append(args, []string{
+			"-v", workdir + ":" + workdir,
+			"--workdir=" + workdir,
+			"camlistore/git",
+			"git"}...)
+		args = append(args, gitArgs...)
+		cmd = exec.Command("docker", args...)
+	} else {
+		cmd = exec.Command("git", gitArgs...)
+		cmd.Dir = workdir
+	}
+	return cmd
+}
+
+// GitCommit is a datastore entity to track which commits we've
+// already emailed about.
+type GitCommit struct {
+	Emailed bool
+}
+
 func pollCommits(dir string) {
-	cmd := exec.Command("git", "fetch", "origin")
-	cmd.Dir = dir
+	cmd := execGit(dir, nil, "pull", "origin")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Error running git fetch origin master in %s: %v\n%s", dir, err, out)
+		log.Printf("Error running git pull origin master in %s: %v\n%s", dir, err, out)
 		return
 	}
-	log.Printf("Ran git fetch.")
-	// TODO: see if .git/refs/remotes/origin/master changed. quicker.
+	log.Printf("Ran git pull.")
+	// TODO: see if .git/refs/remotes/origin/master
+	// changed. (quicker than running recentCommits each time)
 
 	hashes, err := recentCommits(dir)
 	if err != nil {
@@ -196,16 +225,36 @@ func pollCommits(dir string) {
 		if knownCommit[commit] {
 			continue
 		}
+		if dsClient != nil {
+			ctx := context.Background()
+			key := datastore.NewKey(ctx, "git_commit", commit, 0, nil)
+			var gc GitCommit
+			if err := dsClient.Get(ctx, key, &gc); err == nil && gc.Emailed {
+				log.Printf("Already emailed about commit %v; skipping", commit)
+				knownCommit[commit] = true
+				continue
+			}
+		}
 		if err := emailCommit(dir, commit); err == nil {
-			knownCommit[commit] = true
 			log.Printf("Emailed commit %s", commit)
+			knownCommit[commit] = true
+			if dsClient != nil {
+				ctx := context.Background()
+				key := datastore.NewKey(ctx, "git_commit", commit, 0, nil)
+				_, err := dsClient.Put(ctx, key, &GitCommit{Emailed: true})
+				log.Printf("datastore put of git_commit(%v): %v", commit, err)
+			}
+		}
+	}
+	if githubSSHKey != "" {
+		if err := syncToGithub(dir, hashes[0]); err != nil {
+			log.Printf("Failed to push commit %v to github: %v", hashes[0], err)
 		}
 	}
 }
 
 func recentCommits(dir string) (hashes []string, err error) {
-	cmd := exec.Command("git", "log", "--since=1 month ago", "--pretty=oneline", "origin/master")
-	cmd.Dir = dir
+	cmd := execGit(dir, nil, "log", "--since=1 month ago", "--pretty=oneline", "origin/master")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("Error running git log in %s: %v\n%s", dir, err, out)

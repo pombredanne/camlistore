@@ -26,8 +26,10 @@ import (
 	"time"
 
 	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
 
 	"google.golang.org/cloud"
+	"google.golang.org/cloud/internal/testutil"
 )
 
 func TestLogPayload(t *testing.T) {
@@ -219,6 +221,47 @@ func TestOverflow(t *testing.T) {
 	}
 }
 
+func TestIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Integration tests skipped in short mode")
+	}
+
+	ctx := context.Background()
+	ts := testutil.TokenSource(ctx, Scope)
+	if ts == nil {
+		t.Skip("Integration tests skipped. See CONTRIBUTING.md for details")
+	}
+
+	projID := testutil.ProjID()
+
+	c, err := NewClient(ctx, projID, "logging-integration-test", cloud.WithTokenSource(ts))
+	if err != nil {
+		t.Fatalf("error creating client: %v", err)
+	}
+
+	if err := c.Ping(); err != nil {
+		t.Fatalf("error pinging logging api: %v", err)
+	}
+
+	if err := c.LogSync(Entry{Payload: customJSONObject{}}); err != nil {
+		t.Fatalf("error writing log: %v", err)
+	}
+
+	if err := c.Log(Entry{Payload: customJSONObject{}}); err != nil {
+		t.Fatalf("error writing log: %v", err)
+	}
+
+	if _, err := c.Writer(Default).Write([]byte("test log with io.Writer")); err != nil {
+		t.Fatalf("error writing log using io.Writer: %v", err)
+	}
+
+	c.Logger(Default).Println("test log with log.Logger")
+
+	if err := c.Flush(); err != nil {
+		t.Fatalf("error flushing logs: %v", err)
+	}
+}
+
 func (c *Client) stats() (queued, inFlight int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -253,7 +296,10 @@ func newLogTest(t *testing.T) *logTest {
 			io.WriteString(w, "unexpected HTTP request")
 		}
 	}))
-	c, err := NewClient(context.Background(), "PROJ-ID", "LOG-NAME", cloud.WithEndpoint(ts.URL))
+	c, err := NewClient(context.Background(), "PROJ-ID", "LOG-NAME",
+		cloud.WithEndpoint(ts.URL),
+		cloud.WithTokenSource(dummyTokenSource{}), // prevent DefaultTokenSource
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,4 +351,11 @@ func (lt *logTest) getRequest() string {
 		lt.t.Fatalf("timeout waiting for request")
 		panic("unreachable")
 	}
+}
+
+// dummyTokenSource returns fake oauth2 tokens for local testing.
+type dummyTokenSource struct{}
+
+func (dummyTokenSource) Token() (*oauth2.Token, error) {
+	return new(oauth2.Token), nil
 }

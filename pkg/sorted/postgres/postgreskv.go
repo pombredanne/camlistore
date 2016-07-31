@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package postgres provides an implementation of sorted.KeyValue
 // on top of PostgreSQL.
-package postgres
+package postgres // import "camlistore.org/pkg/sorted/postgres"
 
 import (
 	"database/sql"
@@ -24,11 +24,11 @@ import (
 	"regexp"
 
 	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/sorted"
 	"camlistore.org/pkg/sorted/sqlkv"
+	"go4.org/jsonconfig"
 
-	_ "camlistore.org/third_party/github.com/lib/pq"
+	_ "github.com/lib/pq"
 )
 
 func init() {

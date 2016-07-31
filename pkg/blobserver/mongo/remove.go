@@ -18,10 +18,11 @@ package mongo
 
 import (
 	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/syncutil"
 
-	"camlistore.org/third_party/labix.org/v2/mgo"
-	"camlistore.org/third_party/labix.org/v2/mgo/bson"
+	"go4.org/syncutil"
+
+	"labix.org/v2/mgo"
+	"labix.org/v2/mgo/bson"
 )
 
 var removeGate = syncutil.NewGate(100) // arbitrary

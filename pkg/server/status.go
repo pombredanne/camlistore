@@ -18,6 +18,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -35,11 +36,13 @@ import (
 	"camlistore.org/pkg/env"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/search"
 	"camlistore.org/pkg/server/app"
 	"camlistore.org/pkg/types/camtypes"
+	"go4.org/jsonconfig"
+
+	"google.golang.org/cloud/compute/metadata"
 )
 
 // StatusHandler publishes server status information.
@@ -208,6 +211,17 @@ func (sh *StatusHandler) serveStatusJSON(rw http.ResponseWriter, req *http.Reque
 	httputil.ReturnJSON(rw, sh.currentStatus())
 }
 
+func (sh *StatusHandler) googleCloudConsole() (string, error) {
+	if !env.OnGCE() {
+		return "", errors.New("not on GCE")
+	}
+	projID, err := metadata.ProjectID()
+	if err != nil {
+		return "", fmt.Errorf("Error getting project ID: %v", err)
+	}
+	return "https://console.cloud.google.com/compute/instances?project=" + projID, nil
+}
+
 var quotedPrefix = regexp.MustCompile(`[;"]/(\S+?/)[&"]`)
 
 func (sh *StatusHandler) serveStatusHTML(rw http.ResponseWriter, req *http.Request) {
@@ -237,13 +251,24 @@ func (sh *StatusHandler) serveStatusHTML(rw http.ResponseWriter, req *http.Reque
 	f("<h2>Logs</h2><ul>")
 	f("  <li><a href='/debug/config'>/debug/config</a> - server config</li>\n")
 	if env.OnGCE() {
-		f("  <li><a href='/debug/logs'>/debug/logs</a> - server logs</li>\n")
-		f("  <li><a href='/debug/logs?TODO'>/debug/logs?XXX</a> - camlistored logs</li>\n")
+		f("  <li><a href='/debug/logs/camlistored'>camlistored logs on Google Cloud Logging</a></li>\n")
+		f("  <li><a href='/debug/logs/system'>system logs from Google Compute Engine</a></li>\n")
 	}
 	f("</ul>")
 
 	f("<h2>Admin</h2>")
-	f("<form method='post' action='restart' onsubmit='return confirm(\"Really restart now?\")'><button>restart server</button></form>")
+	f("<ul>")
+	f("  <li><form method='post' action='restart' onsubmit='return confirm(\"Really restart now?\")'><button>restart server</button>")
+	f("<input type='checkbox' name='reindex'> reindex</form></li>")
+	if env.OnGCE() {
+		console, err := sh.googleCloudConsole()
+		if err != nil {
+			log.Printf("error getting Google Cloud Console URL: %v", err)
+		} else {
+			f("   <li><b>Updating:</b> When a new image for Camlistore on GCE is available, you can update by hitting \"Reset\" (or \"Stop\", then \"Start\") for your instance on your <a href='%s'>Google Cloud Console</a>.<br>Alternatively, you can ssh to your instance and restart the Camlistore service with: <b>sudo systemctl restart camlistored</b>.</li>", console)
+		}
+	}
+	f("</ul>")
 
 	f("<h2>Handlers</h2>")
 	f("<p>As JSON: <a href='status.json'>status.json</a>; and the <a href='%s?camli.mode=config'>discovery JSON</a>.</p>", st.rootPrefix)
@@ -285,13 +310,15 @@ func (sh *StatusHandler) serveRestart(rw http.ResponseWriter, req *http.Request)
 		}
 	}
 
+	reindex := (req.FormValue("reindex") == "on")
+
 	log.Println("Restarting camlistored")
 	rw.Header().Set("Connection", "close")
 	http.Redirect(rw, req, sh.prefix, http.StatusFound)
 	if f, ok := rw.(http.Flusher); ok {
 		f.Flush()
 	}
-	osutil.RestartProcess()
+	osutil.RestartProcess(fmt.Sprintf("-reindex=%t", reindex))
 }
 
 var cgoEnabled bool

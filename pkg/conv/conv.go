@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package conv contains utilities for parsing values delimited by spaces.
-package conv
+package conv // import "camlistore.org/pkg/conv"
 
 import (
 	"bytes"
@@ -23,7 +23,8 @@ import (
 	"fmt"
 
 	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/strutil"
+
+	"go4.org/strutil"
 )
 
 func ParseFields(v []byte, dst ...interface{}) error {

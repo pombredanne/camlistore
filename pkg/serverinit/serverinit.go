@@ -17,7 +17,7 @@ limitations under the License.
 // Package serverinit is responsible for mapping from a Camlistore
 // configuration file and instantiating HTTP Handlers for all the
 // necessary endpoints.
-package serverinit
+package serverinit // import "camlistore.org/pkg/serverinit"
 
 import (
 	"bytes"
@@ -33,6 +33,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	rpprof "runtime/pprof"
 	"strconv"
 	"strings"
@@ -42,10 +43,14 @@ import (
 	"camlistore.org/pkg/blobserver/handlers"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/jsonconfig"
+	"camlistore.org/pkg/jsonsign/signhandler"
+	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/server"
 	"camlistore.org/pkg/server/app"
 	"camlistore.org/pkg/types/serverconfig"
+	"go4.org/jsonconfig"
+
+	"google.golang.org/cloud/compute/metadata"
 )
 
 const camliPrefix = "/camli/"
@@ -233,11 +238,6 @@ func (hl *handlerLoader) configType(prefix string) string {
 	return ""
 }
 
-func (hl *handlerLoader) getOrSetup(prefix string) interface{} {
-	hl.setupHandler(prefix)
-	return hl.handler[prefix]
-}
-
 func (hl *handlerLoader) MyPrefix() string {
 	return hl.curPrefix
 }
@@ -338,7 +338,15 @@ func (hl *handlerLoader) setupHandler(prefix string) {
 
 	var hh http.Handler
 	if h.htype == "app" {
-		ap, err := app.NewHandler(h.conf, hl.baseURL+"/", prefix)
+		// h.conf might already contain the server's baseURL, but
+		// camlistored.go derives (if needed) a more useful hl.baseURL,
+		// after h.conf was generated, so we provide it as well to
+		// FromJSONConfig so NewHandler can benefit from it.
+		hc, err := app.FromJSONConfig(h.conf, hl.baseURL)
+		if err != nil {
+			exitFailure("error setting up app config for prefix %q: %v", h.prefix, err)
+		}
+		ap, err := app.NewHandler(hc)
 		if err != nil {
 			exitFailure("error setting up app for prefix %q: %v", h.prefix, err)
 		}
@@ -363,9 +371,9 @@ func (hl *handlerLoader) setupHandler(prefix string) {
 	if h.internal {
 		wrappedHandler = unauthorizedHandler{}
 	} else {
-		wrappedHandler = &httputil.PrefixHandler{prefix, hh}
+		wrappedHandler = &httputil.PrefixHandler{Prefix: prefix, Handler: hh}
 		if handlerTypeWantsAuth(h.htype) {
-			wrappedHandler = auth.Handler{wrappedHandler}
+			wrappedHandler = auth.Handler{Handler: wrappedHandler}
 		}
 	}
 	hl.installer.Handle(prefix, wrappedHandler)
@@ -397,6 +405,10 @@ type Config struct {
 	// apps is the list of server apps configured during InstallHandlers,
 	// and that should be started after camlistored has started serving.
 	apps []*app.Handler
+	// signHandler is found and configured during InstallHandlers, or nil.
+	// It is stored in the Config, so we can call UploadPublicKey on on it as
+	// soon as camlistored is ready for it.
+	signHandler *signhandler.Handler
 }
 
 // detectConfigChange returns an informative error if conf contains obsolete keys.
@@ -439,7 +451,8 @@ func Load(config []byte) (*Config, error) {
 }
 
 func load(filename string, opener func(filename string) (jsonconfig.File, error)) (*Config, error) {
-	c := &jsonconfig.ConfigParser{Open: opener}
+	c := osutil.NewJSONConfigParser()
+	c.Open = opener
 	m, err := c.ReadFile(filename)
 	if err != nil {
 		return nil, err
@@ -506,6 +519,7 @@ func (config *Config) InstallHandlers(hi HandlerInstaller, baseURL string, reind
 	defer func() {
 		if e := recover(); e != nil {
 			log.Printf("Caught panic installer handlers: %v", e)
+			debug.PrintStack()
 			err = fmt.Errorf("Caught panic: %v", e)
 		}
 	}()
@@ -583,6 +597,9 @@ func (config *Config) InstallHandlers(hi HandlerInstaller, baseURL string, reind
 		if helpHandler, ok := handler.(*server.HelpHandler); ok {
 			helpHandler.SetServerConfig(config.Obj)
 		}
+		if signHandler, ok := handler.(*signhandler.Handler); ok {
+			config.signHandler = signHandler
+		}
 		if in, ok := handler.(blobserver.HandlerIniter); ok {
 			if err := in.InitHandler(hl); err != nil {
 				return nil, fmt.Errorf("Error calling InitHandler on %s: %v", pfx, err)
@@ -596,9 +613,17 @@ func (config *Config) InstallHandlers(hi HandlerInstaller, baseURL string, reind
 	if v, _ := strconv.ParseBool(os.Getenv("CAMLI_HTTP_PPROF")); v {
 		hi.Handle("/debug/pprof/", profileHandler{})
 	}
+	hi.Handle("/debug/goroutines", auth.RequireAuth(http.HandlerFunc(dumpGoroutines), auth.OpRead))
 	hi.Handle("/debug/config", auth.RequireAuth(configHandler{config}, auth.OpAll))
-	hi.Handle("/debug/logs", auth.RequireAuth(http.HandlerFunc(logsHandler), auth.OpAll))
+	hi.Handle("/debug/logs/", auth.RequireAuth(http.HandlerFunc(logsHandler), auth.OpAll))
 	return multiCloser(hl.closers), nil
+}
+
+func dumpGoroutines(w http.ResponseWriter, r *http.Request) {
+	buf := make([]byte, 2<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write(buf)
 }
 
 // StartApps starts all the server applications that were configured
@@ -612,6 +637,15 @@ func (config *Config) StartApps() error {
 		}
 	}
 	return nil
+}
+
+// UploadPublicKey uploads the public key blob with the sign handler that was
+// configured during InstallHandlers.
+func (config *Config) UploadPublicKey() error {
+	if config.signHandler == nil {
+		return nil
+	}
+	return config.signHandler.UploadPublicKey()
 }
 
 // AppURL returns a map of app name to app base URL for all the configured
@@ -666,16 +700,22 @@ type configHandler struct {
 
 var (
 	knownKeys     = regexp.MustCompile(`(?ms)^\s+"_knownkeys": {.+?},?\n`)
-	sensitiveLine = regexp.MustCompile(`(?m)^\s+\"(auth|aws_secret_access_key|password)\": "[^\"]+".*\n`)
+	sensitiveLine = regexp.MustCompile(`(?m)^\s+\"(auth|aws_secret_access_key|password|client_secret)\": "[^\"]+".*\n`)
+	trailingComma = regexp.MustCompile(`,(\n\s*\})`)
 )
 
-func (h configHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h configHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	b, _ := json.MarshalIndent(h.c.Obj, "", "    ")
 	b = knownKeys.ReplaceAll(b, nil)
+	b = trailingComma.ReplaceAll(b, []byte("$1"))
 	b = sensitiveLine.ReplaceAllFunc(b, func(ln []byte) []byte {
 		i := bytes.IndexByte(ln, ':')
-		return []byte(string(ln[:i+1]) + " REDACTED\n")
+		r := string(ln[:i+1]) + ` "REDACTED"`
+		if bytes.HasSuffix(bytes.TrimSpace(ln), []byte{','}) {
+			r += ","
+		}
+		return []byte(r + "\n")
 	})
 	w.Write(b)
 }
@@ -697,18 +737,33 @@ func (profileHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 func logsHandler(w http.ResponseWriter, r *http.Request) {
-	c := &http.Client{
-		Transport: &http.Transport{
-			Dial: func(network, addr string) (net.Conn, error) {
-				return net.Dial("unix", "/run/camjournald.sock")
+	suffix := strings.TrimPrefix(r.URL.Path, "/debug/logs/")
+	switch suffix {
+	case "camlistored":
+		projID, err := metadata.ProjectID()
+		if err != nil {
+			httputil.ServeError(w, r, fmt.Errorf("Error getting project ID: %v", err))
+			return
+		}
+		http.Redirect(w, r,
+			"https://console.developers.google.com/logs?project="+projID+"&service=custom.googleapis.com&logName=camlistored-stderr",
+			http.StatusFound)
+	case "system":
+		c := &http.Client{
+			Transport: &http.Transport{
+				Dial: func(network, addr string) (net.Conn, error) {
+					return net.Dial("unix", "/run/camjournald.sock")
+				},
 			},
-		},
+		}
+		res, err := c.Get("http://journal/entries")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		io.Copy(w, res.Body)
+	default:
+		http.Error(w, "no such logs", 404)
 	}
-	res, err := c.Get("http://journal/entries")
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	io.Copy(w, res.Body)
 }

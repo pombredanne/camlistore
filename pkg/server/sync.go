@@ -36,13 +36,14 @@ import (
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/constants"
-	"camlistore.org/pkg/context"
 	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/syncutil"
 	"camlistore.org/pkg/types/camtypes"
-	"camlistore.org/third_party/code.google.com/p/xsrftoken"
+	"code.google.com/p/xsrftoken"
+	"go4.org/jsonconfig"
+	"golang.org/x/net/context"
+
+	"go4.org/syncutil"
 )
 
 const (
@@ -93,6 +94,11 @@ type SyncHandler struct {
 	vdestBytes     int64 // number of blob bytes seen on dest during validate
 	vsrcCount      int   // number of blobs seen on src during validate
 	vsrcBytes      int64 // number of blob bytes seen on src during validate
+
+	// syncLoop tries to send on alarmIdlec each time we've slept for a full
+	// queueSyncInterval. Initialized as a synchronous chan if we're not an
+	// idle sync handler, otherwise nil.
+	alarmIdlec chan struct{}
 }
 
 var (
@@ -168,7 +174,7 @@ func newSyncFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (http.Handler,
 		didFullSync := make(chan bool, 1)
 		go func() {
 			for {
-				n := sh.runSync("queue", sh.enumeratePendingBlobs)
+				n := sh.runSync("pending blobs queue", sh.enumeratePendingBlobs)
 				if n > 0 {
 					sh.logf("Queue sync copied %d blobs", n)
 					continue
@@ -214,7 +220,7 @@ func newSyncHandler(fromName, toName string,
 	from blobserver.Storage, to blobReceiverEnumerator,
 	queue sorted.KeyValue) *SyncHandler {
 	return &SyncHandler{
-		copierPoolSize: 2,
+		copierPoolSize: 5,
 		from:           from,
 		to:             to,
 		fromName:       fromName,
@@ -225,6 +231,38 @@ func newSyncHandler(fromName, toName string,
 		needCopy:       make(map[blob.Ref]uint32),
 		lastFail:       make(map[blob.Ref]failDetail),
 		copying:        make(map[blob.Ref]*copyStatus),
+		alarmIdlec:     make(chan struct{}),
+	}
+}
+
+// NewSyncHandler returns a handler that will asynchronously and continuously
+// copy blobs from src to dest, if missing on dest.
+// Blobs waiting to be copied are stored on pendingQueue. srcName and destName are
+// only used for status and debugging messages.
+// N.B: blobs should be added to src with a method that notifies the blob hub,
+// such as blobserver.Receive.
+func NewSyncHandler(srcName, destName string,
+	src blobserver.Storage, dest blobReceiverEnumerator,
+	pendingQueue sorted.KeyValue) *SyncHandler {
+	sh := newSyncHandler(srcName, destName, src, dest, pendingQueue)
+	go sh.syncLoop()
+	blobserver.GetHub(sh.from).AddReceiveHook(sh.enqueue)
+	return sh
+}
+
+// IdleWait waits until the sync handler has finished processing the currently
+// queued blobs.
+func (sh *SyncHandler) IdleWait() {
+	if sh.idle {
+		return
+	}
+	<-sh.alarmIdlec
+}
+
+func (sh *SyncHandler) signalIdle() {
+	select {
+	case sh.alarmIdlec <- struct{}{}:
+	default:
 	}
 }
 
@@ -309,7 +347,7 @@ func (sh *SyncHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if req.Method == "POST" {
 		if req.FormValue("mode") == "validate" {
 			token := req.FormValue("token")
-			if xsrftoken.Valid(token, auth.ProcessRandom(), "user", "runFullValidate") {
+			if xsrftoken.Valid(token, auth.Token(), "user", "runFullValidate") {
 				sh.startFullValidation()
 				http.Redirect(rw, req, "./", http.StatusFound)
 				return
@@ -353,7 +391,7 @@ func (sh *SyncHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	f("<h2>Validation</h2>")
 	if len(sh.vshards) == 0 {
 		f("Validation disabled")
-		token := xsrftoken.Generate(auth.ProcessRandom(), "user", "runFullValidate")
+		token := xsrftoken.Generate(auth.Token(), "user", "runFullValidate")
 		f("<form method='POST'><input type='hidden' name='mode' value='validate'><input type='hidden' name='token' value='%s'><input type='submit' value='Start validation'></form>", token)
 	} else {
 		f("<p>Background scan of source and destination to ensure that the destination has everything the source does, or is at least enqueued to sync.</p>")
@@ -368,7 +406,11 @@ func (sh *SyncHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		f("<li>Dest bytes seen: %d</li>", sh.vdestBytes)
 		f("<li>Blobs found missing &amp; enqueued: %d</li>", sh.vmissing)
 		if len(sh.vshardErrs) > 0 {
-			f("<li>Validation errors: %s</li>", sh.vshardErrs)
+			f("<li>Validation errors:<ul>\n")
+			for _, e := range sh.vshardErrs {
+				f("  <li>%s</li>\n", html.EscapeString(e))
+			}
+			f("</li>\n")
 		}
 		f("</ul>")
 	}
@@ -419,7 +461,7 @@ type copyResult struct {
 	err error
 }
 
-func blobserverEnumerator(ctx *context.Context, src blobserver.BlobEnumerator) func(chan<- blob.SizedRef, <-chan struct{}) error {
+func blobserverEnumerator(ctx context.Context, src blobserver.BlobEnumerator) func(chan<- blob.SizedRef, <-chan struct{}) error {
 	return func(dst chan<- blob.SizedRef, intr <-chan struct{}) error {
 		return blobserver.EnumerateAll(ctx, src, func(sb blob.SizedRef) error {
 			select {
@@ -446,7 +488,7 @@ func (sh *SyncHandler) enumeratePendingBlobs(dst chan<- blob.SizedRef, intr <-ch
 		}
 		toSend = make([]blob.SizedRef, 0, n)
 		for br, size := range sh.needCopy {
-			toSend = append(toSend, blob.SizedRef{br, size})
+			toSend = append(toSend, blob.SizedRef{Ref: br, Size: size})
 			if len(toSend) == n {
 				break
 			}
@@ -476,7 +518,7 @@ func (sh *SyncHandler) enumerateQueuedBlobs(dst chan<- blob.SizedRef, intr <-cha
 			continue
 		}
 		select {
-		case dst <- blob.SizedRef{br, uint32(size)}:
+		case dst <- blob.SizedRef{Ref: br, Size: uint32(size)}:
 		case <-intr:
 			return it.Close()
 		}
@@ -484,7 +526,7 @@ func (sh *SyncHandler) enumerateQueuedBlobs(dst chan<- blob.SizedRef, intr <-cha
 	return it.Close()
 }
 
-func (sh *SyncHandler) runSync(srcName string, enumSrc func(chan<- blob.SizedRef, <-chan struct{}) error) int {
+func (sh *SyncHandler) runSync(syncType string, enumSrc func(chan<- blob.SizedRef, <-chan struct{}) error) int {
 	enumch := make(chan blob.SizedRef, 8)
 	errch := make(chan error, 1)
 	intr := make(chan struct{})
@@ -519,7 +561,7 @@ FeedWork:
 	}
 
 	if err := <-errch; err != nil {
-		sh.logf("error enumerating from source: %v", err)
+		sh.logf("error enumerating for %v sync: %v", syncType, err)
 	}
 	return nCopied
 }
@@ -536,6 +578,7 @@ func (sh *SyncHandler) syncLoop() {
 		d := queueSyncInterval - time.Since(t0)
 		select {
 		case <-time.After(d):
+			sh.signalIdle()
 		case <-sh.wakec:
 		}
 	}
@@ -602,7 +645,7 @@ func (sh *SyncHandler) ReceiveBlob(br blob.Ref, r io.Reader) (sb blob.SizedRef, 
 	if err != nil {
 		return
 	}
-	sb = blob.SizedRef{br, uint32(n)}
+	sb = blob.SizedRef{Ref: br, Size: uint32(n)}
 	return sb, sh.enqueue(sb)
 }
 
@@ -702,8 +745,8 @@ func (sh *SyncHandler) validateShardPrefix(pfx string) (err error) {
 		}
 		sh.mu.Unlock()
 	}()
-	ctx := context.New()
-	defer ctx.Cancel()
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
 	src, serrc := sh.startValidatePrefix(ctx, pfx, false)
 	dst, derrc := sh.startValidatePrefix(ctx, pfx, true)
 	srcErr := &chanError{
@@ -751,7 +794,7 @@ func (sh *SyncHandler) validateShardPrefix(pfx string) (err error) {
 var errNotPrefix = errors.New("sentinel error: hit blob into the next shard")
 
 // doDest is false for source and true for dest.
-func (sh *SyncHandler) startValidatePrefix(ctx *context.Context, pfx string, doDest bool) (<-chan blob.SizedRef, <-chan error) {
+func (sh *SyncHandler) startValidatePrefix(ctx context.Context, pfx string, doDest bool) (<-chan blob.SizedRef, <-chan error) {
 	var e blobserver.BlobEnumerator
 	if doDest {
 		e = sh.to
@@ -792,7 +835,7 @@ func (sh *SyncHandler) startValidatePrefix(ctx *context.Context, pfx string, doD
 				sh.mu.Unlock()
 				return nil
 			case <-ctx.Done():
-				return context.ErrCanceled
+				return ctx.Err()
 			}
 		})
 		if err == errNotPrefix {
@@ -977,7 +1020,7 @@ func (sh *SyncHandler) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) er
 	return nil
 }
 
-func (sh *SyncHandler) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+func (sh *SyncHandler) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	defer close(dest)
 	sh.logf("Unexpected EnumerateBlobs call")
 	return nil

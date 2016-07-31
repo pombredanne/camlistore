@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -36,12 +35,13 @@ import (
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/cacher"
 	"camlistore.org/pkg/client"
+	"camlistore.org/pkg/cmdmain"
 	"camlistore.org/pkg/fs"
-	"camlistore.org/pkg/legal/legalprint"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/search"
-	"camlistore.org/third_party/bazil.org/fuse"
-	fusefs "camlistore.org/third_party/bazil.org/fuse/fs"
+
+	"bazil.org/fuse"
+	fusefs "bazil.org/fuse/fs"
 )
 
 var (
@@ -65,8 +65,13 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	if legalprint.MaybePrint(os.Stderr) {
+	if *cmdmain.FlagLegal {
+		cmdmain.PrintLicenses()
 		return
+	}
+
+	if *cmdmain.FlagHelp {
+		usage()
 	}
 
 	narg := flag.NArg()
@@ -113,7 +118,6 @@ func main() {
 			}
 		} else {
 			cl = client.NewOrFail() // automatic from flags
-			cl.SetHTTPClient(&http.Client{Transport: cl.TransportForConfig(nil)})
 
 			var ok bool
 			root, ok = blob.Parse(rootArg)
@@ -136,7 +140,6 @@ func main() {
 		}
 	} else {
 		cl = client.NewOrFail() // automatic from flags
-		cl.SetHTTPClient(&http.Client{Transport: cl.TransportForConfig(nil)})
 	}
 
 	diskCacheFetcher, err := cacher.NewDiskCache(cl)
@@ -164,7 +167,7 @@ func main() {
 
 	conn, err = fuse.Mount(mountPoint, fuse.VolumeName(filepath.Base(mountPoint)))
 	if err != nil {
-		if err.Error() == "cannot find load_fusefs" && runtime.GOOS == "darwin" {
+		if err == fuse.ErrOSXFUSENotFound {
 			log.Fatal("FUSE not available; install from http://osxfuse.github.io/")
 		}
 		log.Fatalf("Mount: %v", err)

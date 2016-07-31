@@ -23,7 +23,8 @@ import (
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/client"
 	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/syncutil"
+
+	"go4.org/syncutil"
 )
 
 // TODO(mpl): move Uploader to pkg/client, or maybe its own pkg, and clean up files.go
@@ -41,7 +42,7 @@ type Uploader struct {
 	// of a Client?
 	altStatReceiver blobserver.StatReceiver
 
-	transport *httputil.StatsTransport // for HTTP statistics
+	stats     *httputil.StatsTransport // if non-nil, HTTP statistics
 	pwd       string
 	statCache UploadCache
 	haveCache HaveCache
@@ -56,9 +57,9 @@ type fileOptions struct {
 	// the above permanode.
 	tag string
 	// perform for the client the actions needing gpg signing when uploading a file.
-	vivify   bool
-	exifTime bool // use the time in exif metadata as the modtime if possible.
-	capCtime bool // use mtime as ctime if ctime > mtime
+	vivify       bool
+	exifTime     bool // use the time in exif metadata as the modtime if possible.
+	capCtime     bool // use mtime as ctime if ctime > mtime
 	contentsOnly bool // do not store any of the file's attributes, only its contents.
 }
 

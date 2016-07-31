@@ -29,7 +29,7 @@ Example low-level config:
      },
 
 */
-package shard
+package shard // import "camlistore.org/pkg/blobserver/shard"
 
 import (
 	"errors"
@@ -37,8 +37,8 @@ import (
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/context"
-	"camlistore.org/pkg/jsonconfig"
+	"go4.org/jsonconfig"
+	"golang.org/x/net/context"
 )
 
 type shardStorage struct {
@@ -98,7 +98,7 @@ func (sto *shardStorage) batchedShards(blobs []blob.Ref, fn func(blobserver.Stor
 		}()
 	}
 	var reterr error
-	for _ = range m {
+	for range m {
 		if err := <-ch; err != nil {
 			reterr = err
 		}
@@ -118,7 +118,7 @@ func (sto *shardStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) 
 	})
 }
 
-func (sto *shardStorage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+func (sto *shardStorage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	return blobserver.MergedEnumerateStorage(ctx, dest, sto.shards, after, limit)
 }
 

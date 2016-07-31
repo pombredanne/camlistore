@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package gce configures hooks for running Camlistore for Google Compute Engine.
-package gce
+package gce // import "camlistore.org/pkg/osutil/gce"
 
 import (
 	"errors"
@@ -27,11 +27,11 @@ import (
 	"strings"
 
 	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/osutil"
-	_ "camlistore.org/pkg/wkfs/gcs"
-	"golang.org/x/net/context"
 
+	"go4.org/jsonconfig"
+	_ "go4.org/wkfs/gcs"
+	"golang.org/x/net/context"
 	"google.golang.org/cloud/compute/metadata"
 	"google.golang.org/cloud/logging"
 )

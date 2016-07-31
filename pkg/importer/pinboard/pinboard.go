@@ -40,7 +40,7 @@ the future provide an api that lets us query what has changed.  We
 might want to switch to that when available to make the import process
 more light-weight.
 */
-package pinboard
+package pinboard // import "camlistore.org/pkg/importer/pinboard"
 
 import (
 	"encoding/json"
@@ -52,12 +52,13 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/context"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/importer"
 	"camlistore.org/pkg/schema"
 	"camlistore.org/pkg/schema/nodeattr"
-	"camlistore.org/pkg/syncutil"
+
+	"go4.org/ctxutil"
+	"go4.org/syncutil"
 )
 
 func init() {
@@ -245,16 +246,16 @@ func (r *run) importBatch(authToken string, parent *importer.Object) (keepTrying
 	sleepDuration := r.nextAfter.Sub(time.Now())
 	// block until we either get canceled or until it is time to run
 	select {
-	case <-r.Done():
+	case <-r.Context().Done():
 		log.Printf("pinboard: Importer interrupted.")
-		return false, context.ErrCanceled
+		return false, r.Context().Err()
 	case <-time.After(sleepDuration):
 		// just proceed
 	}
 	start := time.Now()
 
 	u := fmt.Sprintf(fetchUrl, authToken, batchLimit, r.nextCursor)
-	resp, err := r.HTTPClient().Get(u)
+	resp, err := ctxutil.Client(r.Context()).Get(u)
 	if err != nil {
 		return false, err
 	}
@@ -291,9 +292,11 @@ func (r *run) importBatch(authToken string, parent *importer.Object) (keepTrying
 	log.Printf("pinboard: Importing %d posts...", postCount)
 	var grp syncutil.Group
 	for _, post := range postBatch {
-		if r.Context.IsCanceled() {
+		select {
+		case <-r.Context().Done():
 			log.Printf("pinboard: Importer interrupted")
-			return false, context.ErrCanceled
+			return false, r.Context().Err()
+		default:
 		}
 
 		post := post

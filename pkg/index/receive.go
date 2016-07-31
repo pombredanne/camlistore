@@ -22,11 +22,14 @@ import (
 	"errors"
 	"fmt"
 	_ "image/gif"
+	_ "image/jpeg"
 	_ "image/png"
 	"io"
 	"log"
+	"math"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,12 +41,12 @@ import (
 	"camlistore.org/pkg/magic"
 	"camlistore.org/pkg/media"
 	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/types"
-
-	"camlistore.org/third_party/github.com/hjfreyer/taglib-go/taglib"
-	"camlistore.org/third_party/github.com/rwcarlsen/goexif/exif"
-	"camlistore.org/third_party/github.com/rwcarlsen/goexif/tiff"
-	_ "camlistore.org/third_party/go/pkg/image/jpeg"
+	"github.com/hjfreyer/taglib-go/taglib"
+	"github.com/rwcarlsen/goexif/exif"
+	"github.com/rwcarlsen/goexif/tiff"
+	"go4.org/readerutil"
+	"go4.org/types"
+	"golang.org/x/net/context"
 )
 
 // outOfOrderIndexerLoop asynchronously reindexes blobs received
@@ -51,7 +54,7 @@ import (
 // index has no blobSource.
 func (ix *Index) outOfOrderIndexerLoop() {
 	ix.mu.RLock()
-	if ix.oooRunning == true {
+	if ix.oooRunning {
 		panic("outOfOrderIndexerLoop is already running")
 	}
 	if ix.blobSource == nil {
@@ -60,11 +63,11 @@ func (ix *Index) outOfOrderIndexerLoop() {
 	ix.oooRunning = true
 	ix.mu.RUnlock()
 WaitTickle:
-	for _ = range ix.tickleOoo {
+	for range ix.tickleOoo {
 		for {
-			ix.mu.Lock()
+			ix.Lock()
 			if len(ix.readyReindex) == 0 {
-				ix.mu.Unlock()
+				ix.Unlock()
 				continue WaitTickle
 			}
 			var br blob.Ref
@@ -72,25 +75,25 @@ WaitTickle:
 				break
 			}
 			delete(ix.readyReindex, br)
-			ix.mu.Unlock()
+			ix.Unlock()
 
 			err := ix.indexBlob(br)
 			if err != nil {
 				log.Printf("out-of-order indexBlob(%v) = %v", br, err)
-				ix.mu.Lock()
+				ix.Lock()
 				if len(ix.needs[br]) == 0 {
 					ix.readyReindex[br] = true
 				}
-				ix.mu.Unlock()
+				ix.Unlock()
 			}
 		}
 	}
 }
 
 func (ix *Index) indexBlob(br blob.Ref) error {
-	ix.mu.RLock()
+	ix.RLock()
 	bs := ix.blobSource
-	ix.mu.RUnlock()
+	ix.RUnlock()
 	if bs == nil {
 		panic(fmt.Sprintf("index: can't re-index %v: no blobSource", br))
 	}
@@ -147,8 +150,6 @@ func blobsFilteringOut(v []blob.Ref, x blob.Ref) []blob.Ref {
 }
 
 func (ix *Index) noteBlobIndexed(br blob.Ref) {
-	ix.mu.Lock()
-	defer ix.mu.Unlock()
 	for _, needer := range ix.neededBy[br] {
 		newNeeds := blobsFilteringOut(ix.needs[needer], br)
 		if len(newNeeds) == 0 {
@@ -183,6 +184,11 @@ func (ix *Index) removeAllMissingEdges(br blob.Ref) {
 }
 
 func (ix *Index) ReceiveBlob(blobRef blob.Ref, source io.Reader) (retsb blob.SizedRef, err error) {
+	ctx := context.TODO()
+
+	ix.Lock()
+	defer ix.Unlock()
+
 	missingDeps := false
 	defer func() {
 		if err == nil {
@@ -199,7 +205,7 @@ func (ix *Index) ReceiveBlob(blobRef blob.Ref, source io.Reader) (retsb blob.Siz
 	}
 	if haveVal, haveErr := ix.s.Get("have:" + blobRef.String()); haveErr == nil {
 		if strings.HasSuffix(haveVal, "|indexed") {
-			return blob.SizedRef{blobRef, uint32(written)}, nil
+			return blob.SizedRef{Ref: blobRef, Size: uint32(written)}, nil
 		}
 	}
 
@@ -209,7 +215,7 @@ func (ix *Index) ReceiveBlob(blobRef blob.Ref, source io.Reader) (retsb blob.Siz
 		fetcher: ix.blobSource,
 	}
 
-	mm, err := ix.populateMutationMap(fetcher, blobRef, sniffer)
+	mm, err := ix.populateMutationMap(ctx, fetcher, blobRef, sniffer)
 	if err != nil {
 		if err != errMissingDep {
 			return
@@ -231,7 +237,7 @@ func (ix *Index) ReceiveBlob(blobRef blob.Ref, source io.Reader) (retsb blob.Siz
 			// successfully recorded that the blob isn't
 			// indexed, but we'll reindex it later once
 			// the dependent blobs arrive.
-			return blob.SizedRef{blobRef, uint32(written)}, nil
+			return blob.SizedRef{Ref: blobRef, Size: uint32(written)}, nil
 		}
 		return
 	}
@@ -241,7 +247,7 @@ func (ix *Index) ReceiveBlob(blobRef blob.Ref, source io.Reader) (retsb blob.Siz
 	}
 
 	if c := ix.corpus; c != nil {
-		if err = c.addBlob(blobRef, mm); err != nil {
+		if err = c.addBlob(ctx, blobRef, mm); err != nil {
 			return
 		}
 	}
@@ -253,7 +259,7 @@ func (ix *Index) ReceiveBlob(blobRef blob.Ref, source io.Reader) (retsb blob.Siz
 	// mimeType := sniffer.MIMEType()
 	// log.Printf("indexer: received %s; type=%v; truncated=%v", blobRef, mimeType, sniffer.IsTruncated())
 
-	return blob.SizedRef{blobRef, uint32(written)}, nil
+	return blob.SizedRef{Ref: blobRef, Size: uint32(written)}, nil
 }
 
 // commit writes the contents of the mutationMap on a batch
@@ -286,7 +292,7 @@ func (ix *Index) commit(mm *mutationMap) error {
 //
 // the blobref can be trusted at this point (it's been fully consumed
 // and verified to match), and the sniffer has been populated.
-func (ix *Index) populateMutationMap(fetcher *missTrackFetcher, br blob.Ref, sniffer *BlobSniffer) (*mutationMap, error) {
+func (ix *Index) populateMutationMap(ctx context.Context, fetcher *missTrackFetcher, br blob.Ref, sniffer *BlobSniffer) (*mutationMap, error) {
 	mm := &mutationMap{
 		kv: map[string]string{
 			"meta:" + br.String(): fmt.Sprintf("%d|%s", sniffer.Size(), sniffer.MIMEType()),
@@ -296,7 +302,7 @@ func (ix *Index) populateMutationMap(fetcher *missTrackFetcher, br blob.Ref, sni
 	if blob, ok := sniffer.SchemaBlob(); ok {
 		switch blob.Type() {
 		case "claim":
-			err = ix.populateClaim(fetcher, blob, mm)
+			err = ix.populateClaim(ctx, fetcher, blob, mm)
 		case "file":
 			err = ix.populateFile(fetcher, blob, mm)
 		case "directory":
@@ -313,8 +319,6 @@ func (ix *Index) populateMutationMap(fetcher *missTrackFetcher, br blob.Ref, sni
 		haveVal = fmt.Sprintf("%d|indexed", sniffer.Size())
 	}
 	mm.kv["have:"+br.String()] = haveVal
-	ix.mu.Lock()
-	defer ix.mu.Unlock()
 	if len(fetcher.missing) == 0 {
 		// If err == nil, we're good. Else (err == errMissingDep), we
 		// know the error did not come from a fetching miss (because
@@ -384,6 +388,8 @@ func readPrefixOrFile(prefix []byte, fetcher blob.Fetcher, b *schema.Blob, fn fu
 	return err
 }
 
+var exifDebug, _ = strconv.ParseBool(os.Getenv("CAMLI_DEBUG_IMAGES"))
+
 // b: the parsed file schema blob
 // mm: keys to populate
 func (ix *Index) populateFile(fetcher blob.Fetcher, b *schema.Blob, mm *mutationMap) (err error) {
@@ -429,14 +435,18 @@ func (ix *Index) populateFile(fetcher blob.Fetcher, b *schema.Blob, mm *mutation
 		if err = readPrefixOrFile(imageBuf.Bytes, fetcher, b, fileTime); err == nil {
 			times = append(times, ft)
 		}
-		log.Printf("filename %q exif = %v, %v", b.FileName(), ft, err)
+		if exifDebug {
+			log.Printf("filename %q exif = %v, %v", b.FileName(), ft, err)
+		}
 
 		// TODO(mpl): find (generate?) more broken EXIF images to experiment with.
 		indexEXIFData := func(r filePrefixReader) error {
 			return indexEXIF(wholeRef, r, mm)
 		}
 		if err = readPrefixOrFile(imageBuf.Bytes, fetcher, b, indexEXIFData); err != nil {
-			log.Printf("error parsing EXIF: %v", err)
+			if exifDebug {
+				log.Printf("error parsing EXIF: %v", err)
+			}
 		}
 	}
 
@@ -578,7 +588,13 @@ func indexEXIF(wholeRef blob.Ref, r io.Reader, mm *mutationMap) (err error) {
 		return nil
 	}
 	if lat, long, err := ex.LatLong(); err == nil {
-		mm.Set(keyEXIFGPS.Key(wholeRef), keyEXIFGPS.Val(fmt.Sprint(lat), fmt.Sprint(long)))
+		if math.Abs(long) > 180.0 || math.Abs(lat) > 90.0 {
+			log.Printf("Long, lat outside allowed range: %v, %v", long, lat)
+			return nil
+		}
+		// index 7 places fixed precision (~10mm worst case at equator)
+		// http://stackoverflow.com/a/1947615/114581
+		mm.Set(keyEXIFGPS.Key(wholeRef), keyEXIFGPS.Val(fmt.Sprintf("%.7f", lat), fmt.Sprintf("%.7f", long)))
 	} else if !exif.IsTagNotPresentError(err) {
 		log.Printf("Invalid EXIF GPS data: %v", err)
 	}
@@ -586,7 +602,7 @@ func indexEXIF(wholeRef blob.Ref, r io.Reader, mm *mutationMap) (err error) {
 }
 
 // indexMusic adds mutations to index the wholeRef by attached metadata and other properties.
-func indexMusic(r types.SizeReaderAt, wholeRef blob.Ref, mm *mutationMap) {
+func indexMusic(r readerutil.SizeReaderAt, wholeRef blob.Ref, mm *mutationMap) {
 	tag, err := taglib.Decode(r, r.Size())
 	if err != nil {
 		log.Print("index: error parsing tag: ", err)
@@ -686,14 +702,14 @@ var errMissingDep = errors.New("blob was not fully indexed because of a missing 
 
 // populateDeleteClaim adds to mm the entries resulting from the delete claim cl.
 // It is assumed cl is a valid claim, and vr has already been verified.
-func (ix *Index) populateDeleteClaim(cl schema.Claim, vr *jsonsign.VerifyRequest, mm *mutationMap) error {
+func (ix *Index) populateDeleteClaim(ctx context.Context, cl schema.Claim, vr *jsonsign.VerifyRequest, mm *mutationMap) error {
 	br := cl.Blob().BlobRef()
 	target := cl.Target()
 	if !target.Valid() {
 		log.Print(fmt.Errorf("no valid target for delete claim %v", br))
 		return nil
 	}
-	meta, err := ix.GetBlobMeta(target)
+	meta, err := ix.GetBlobMeta(ctx, target)
 	if err != nil {
 		if err == os.ErrNotExist {
 			if err := ix.noteNeeded(br, target); err != nil {
@@ -723,7 +739,7 @@ func (ix *Index) populateDeleteClaim(cl schema.Claim, vr *jsonsign.VerifyRequest
 	return nil
 }
 
-func (ix *Index) populateClaim(fetcher *missTrackFetcher, b *schema.Blob, mm *mutationMap) error {
+func (ix *Index) populateClaim(ctx context.Context, fetcher *missTrackFetcher, b *schema.Blob, mm *mutationMap) error {
 	br := b.BlobRef()
 
 	claim, ok := b.AsClaim()
@@ -745,7 +761,7 @@ func (ix *Index) populateClaim(fetcher *missTrackFetcher, b *schema.Blob, mm *mu
 	mm.Set("signerkeyid:"+vr.CamliSigner.String(), verifiedKeyId)
 
 	if claim.ClaimType() == string(schema.DeleteClaim) {
-		if err := ix.populateDeleteClaim(claim, vr, mm); err != nil {
+		if err := ix.populateDeleteClaim(ctx, claim, vr, mm); err != nil {
 			return err
 		}
 		mm.noteDelete(claim)

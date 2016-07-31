@@ -27,9 +27,10 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/context"
 	"camlistore.org/pkg/geocode"
-	"camlistore.org/pkg/types"
+	"camlistore.org/pkg/schema/nodeattr"
+	"go4.org/types"
+	"golang.org/x/net/context"
 )
 
 const base = "0000-01-01T00:00:00Z"
@@ -74,7 +75,7 @@ type keyword interface {
 	// Note that len(args) > 0 (see atom-struct comment above).
 	// It should return a pointer to a Constraint object, expressing the meaning of
 	// its keyword.
-	Predicate(ctx *context.Context, args []string) (*Constraint, error)
+	Predicate(ctx context.Context, args []string) (*Constraint, error)
 }
 
 var keywords []keyword
@@ -105,6 +106,7 @@ func init() {
 	registerKeyword(newBefore())
 	registerKeyword(newAttribute())
 	registerKeyword(newChildrenOf())
+	registerKeyword(newParentOf())
 	registerKeyword(newFormat())
 	registerKeyword(newTag())
 	registerKeyword(newTitle())
@@ -117,6 +119,9 @@ func init() {
 	registerKeyword(newIsPortait())
 	registerKeyword(newWidth())
 
+	// File predicates
+	registerKeyword(newFilename())
+
 	// Custom predicates
 	registerKeyword(newIsPost())
 	registerKeyword(newIsCheckin())
@@ -124,6 +129,9 @@ func init() {
 	// Location predicates
 	registerKeyword(newHasLocation())
 	registerKeyword(newLocation())
+
+	// People predicates
+	registerKeyword(newWith())
 }
 
 // Helper implementation for mixing into keyword implementations
@@ -180,7 +188,7 @@ func (a after) Description() string {
 		"i.e. 2011-01-01 is Jan 1 of year 2011 and \"2011\" means the same."
 }
 
-func (a after) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (a after) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	t, err := parseTimePrefix(args[0])
 	if err != nil {
 		return nil, err
@@ -208,7 +216,7 @@ func (b before) Description() string {
 		"i.e. 2011-01-01 is Jan 1 of year 2011 and \"2011\" means the same."
 }
 
-func (b before) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (b before) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	t, err := parseTimePrefix(args[0])
 	if err != nil {
 		return nil, err
@@ -237,8 +245,8 @@ func (a attribute) Description() string {
 		"case-insensitive search for 'bar' in attribute foo"
 }
 
-func (a attribute) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
-	c := attrConst(args[0], args[1])
+func (a attribute) Predicate(ctx context.Context, args []string) (*Constraint, error) {
+	c := permWithAttr(args[0], args[1])
 	if strings.HasPrefix(args[1], "~") {
 		// Substring. Hack. Figure out better way to do this.
 		c.Permanode.Value = ""
@@ -263,11 +271,38 @@ func (k childrenOf) Description() string {
 		"permanode): childrenof:sha1-527cf12 Only matches permanodes currently."
 }
 
-func (k childrenOf) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (k childrenOf) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	c := &Constraint{
 		Permanode: &PermanodeConstraint{
 			Relation: &RelationConstraint{
 				Relation: "parent",
+				Any: &Constraint{
+					BlobRefPrefix: args[0],
+				},
+			},
+		},
+	}
+	return c, nil
+}
+
+type parentOf struct {
+	matchPrefix
+}
+
+func newParentOf() keyword {
+	return parentOf{newMatchPrefix("parentof")}
+}
+
+func (k parentOf) Description() string {
+	return "Find parent permanodes of a child permanode (or prefix of a child\n" +
+		"permanode): parentof:sha1-527cf12 Only matches permanodes currently."
+}
+
+func (k parentOf) Predicate(ctx context.Context, args []string) (*Constraint, error) {
+	c := &Constraint{
+		Permanode: &PermanodeConstraint{
+			Relation: &RelationConstraint{
+				Relation: "child",
 				Any: &Constraint{
 					BlobRefPrefix: args[0],
 				},
@@ -289,7 +324,7 @@ func (f format) Description() string {
 	return "file's format (or MIME-type) such as jpg, pdf, tiff."
 }
 
-func (f format) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (f format) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	mimeType, err := mimeFromFormat(args[0])
 	if err != nil {
 		return nil, err
@@ -314,8 +349,51 @@ func (t tag) Description() string {
 	return "match on a tag"
 }
 
-func (t tag) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
-	return attrConst("tag", args[0]), nil
+func (t tag) Predicate(ctx context.Context, args []string) (*Constraint, error) {
+	return permWithAttr("tag", args[0]), nil
+}
+
+type with struct {
+	matchPrefix
+}
+
+func newWith() keyword {
+	return with{newMatchPrefix("with")}
+}
+
+func (w with) Description() string {
+	return "match people containing substring in their first or last name"
+}
+
+func (w with) Predicate(ctx context.Context, args []string) (*Constraint, error) {
+	// TODO(katepek): write a query optimizer or a separate matcher
+	c := &Constraint{
+		// TODO(katepek): Does this work with repeated values for "with"?
+		// Select all permanodes where attribute "with" points to permanodes with the foursquare person type
+		// and with first or last name partially matching the query string
+		Permanode: &PermanodeConstraint{
+			Attr: "with",
+			ValueInSet: andConst(
+				&Constraint{
+					Permanode: &PermanodeConstraint{
+						Attr:  nodeattr.Type,
+						Value: "foursquare.com:person",
+					},
+				},
+				orConst(
+					permWithAttrSubstr(nodeattr.GivenName, &StringConstraint{
+						Contains:        args[0],
+						CaseInsensitive: true,
+					}),
+					permWithAttrSubstr(nodeattr.FamilyName, &StringConstraint{
+						Contains:        args[0],
+						CaseInsensitive: true,
+					}),
+				),
+			),
+		},
+	}
+	return c, nil
 }
 
 type title struct {
@@ -330,10 +408,10 @@ func (t title) Description() string {
 	return "match nodes containing substring in their title"
 }
 
-func (t title) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (t title) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	c := &Constraint{
 		Permanode: &PermanodeConstraint{
-			Attr:       "title",
+			Attr:       nodeattr.Title,
 			SkipHidden: true,
 			ValueMatches: &StringConstraint{
 				Contains:        args[0],
@@ -358,10 +436,10 @@ func (k isImage) Description() string {
 	return "object is an image"
 }
 
-func (k isImage) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (k isImage) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	c := &Constraint{
 		Permanode: &PermanodeConstraint{
-			Attr: "camliContent",
+			Attr: nodeattr.CamliContent,
 			ValueInSet: &Constraint{
 				File: &FileConstraint{
 					IsImage: true,
@@ -384,7 +462,7 @@ func (k isLandscape) Description() string {
 	return "the image has a landscape aspect"
 }
 
-func (k isLandscape) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (k isLandscape) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	return whRatio(&FloatConstraint{Min: 1.0}), nil
 }
 
@@ -400,7 +478,7 @@ func (k isPano) Description() string {
 	return "the image's aspect ratio is over 2 - panorama picture."
 }
 
-func (k isPano) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (k isPano) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	return whRatio(&FloatConstraint{Min: 2.0}), nil
 }
 
@@ -416,7 +494,7 @@ func (k isPortait) Description() string {
 	return "the image has a portrait aspect"
 }
 
-func (k isPortait) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (k isPortait) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	return whRatio(&FloatConstraint{Max: 1.0}), nil
 }
 
@@ -435,7 +513,7 @@ func (w width) Description() string {
 		"Exact matches should use width:640 "
 }
 
-func (w width) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (w width) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	mins, maxs, err := parseWHExpression(args[0])
 	if err != nil {
 		return nil, err
@@ -462,7 +540,7 @@ func (h height) Description() string {
 		"Exact matches should use height:480"
 }
 
-func (h height) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (h height) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	mins, maxs, err := parseWHExpression(args[0])
 	if err != nil {
 		return nil, err
@@ -490,7 +568,7 @@ func (l location) Description() string {
 		"maps.googleapis.com. For example: loc:\"new york, new york\" "
 }
 
-func (l location) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (l location) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	where := args[0]
 	rects, err := geocode.Lookup(ctx, where)
 	if err != nil {
@@ -539,7 +617,7 @@ func (h hasLocation) Description() string {
 		"and GPSLongitude can be retrieved from the image's EXIF tags)."
 }
 
-func (h hasLocation) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (h hasLocation) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	fileLoc := permOfFile(&FileConstraint{
 		IsImage: true,
 		Location: &LocationConstraint{
@@ -558,7 +636,7 @@ func (h hasLocation) Predicate(ctx *context.Context, args []string) (*Constraint
 
 // Helpers
 
-func attrConst(attr, val string) *Constraint {
+func permWithAttr(attr, val string) *Constraint {
 	c := &Constraint{
 		Permanode: &PermanodeConstraint{
 			Attr:       attr,
@@ -573,10 +651,19 @@ func attrConst(attr, val string) *Constraint {
 	return c
 }
 
+func permWithAttrSubstr(attr string, c *StringConstraint) *Constraint {
+	return &Constraint{
+		Permanode: &PermanodeConstraint{
+			Attr:         attr,
+			ValueMatches: c,
+		},
+	}
+}
+
 func permOfFile(fc *FileConstraint) *Constraint {
 	return &Constraint{
 		Permanode: &PermanodeConstraint{
-			Attr:       "camliContent",
+			Attr:       nodeattr.CamliContent,
 			ValueInSet: &Constraint{File: fc},
 		},
 	}
@@ -658,10 +745,10 @@ func (k isPost) Description() string {
 	return "matches tweets, status updates, blog posts, etc"
 }
 
-func (k isPost) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (k isPost) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	return &Constraint{
 		Permanode: &PermanodeConstraint{
-			Attr:  "camliNodeType",
+			Attr:  nodeattr.Type,
 			Value: "twitter.com:tweet",
 		},
 	}, nil
@@ -679,11 +766,32 @@ func (k isCheckin) Description() string {
 	return "matches location check-ins (foursquare, etc)"
 }
 
-func (k isCheckin) Predicate(ctx *context.Context, args []string) (*Constraint, error) {
+func (k isCheckin) Predicate(ctx context.Context, args []string) (*Constraint, error) {
 	return &Constraint{
 		Permanode: &PermanodeConstraint{
-			Attr:  "camliNodeType",
+			Attr:  nodeattr.Type,
 			Value: "foursquare.com:checkin",
 		},
 	}, nil
+}
+
+type filename struct {
+	matchPrefix
+}
+
+func newFilename() keyword {
+	return filename{newMatchPrefix("filename")}
+}
+
+func (fn filename) Description() string {
+	return "Match filename"
+}
+
+func (fn filename) Predicate(ctx context.Context, args []string) (*Constraint, error) {
+	c := permOfFile(&FileConstraint{
+		FileName: &StringConstraint{
+			Equals: args[0],
+		},
+	})
+	return c, nil
 }

@@ -44,6 +44,8 @@ func AwaitReachable(addr string, maxWait time.Duration) error {
 // to passing to net.Dial, with the port set as the scheme's default port if
 // absent.
 func HostPort(urlStr string) (string, error) {
+	// TODO: rename this function to URLHostPort instead, like
+	// ListenHostPort below.
 	u, err := url.Parse(urlStr)
 	if err != nil {
 		return "", fmt.Errorf("could not parse %q as a url: %v", urlStr, err)
@@ -67,6 +69,22 @@ func HostPort(urlStr string) (string, error) {
 		}
 	}
 	return hostPort, nil
+}
+
+// ListenHostPort maps a listen address into a host:port string.
+// If the host part in listenAddr is empty or 0.0.0.0, localhost
+// is used instead.
+func ListenHostPort(listenAddr string) (string, error) {
+	hp := listenAddr
+	if strings.HasPrefix(hp, ":") {
+		hp = "localhost" + hp
+	} else if strings.HasPrefix(hp, "0.0.0.0:") {
+		hp = "localhost:" + hp[len("0.0.0.0:"):]
+	}
+	if _, _, err := net.SplitHostPort(hp); err != nil {
+		return "", err
+	}
+	return hp, nil
 }
 
 // ListenOnLocalRandomPort returns a TCP listener on a random
@@ -120,4 +138,28 @@ func loopbackIP() net.IP {
 		}
 	}
 	return nil
+}
+
+// RandPort returns a random port to listen on.
+func RandPort() (int, error) {
+	var port int
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		return port, err
+	}
+	listener, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return port, fmt.Errorf("could not listen to find random port: %v", err)
+	}
+	randAddr := listener.Addr().(*net.TCPAddr)
+	if err := listener.Close(); err != nil {
+		return port, fmt.Errorf("could not close random listener: %v", err)
+	}
+	return randAddr.Port, nil
+}
+
+// HasPort, given a string of the form "host", "host:port", or
+// "[ipv6::address]:port", returns true if the string includes a port.
+func HasPort(s string) bool {
+	return strings.LastIndex(s, ":") > strings.LastIndex(s, "]")
 }

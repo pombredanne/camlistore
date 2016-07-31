@@ -28,7 +28,8 @@ import (
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/rollsum"
-	"camlistore.org/pkg/syncutil"
+
+	"go4.org/syncutil"
 )
 
 const (
@@ -89,67 +90,6 @@ func WriteFileFromReader(bs blobserver.StatReceiver, filename string, r io.Reade
 // JSON blob.
 func WriteFileMap(bs blobserver.StatReceiver, file *Builder, r io.Reader) (blob.Ref, error) {
 	return writeFileMapRolling(bs, file, r)
-}
-
-// This is the simple 1MB chunk version. The rolling checksum version is below.
-func writeFileMapOld(bs blobserver.StatReceiver, file *Builder, r io.Reader) (blob.Ref, error) {
-	parts, size := []BytesPart{}, int64(0)
-
-	var buf bytes.Buffer
-	for {
-		buf.Reset()
-		n, err := io.Copy(&buf, io.LimitReader(r, maxBlobSize))
-		if err != nil {
-			return blob.Ref{}, err
-		}
-		if n == 0 {
-			break
-		}
-
-		hash := blob.NewHash()
-		io.Copy(hash, bytes.NewReader(buf.Bytes()))
-		br := blob.RefFromHash(hash)
-		hasBlob, err := serverHasBlob(bs, br)
-		if err != nil {
-			return blob.Ref{}, err
-		}
-		if !hasBlob {
-			sb, err := bs.ReceiveBlob(br, &buf)
-			if err != nil {
-				return blob.Ref{}, err
-			}
-			if want := (blob.SizedRef{br, uint32(n)}); sb != want {
-				return blob.Ref{}, fmt.Errorf("schema/filewriter: wrote %s, expect %s", sb, want)
-			}
-		}
-
-		size += n
-		parts = append(parts, BytesPart{
-			BlobRef: br,
-			Size:    uint64(n),
-			Offset:  0, // into BlobRef to read from (not of dest)
-		})
-	}
-
-	err := file.PopulateParts(size, parts)
-	if err != nil {
-		return blob.Ref{}, err
-	}
-
-	json := file.Blob().JSON()
-	if err != nil {
-		return blob.Ref{}, err
-	}
-	br := blob.SHA1FromString(json)
-	sb, err := bs.ReceiveBlob(br, strings.NewReader(json))
-	if err != nil {
-		return blob.Ref{}, err
-	}
-	if expect := (blob.SizedRef{br, uint32(len(json))}); expect != sb {
-		return blob.Ref{}, fmt.Errorf("schema/filewriter: wrote %s bytes, got %s ack'd", expect, sb)
-	}
-
-	return br, nil
 }
 
 func serverHasBlob(bs blobserver.BlobStatter, br blob.Ref) (have bool, err error) {

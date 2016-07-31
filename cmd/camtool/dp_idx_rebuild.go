@@ -25,13 +25,13 @@ import (
 
 	"camlistore.org/pkg/blobserver/diskpacked"
 	"camlistore.org/pkg/cmdmain"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/serverinit"
+	"go4.org/jsonconfig"
 )
 
 type reindexdpCmd struct {
-	overwrite, verbose bool
+	overwrite bool
 }
 
 func init() {

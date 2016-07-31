@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // Package resize resizes images.
-package resize
+package resize // import "camlistore.org/pkg/images/resize"
 
 import (
 	"image"
@@ -127,6 +127,7 @@ func resizeYCbCr(m *image.YCbCr, r image.Rectangle, w, h int) (image.Image, bool
 // resizeRGBA returns a scaled copy of the RGBA image slice r of m.
 // The returned image has width w and height h.
 func resizeRGBA(m *image.RGBA, r image.Rectangle, w, h int) image.Image {
+	// TODO(mpl): consider using xdraw here as well ?
 	ww, hh := uint64(w), uint64(h)
 	dx, dy := uint64(r.Dx()), uint64(r.Dy())
 	// See comment in Resize.

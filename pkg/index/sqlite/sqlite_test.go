@@ -1,3 +1,5 @@
+// +build with_sqlite
+
 /*
 Copyright 2012 The Camlistore Authors.
 
@@ -28,12 +30,12 @@ import (
 
 	"camlistore.org/pkg/index"
 	"camlistore.org/pkg/index/indextest"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/sorted"
 	"camlistore.org/pkg/sorted/kvtest"
 	_ "camlistore.org/pkg/sorted/sqlite"
+	"go4.org/jsonconfig"
 
-	_ "camlistore.org/third_party/github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 var (
@@ -90,7 +92,7 @@ func (tester) test(t *testing.T, tfn func(*testing.T, func() *index.Index)) {
 		mu.Lock()
 		cleanups = append(cleanups, cleanup)
 		mu.Unlock()
-		return index.MustNew(t, s)
+		return indextest.MustNew(t, s)
 	}
 	tfn(t, makeIndex)
 }

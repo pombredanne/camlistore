@@ -31,7 +31,7 @@ Example config:
           }
       },
 */
-package proxycache
+package proxycache // import "camlistore.org/pkg/blobserver/proxycache"
 
 import (
 	"bytes"
@@ -45,12 +45,10 @@ import (
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/context"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/sorted"
+	"go4.org/jsonconfig"
+	"golang.org/x/net/context"
 )
-
-const buffered = 8
 
 type sto struct {
 	origin        blobserver.Storage
@@ -128,7 +126,7 @@ func (sto *sto) touchBlob(sb blob.SizedRef) {
 func (sto *sto) Fetch(b blob.Ref) (rc io.ReadCloser, size uint32, err error) {
 	rc, size, err = sto.cache.Fetch(b)
 	if err == nil {
-		sto.touchBlob(blob.SizedRef{b, size})
+		sto.touchBlob(blob.SizedRef{Ref: b, Size: size})
 		return
 	}
 	if err != os.ErrNotExist {
@@ -147,7 +145,7 @@ func (sto *sto) Fetch(b blob.Ref) (rc io.ReadCloser, size uint32, err error) {
 			log.Printf("populating proxycache cache for %v: %v", b, err)
 			return
 		}
-		sto.touchBlob(blob.SizedRef{b, size})
+		sto.touchBlob(blob.SizedRef{Ref: b, Size: size})
 	}()
 	return ioutil.NopCloser(bytes.NewReader(all)), size, nil
 }
@@ -179,17 +177,9 @@ func (sto *sto) RemoveBlobs(blobs []blob.Ref) error {
 	return sto.origin.RemoveBlobs(blobs)
 }
 
-func (sto *sto) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+func (sto *sto) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	return sto.origin.EnumerateBlobs(ctx, dest, after, limit)
 }
 
 // TODO:
 //var _ blobserver.Generationer = (*sto)(nil)
-
-func (sto *sto) x_ResetStorageGeneration() error {
-	panic("TODO")
-}
-
-func (sto *sto) x_StorageGeneration() (initTime time.Time, random string, err error) {
-	panic("TODO")
-}

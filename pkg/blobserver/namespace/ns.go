@@ -20,7 +20,7 @@ limitations under the License.
 // has access and visibility to a subset of the blobs which have been
 // uploaded through this namespace. The list of accessible blobs are
 // stored in the provided "inventory" sorted key/value target.
-package namespace
+package namespace // import "camlistore.org/pkg/blobserver/namespace"
 
 import (
 	"bytes"
@@ -32,10 +32,11 @@ import (
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/context"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/strutil"
+	"go4.org/jsonconfig"
+	"golang.org/x/net/context"
+
+	"go4.org/strutil"
 )
 
 type nsto struct {
@@ -65,7 +66,7 @@ func newFromConfig(ld blobserver.Loader, config jsonconfig.Obj) (storage blobser
 	return sto, nil
 }
 
-func (ns *nsto) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+func (ns *nsto) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	defer close(dest)
 	done := ctx.Done()
 
@@ -87,7 +88,7 @@ func (ns *nsto) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, 
 		select {
 		case dest <- blob.SizedRef{br, uint32(size)}:
 		case <-done:
-			return context.ErrCanceled
+			return ctx.Err()
 		}
 		limit--
 	}

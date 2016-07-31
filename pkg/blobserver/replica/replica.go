@@ -32,7 +32,7 @@ Example config:
           }
       },
 */
-package replica
+package replica // import "camlistore.org/pkg/blobserver/replica"
 
 import (
 	"bytes"
@@ -45,8 +45,8 @@ import (
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/context"
-	"camlistore.org/pkg/jsonconfig"
+	"go4.org/jsonconfig"
+	"golang.org/x/net/context"
 )
 
 var (
@@ -172,7 +172,7 @@ func (sto *replicaStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref
 	}
 
 	var retErr error
-	for _ = range sto.readReplicas {
+	for range sto.readReplicas {
 		if err := <-errc; err != nil {
 			retErr = err
 		}
@@ -216,7 +216,7 @@ func (sto *replicaStorage) ReceiveBlob(br blob.Ref, src io.Reader) (_ blob.Sized
 
 	nSuccess := 0
 	var fails []sizedBlobAndError
-	for _ = range sto.replicas {
+	for range sto.replicas {
 		res := <-resc
 		switch {
 		case res.err == nil && int64(res.sb.Size) == size:
@@ -252,7 +252,7 @@ func (sto *replicaStorage) RemoveBlobs(blobs []blob.Ref) error {
 	}
 	var reterr error
 	nSuccess := 0
-	for _ = range sto.replicas {
+	for range sto.replicas {
 		if err := <-errch; err != nil {
 			reterr = err
 		} else {
@@ -268,7 +268,7 @@ func (sto *replicaStorage) RemoveBlobs(blobs []blob.Ref) error {
 	return reterr
 }
 
-func (sto *replicaStorage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+func (sto *replicaStorage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	return blobserver.MergedEnumerateStorage(ctx, dest, sto.readReplicas, after, limit)
 }
 

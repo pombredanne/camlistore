@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package clientconfig provides types related to the client configuration
 // file.
-package clientconfig
+package clientconfig // import "camlistore.org/pkg/types/clientconfig"
 
 import (
 	"errors"
@@ -24,8 +24,9 @@ import (
 	"strings"
 
 	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/jsonconfig"
-	"camlistore.org/pkg/wkfs"
+	"go4.org/jsonconfig"
+
+	"go4.org/wkfs"
 )
 
 // Config holds the values from the JSON client config file.
@@ -66,7 +67,7 @@ func (conf *Config) Alias(server string) string {
 // access a server defined by the provided low-level server configuration.
 func GenerateClientConfig(serverConfig jsonconfig.Obj) (*Config, error) {
 	missingConfig := func(param string) (*Config, error) {
-		return nil, fmt.Errorf("required value for '%s' not found", param)
+		return nil, fmt.Errorf("required value for %q not found", param)
 	}
 
 	if serverConfig == nil {
@@ -158,6 +159,6 @@ func GenerateClientConfig(serverConfig jsonconfig.Obj) (*Config, error) {
 		},
 		Identity:           keyId,
 		IdentitySecretRing: secretRing,
-		IgnoredFiles:       []string{".DS_Store"},
+		IgnoredFiles:       []string{".DS_Store", "*~"},
 	}, nil
 }

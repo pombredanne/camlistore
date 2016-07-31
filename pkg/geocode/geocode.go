@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package geocode handles mapping user-entered locations into lat/long polygons.
-package geocode
+package geocode // import "camlistore.org/pkg/geocode"
 
 import (
 	"encoding/json"
@@ -24,9 +24,10 @@ import (
 	"net/url"
 	"sync"
 
-	"camlistore.org/pkg/context"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/singleflight"
+	"go4.org/ctxutil"
+	"go4.org/syncutil/singleflight"
+	"golang.org/x/net/context"
+	"golang.org/x/net/context/ctxhttp"
 )
 
 type LatLong struct {
@@ -48,7 +49,7 @@ var (
 
 // Lookup returns rectangles for the given address. Currently the only
 // implementation is the Google geocoding service.
-func Lookup(ctx *context.Context, address string) ([]Rect, error) {
+func Lookup(ctx context.Context, address string) ([]Rect, error) {
 	mu.RLock()
 	rects, ok := cache[address]
 	mu.RUnlock()
@@ -59,11 +60,11 @@ func Lookup(ctx *context.Context, address string) ([]Rect, error) {
 	rectsi, err := sf.Do(address, func() (interface{}, error) {
 		// TODO: static data files from OpenStreetMap, Wikipedia, etc?
 		urlStr := "https://maps.googleapis.com/maps/api/geocode/json?address=" + url.QueryEscape(address) + "&sensor=false"
-		res, err := ctx.HTTPClient().Get(urlStr)
+		res, err := ctxhttp.Get(ctx, ctxutil.Client(ctx), urlStr)
 		if err != nil {
 			return nil, err
 		}
-		defer httputil.CloseBody(res.Body)
+		defer res.Body.Close()
 		rects, err := decodeGoogleResponse(res.Body)
 		log.Printf("Google geocode lookup (%q) = %#v, %v", address, rects, err)
 		if err == nil {

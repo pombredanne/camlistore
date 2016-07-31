@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package cacher provides various blobref fetching caching mechanisms.
-package cacher
+package cacher // import "camlistore.org/pkg/cacher"
 
 import (
 	"io"
@@ -28,7 +28,8 @@ import (
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/blobserver/localdisk"
 	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/singleflight"
+
+	"go4.org/syncutil/singleflight"
 )
 
 // NewCachingFetcher returns a CachingFetcher that fetches from

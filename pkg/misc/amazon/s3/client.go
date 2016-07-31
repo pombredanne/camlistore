@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package s3 implements a generic Amazon S3 client, not specific
 // to Camlistore.
-package s3
+package s3 // import "camlistore.org/pkg/misc/amazon/s3"
 
 import (
 	"bytes"
@@ -37,7 +37,8 @@ import (
 	"time"
 
 	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/httputil"
+
+	"go4.org/syncutil"
 )
 
 const maxList = 1000
@@ -46,6 +47,10 @@ const maxList = 1000
 type Client struct {
 	*Auth
 	Transport http.RoundTripper // or nil for the default
+	// PutGate limits the number of concurrent PutObject calls, because
+	// apparently S3 throttles us if there are too many. No limit if nil.
+	// Default in S3 blobserver is 5.
+	PutGate *syncutil.Gate
 }
 
 type Bucket struct {
@@ -88,7 +93,7 @@ func (c *Client) Buckets() ([]*Bucket, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer httputil.CloseBody(res.Body)
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("s3: Unexpected status code %d fetching bucket list", res.StatusCode)
 	}
@@ -130,6 +135,10 @@ func (c *Client) Stat(key, bucket string) (size int64, reterr error) {
 }
 
 func (c *Client) PutObject(key, bucket string, md5 hash.Hash, size int64, body io.Reader) error {
+	if c.PutGate != nil {
+		c.PutGate.Start()
+		defer c.PutGate.Done()
+	}
 	req := newReq(c.keyURL(bucket, key))
 	req.Method = "PUT"
 	req.ContentLength = size
@@ -145,7 +154,7 @@ func (c *Client) PutObject(key, bucket string, md5 hash.Hash, size int64, body i
 
 	res, err := c.transport().RoundTrip(req)
 	if res != nil && res.Body != nil {
-		defer httputil.CloseBody(res.Body)
+		defer res.Body.Close()
 	}
 	if err != nil {
 		return err
@@ -251,7 +260,7 @@ func (c *Client) ListBucket(bucket string, startAt string, maxKeys int) (items [
 					log.Print(err)
 				}
 			}
-			httputil.CloseBody(res.Body)
+			res.Body.Close()
 			if err != nil {
 				if try < maxTries-1 {
 					continue
@@ -304,7 +313,7 @@ func (c *Client) Get(bucket, key string) (body io.ReadCloser, size int64, err er
 // The caller must close rc.
 func (c *Client) GetPartial(bucket, key string, offset, length int64) (rc io.ReadCloser, err error) {
 	if offset < 0 {
-		return nil, errors.New("invalid negative length")
+		return nil, errors.New("invalid negative offset")
 	}
 
 	req := newReq(c.keyURL(bucket, key))

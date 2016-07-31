@@ -18,7 +18,8 @@ package s3
 
 import (
 	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/syncutil"
+
+	"go4.org/syncutil"
 )
 
 var removeGate = syncutil.NewGate(20) // arbitrary
@@ -34,7 +35,7 @@ func (sto *s3Storage) RemoveBlobs(blobs []blob.Ref) error {
 		removeGate.Start()
 		wg.Go(func() error {
 			defer removeGate.Done()
-			return sto.s3Client.Delete(sto.bucket, blob.String())
+			return sto.s3Client.Delete(sto.bucket, sto.dirPrefix+blob.String())
 		})
 	}
 	return wg.Err()

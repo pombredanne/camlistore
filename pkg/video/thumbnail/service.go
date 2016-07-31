@@ -26,7 +26,7 @@ The default implementation uses ffmpeg.
 
 See ServiceFromConfig for accepted configuration.
 */
-package thumbnail
+package thumbnail // import "camlistore.org/pkg/video/thumbnail"
 
 import (
 	"errors"
@@ -38,9 +38,10 @@ import (
 	"time"
 
 	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/netutil"
-	"camlistore.org/pkg/syncutil"
+	"go4.org/jsonconfig"
+
+	"go4.org/syncutil"
 )
 
 // A Service controls the generation of video thumbnails.

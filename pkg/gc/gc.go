@@ -15,14 +15,15 @@ limitations under the License.
 */
 
 // Package gc defines a generic garbage collector.
-package gc
+package gc // import "camlistore.org/pkg/gc"
 
 import (
 	"errors"
 	"fmt"
 
-	"camlistore.org/pkg/context"
-	"camlistore.org/pkg/syncutil"
+	"golang.org/x/net/context"
+
+	"go4.org/syncutil"
 )
 
 const buffered = 32 // arbitrary
@@ -73,19 +74,19 @@ type Enumerator interface {
 	// value, the channel should be closed.
 	//
 	// If the provided context is closed, Enumerate should return
-	// with an error (typically context.ErrCanceled)
-	Enumerate(*context.Context, chan<- Item) error
+	// with an error (typically context.Canceled)
+	Enumerate(context.Context, chan<- Item) error
 }
 
 // ItemEnumerator enumerates all the edges out from an item.
 type ItemEnumerator interface {
 	// EnumerateItme is like Enuerator's Enumerate, but specific
 	// to the provided item.
-	EnumerateItem(*context.Context, Item, chan<- Item) error
+	EnumerateItem(context.Context, Item, chan<- Item) error
 }
 
 // ctx will be canceled on failure
-func (c *Collector) markItem(ctx *context.Context, it Item, isRoot bool) error {
+func (c *Collector) markItem(ctx context.Context, it Item, isRoot bool) error {
 	if !isRoot {
 		marked, err := c.Marker.IsMarked(it)
 		if err != nil {
@@ -99,6 +100,8 @@ func (c *Collector) markItem(ctx *context.Context, it Item, isRoot bool) error {
 		return err
 	}
 
+	// FIXME(tgulacsi): is it a problem that we cannot cancel the parent?
+	ctx, cancel := context.WithCancel(ctx)
 	ch := make(chan Item, buffered)
 	var grp syncutil.Group
 	grp.Go(func() error {
@@ -113,14 +116,14 @@ func (c *Collector) markItem(ctx *context.Context, it Item, isRoot bool) error {
 		return nil
 	})
 	if err := grp.Err(); err != nil {
-		ctx.Cancel()
+		cancel()
 		return err
 	}
 	return nil
 }
 
 // Collect performs a garbage collection.
-func (c *Collector) Collect(ctx *context.Context) (err error) {
+func (c *Collector) Collect(ctx context.Context) (err error) {
 	if c.World == nil {
 		return errors.New("no World")
 	}
@@ -151,10 +154,10 @@ func (c *Collector) Collect(ctx *context.Context) (err error) {
 
 	// Mark.
 	roots := make(chan Item, buffered)
-	markCtx := ctx.New()
+	markCtx, cancelMark := context.WithCancel(ctx)
 	var marker syncutil.Group
 	marker.Go(func() error {
-		defer markCtx.Cancel()
+		defer cancelMark()
 		for it := range roots {
 			if err := c.markItem(markCtx, it, true); err != nil {
 				return err
@@ -171,7 +174,7 @@ func (c *Collector) Collect(ctx *context.Context) (err error) {
 
 	// Sweep.
 	all := make(chan Item, buffered)
-	sweepCtx := ctx.New()
+	sweepCtx, _ := context.WithCancel(ctx)
 	var sweeper syncutil.Group
 	sweeper.Go(func() error {
 		return c.Sweeper.Enumerate(sweepCtx, all)

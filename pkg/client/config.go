@@ -32,12 +32,13 @@ import (
 	"camlistore.org/pkg/buildinfo"
 	"camlistore.org/pkg/client/android"
 	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/jsonsign"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/types/camtypes"
 	"camlistore.org/pkg/types/clientconfig"
-	"camlistore.org/pkg/wkfs"
+	"go4.org/jsonconfig"
+
+	"go4.org/wkfs"
 )
 
 // If set, flagServer overrides the JSON config file
@@ -96,7 +97,7 @@ func (c *Client) parseConfig() {
 		log.Fatal(errMsg)
 	}
 	// TODO: instead of using jsonconfig, we could read the file, and unmarshall into the structs that we now have in pkg/types/clientconfig. But we'll have to add the old fields (before the name changes, and before the multi-servers change) to the structs as well for our gracefull conversion/error messages to work.
-	conf, err := jsonconfig.ReadFile(configPath)
+	conf, err := osutil.NewJSONConfigParser().ReadFile(configPath)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
@@ -206,7 +207,7 @@ func printConfigChangeHelp(conf jsonconfig.Obj) {
 		}
 	}
 	if oldConfig {
-		configChangedMsg += "Please see http://camlistore.org/docs/client-config, or use camput init to recreate a default one."
+		configChangedMsg += "Please see https://camlistore.org/doc/client-config, or use camput init to recreate a default one."
 		log.Print(configChangedMsg)
 	}
 }
@@ -284,14 +285,6 @@ func defaultServer() string {
 		}
 	}
 	return ""
-}
-
-func (c *Client) serverOrDefault() string {
-	configOnce.Do(parseConfig)
-	if c.server != "" {
-		return cleanServer(c.server)
-	}
-	return defaultServer()
 }
 
 func (c *Client) useTLS() bool {
@@ -560,21 +553,27 @@ func hasDirPrefix(dirPrefix, fullpath string) bool {
 	return false
 }
 
-// hasComponent returns whether the pathComponent is a path component of fullpath. i.e it is a part of fullpath that fits exactly between two path separators.
+// hasComponent returns whether the pathComponent is a path component of
+// fullpath. i.e it is a part of fullpath that fits exactly between two path
+// separators.
 func hasComponent(component, fullpath string) bool {
-	idx := strings.Index(fullpath, component)
-	if idx == -1 {
-		return false
+	// trim Windows volume name
+	fullpath = strings.TrimPrefix(fullpath, filepath.VolumeName(fullpath))
+	for {
+		i := strings.Index(fullpath, component)
+		if i == -1 {
+			return false
+		}
+		if i != 0 && fullpath[i-1] == filepath.Separator {
+			componentEnd := i + len(component)
+			if componentEnd == len(fullpath) {
+				return true
+			}
+			if fullpath[componentEnd] == filepath.Separator {
+				return true
+			}
+		}
+		fullpath = fullpath[i+1:]
 	}
-	if fullpath[idx-1] != filepath.Separator {
-		return false
-	}
-	componentEnd := idx + len(component)
-	if componentEnd == len(fullpath) {
-		return true
-	}
-	if fullpath[componentEnd] == filepath.Separator {
-		return true
-	}
-	return false
+	panic("unreachable")
 }

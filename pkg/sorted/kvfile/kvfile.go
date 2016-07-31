@@ -17,7 +17,7 @@ limitations under the License.
 // Package kvfile provides an implementation of sorted.KeyValue
 // on top of a single mutable database file on disk using
 // github.com/cznic/kv.
-package kvfile
+package kvfile // import "camlistore.org/pkg/sorted/kvfile"
 
 import (
 	"bytes"
@@ -28,11 +28,11 @@ import (
 	"os"
 	"sync"
 
-	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/kvutil"
 	"camlistore.org/pkg/sorted"
+	"go4.org/jsonconfig"
 
-	"camlistore.org/third_party/github.com/cznic/kv"
+	"github.com/cznic/kv"
 )
 
 var _ sorted.Wiper = (*kvis)(nil)

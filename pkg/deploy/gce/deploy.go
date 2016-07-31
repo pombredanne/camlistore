@@ -15,13 +15,11 @@ limitations under the License.
 */
 
 // Package gce provides tools to deploy Camlistore on Google Compute Engine.
-package gce
-
-// TODO: we want to host our own docker images under gs://camlistore-release/docker, so we should make a
-// list. For the purposes of this package, we should add mysql to the list.
+package gce // import "camlistore.org/pkg/deploy/gce"
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,15 +35,17 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/constants/google"
-	"camlistore.org/pkg/context"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/syncutil"
+	"golang.org/x/net/context"
 
+	"go4.org/cloud/google/gceutil"
+	"go4.org/syncutil"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	// TODO(mpl): switch to google.golang.org/cloud/compute
 	compute "google.golang.org/api/compute/v1"
+	"google.golang.org/api/googleapi"
 	storage "google.golang.org/api/storage/v1"
 	"google.golang.org/cloud"
 	"google.golang.org/cloud/logging"
@@ -53,16 +53,14 @@ import (
 )
 
 const (
-	projectsAPIURL = "https://www.googleapis.com/compute/v1/projects/"
-	// TODO(mpl): automatically pick the latest stable coreos image, if possible.
-	coreosImgURL = "https://www.googleapis.com/compute/v1/projects/coreos-cloud/global/images/coreos-stable-723-3-0-v20150804"
+	DefaultInstanceName = "camlistore-server"
+	DefaultMachineType  = "g1-small"
+	DefaultRegion       = "us-central1"
 
-	// default instance configuration values.
-	// TODO(mpl): they can probably be lowercased now that handler.go is in the same
-	// package. Just need to verify camdeploy does not need them.
-	InstanceName  = "camlistore-server"
-	Machine       = "g1-small"
-	Zone          = "us-central1-a"
+	projectsAPIURL = "https://www.googleapis.com/compute/v1/projects/"
+
+	fallbackZone = "us-central1-a"
+
 	camliUsername = "camlistore" // directly set in compute metadata, so not user settable.
 
 	configDir = "config"
@@ -78,18 +76,24 @@ const (
 var (
 	// Verbose enables more info to be printed.
 	Verbose bool
-	// HTTPS certificate file name
-	certFilename = filepath.Base(osutil.DefaultTLSCert())
-	// HTTPS key name
-	keyFilename = filepath.Base(osutil.DefaultTLSKey())
 )
+
+// certFilename returns the HTTPS certificate file name
+func certFilename() string {
+	return filepath.Base(osutil.DefaultTLSCert())
+}
+
+// keyFilename returns the HTTPS key name
+func keyFilename() string {
+	return filepath.Base(osutil.DefaultTLSKey())
+}
 
 // NewOAuthConfig returns an OAuth configuration template.
 func NewOAuthConfig(clientID, clientSecret string) *oauth2.Config {
 	return &oauth2.Config{
 		Scopes: []string{
 			logging.Scope,
-			compute.DevstorageFull_controlScope,
+			compute.DevstorageFullControlScope,
 			compute.ComputeScope,
 			"https://www.googleapis.com/auth/sqlservice",
 			"https://www.googleapis.com/auth/sqlservice.admin",
@@ -105,17 +109,18 @@ type InstanceConf struct {
 	Name     string // Name given to the virtual machine instance.
 	Project  string // Google project ID where the instance is created.
 	Machine  string // Machine type.
-	Zone     string // Geographic zone.
+	Zone     string // GCE zone; see https://cloud.google.com/compute/docs/zones
 	SSHPub   string // SSH public key.
 	CertFile string // HTTPS certificate file.
 	KeyFile  string // HTTPS key file.
 	Hostname string // Fully qualified domain name.
-	Password string // Camlistore HTTP basic auth password. Defaults to project ID.
 
 	configDir string // bucketBase() + "/config"
 	blobDir   string // bucketBase() + "/blobs"
 
 	Ctime time.Time // Timestamp for this configuration.
+
+	WIP bool // Whether to use the camlistored-WORKINPROGRESS.tar.gz tarball instead of the "production" one
 }
 
 func (conf *InstanceConf) bucketBase() string {
@@ -124,12 +129,17 @@ func (conf *InstanceConf) bucketBase() string {
 
 // Deployer creates and starts an instance such as defined in Conf.
 type Deployer struct {
+	// Client is an OAuth2 client, authenticated for working with
+	// the user's Google Cloud resources.
 	Client *http.Client
-	Conf   *InstanceConf
+
+	Conf *InstanceConf
 
 	// SHA-1 and SHA-256 fingerprints of the HTTPS certificate created during setupHTTPS, if any.
 	// Keyed by hash name: "SHA-1", and "SHA-256".
 	certFingerprints map[string]string
+
+	*log.Logger // Cannot be nil.
 }
 
 // Get returns the Instance corresponding to the Project, Zone, and Name defined in the
@@ -256,7 +266,7 @@ func (d *Deployer) checkProjectID() error {
 
 // Create sets up and starts a Google Compute Engine instance as defined in d.Conf. It
 // creates the necessary Google Storage buckets beforehand.
-func (d *Deployer) Create(ctx *context.Context) (*compute.Instance, error) {
+func (d *Deployer) Create(ctx context.Context) (*compute.Instance, error) {
 	if err := d.checkProjectID(); err != nil {
 		return nil, err
 	}
@@ -275,7 +285,6 @@ func (d *Deployer) Create(ctx *context.Context) (*compute.Instance, error) {
 		return nil, fmt.Errorf("cloud config length of %d bytes is over %d byte limit", len(config), maxCloudConfig)
 	}
 
-	// TODO(mpl): maybe add a wipe mode where we erase other instances before attempting to create.
 	if zone, err := d.projectHasInstance(); zone != "" {
 		return nil, instanceExistsError{
 			project: d.Conf.Project,
@@ -303,7 +312,7 @@ func (d *Deployer) Create(ctx *context.Context) (*compute.Instance, error) {
 	}
 	if Verbose {
 		ij, _ := json.MarshalIndent(inst, "", "    ")
-		log.Printf("Instance: %s", ij)
+		d.Printf("Instance: %s", ij)
 	}
 
 	if err = <-fwc; err != nil {
@@ -312,16 +321,29 @@ func (d *Deployer) Create(ctx *context.Context) (*compute.Instance, error) {
 	return inst, nil
 }
 
+func randPassword() string {
+	buf := make([]byte, 5)
+	if n, err := rand.Read(buf); err != nil || n != len(buf) {
+		log.Fatalf("crypto/rand.Read = %v, %v", n, err)
+	}
+	return fmt.Sprintf("%x", buf)
+}
+
+// LooksLikeRegion reports whether s looks like a GCE region.
+func LooksLikeRegion(s string) bool {
+	return strings.Count(s, "-") == 1
+}
+
 // createInstance starts the creation of the Compute Engine instance and waits for the
 // result of the creation operation. It should be called after setBuckets and setupHTTPS.
-func (d *Deployer) createInstance(computeService *compute.Service, ctx *context.Context) error {
+func (d *Deployer) createInstance(computeService *compute.Service, ctx context.Context) error {
+	coreosImgURL, err := gceutil.CoreOSImageURL(d.Client)
+	if err != nil {
+		return fmt.Errorf("error looking up latest CoreOS stable image: %v", err)
+	}
 	prefix := projectsAPIURL + d.Conf.Project
 	machType := prefix + "/zones/" + d.Conf.Zone + "/machineTypes/" + d.Conf.Machine
 	config := cloudConfig(d.Conf)
-	password := d.Conf.Password
-	if password == "" {
-		password = d.Conf.Project
-	}
 	instance := &compute.Instance{
 		Name:        d.Conf.Name,
 		Description: "Camlistore server",
@@ -344,23 +366,23 @@ func (d *Deployer) createInstance(computeService *compute.Service, ctx *context.
 			Items: []*compute.MetadataItems{
 				{
 					Key:   "camlistore-username",
-					Value: camliUsername,
+					Value: googleapi.String(camliUsername),
 				},
 				{
 					Key:   "camlistore-password",
-					Value: password,
+					Value: googleapi.String(randPassword()),
 				},
 				{
 					Key:   "camlistore-blob-dir",
-					Value: "gs://" + d.Conf.blobDir,
+					Value: googleapi.String("gs://" + d.Conf.blobDir),
 				},
 				{
 					Key:   "camlistore-config-dir",
-					Value: "gs://" + d.Conf.configDir,
+					Value: googleapi.String("gs://" + d.Conf.configDir),
 				},
 				{
 					Key:   "user-data",
-					Value: config,
+					Value: googleapi.String(config),
 				},
 			},
 		},
@@ -380,7 +402,7 @@ func (d *Deployer) createInstance(computeService *compute.Service, ctx *context.
 				Email: "default",
 				Scopes: []string{
 					logging.Scope,
-					compute.DevstorageFull_controlScope,
+					compute.DevstorageFullControlScope,
 					compute.ComputeScope,
 					"https://www.googleapis.com/auth/sqlservice",
 					"https://www.googleapis.com/auth/sqlservice.admin",
@@ -391,7 +413,7 @@ func (d *Deployer) createInstance(computeService *compute.Service, ctx *context.
 	if d.Conf.Hostname != "" && d.Conf.Hostname != "localhost" {
 		instance.Metadata.Items = append(instance.Metadata.Items, &compute.MetadataItems{
 			Key:   "camlistore-hostname",
-			Value: d.Conf.Hostname,
+			Value: googleapi.String(d.Conf.Hostname),
 		})
 	}
 	const localMySQL = false // later
@@ -408,7 +430,7 @@ func (d *Deployer) createInstance(computeService *compute.Service, ctx *context.
 	}
 
 	if Verbose {
-		log.Print("Creating instance...")
+		d.Print("Creating instance...")
 	}
 	op, err := computeService.Instances.Insert(d.Conf.Project, d.Conf.Zone, instance).Do()
 	if err != nil {
@@ -416,12 +438,14 @@ func (d *Deployer) createInstance(computeService *compute.Service, ctx *context.
 	}
 	opName := op.Name
 	if Verbose {
-		log.Printf("Created. Waiting on operation %v", opName)
+		d.Printf("Created. Waiting on operation %v", opName)
 	}
 OpLoop:
 	for {
-		if ctx.IsCanceled() {
-			return context.ErrCanceled
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
 		time.Sleep(2 * time.Second)
 		op, err := computeService.ZoneOperations.Get(d.Conf.Project, d.Conf.Zone, opName).Do()
@@ -431,18 +455,18 @@ OpLoop:
 		switch op.Status {
 		case "PENDING", "RUNNING":
 			if Verbose {
-				log.Printf("Waiting on operation %v", opName)
+				d.Printf("Waiting on operation %v", opName)
 			}
 			continue
 		case "DONE":
 			if op.Error != nil {
 				for _, operr := range op.Error.Errors {
-					log.Printf("Error: %+v", operr)
+					d.Printf("Error: %+v", operr)
 				}
 				return fmt.Errorf("failed to start.")
 			}
 			if Verbose {
-				log.Printf("Success. %+v", op)
+				d.Printf("Success. %+v", op)
 			}
 			break OpLoop
 		default:
@@ -454,6 +478,13 @@ OpLoop:
 
 func cloudConfig(conf *InstanceConf) string {
 	config := strings.Replace(baseInstanceConfig, "INNODB_BUFFER_POOL_SIZE=NNN", "INNODB_BUFFER_POOL_SIZE="+strconv.Itoa(innodbBufferPoolSize(conf.Machine)), -1)
+	camlistoredTarball := "https://storage.googleapis.com/camlistore-release/docker/"
+	if conf.WIP {
+		camlistoredTarball += "camlistored-WORKINPROGRESS.tar.gz"
+	} else {
+		camlistoredTarball += "camlistored.tar.gz"
+	}
+	config = strings.Replace(config, "CAMLISTORED_TARBALL", camlistoredTarball, 1)
 	if conf.SSHPub != "" {
 		config += fmt.Sprintf("\nssh_authorized_keys:\n    - %s\n", conf.SSHPub)
 	}
@@ -462,11 +493,19 @@ func cloudConfig(conf *InstanceConf) string {
 
 // getInstalledTLS returns the TLS certificate and key stored on Google Cloud Storage for the
 // instance defined in d.Conf.
+//
+// If either the TLS keypair doesn't exist, the error is os.ErrNotExist.
 func (d *Deployer) getInstalledTLS() (certPEM, keyPEM []byte, err error) {
-	ctx := cloud.NewContext(d.Conf.Project, d.Client)
+	ctx := context.Background()
+	stoClient, err := cloudstorage.NewClient(ctx, cloud.WithBaseHTTP(d.Client))
+	if err != nil {
+		return nil, nil, fmt.Errorf("error creating Cloud Storage client to fetch TLS cert & key from new instance: %v", err)
+	}
 	getFile := func(name string) ([]byte, error) {
-		sr, err := cloudstorage.NewReader(ctx, d.Conf.bucketBase(),
-			path.Join(configDir, name))
+		sr, err := stoClient.Bucket(d.Conf.bucketBase()).Object(path.Join(configDir, name)).NewReader(ctx)
+		if err == cloudstorage.ErrObjectNotExist {
+			return nil, os.ErrNotExist
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -475,11 +514,11 @@ func (d *Deployer) getInstalledTLS() (certPEM, keyPEM []byte, err error) {
 	}
 	var grp syncutil.Group
 	grp.Go(func() (err error) {
-		certPEM, err = getFile(certFilename)
+		certPEM, err = getFile(certFilename())
 		return
 	})
 	grp.Go(func() (err error) {
-		keyPEM, err = getFile(keyFilename)
+		keyPEM, err = getFile(keyFilename())
 		return
 	})
 	err = grp.Err()
@@ -487,7 +526,7 @@ func (d *Deployer) getInstalledTLS() (certPEM, keyPEM []byte, err error) {
 }
 
 // setBuckets defines the buckets needed by the instance and creates them.
-func (d *Deployer) setBuckets(storageService *storage.Service, ctx *context.Context) error {
+func (d *Deployer) setBuckets(storageService *storage.Service, ctx context.Context) error {
 	projBucket := d.Conf.Project + "-camlistore"
 
 	needBucket := map[string]bool{
@@ -503,20 +542,22 @@ func (d *Deployer) setBuckets(storageService *storage.Service, ctx *context.Cont
 	}
 	if len(needBucket) > 0 {
 		if Verbose {
-			log.Printf("Need to create buckets: %v", needBucket)
+			d.Printf("Need to create buckets: %v", needBucket)
 		}
 		var waitBucket sync.WaitGroup
 		var bucketErr error
 		for name := range needBucket {
-			if ctx.IsCanceled() {
-				return context.ErrCanceled
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
 			}
 			name := name
 			waitBucket.Add(1)
 			go func() {
 				defer waitBucket.Done()
 				if Verbose {
-					log.Printf("Creating bucket %s", name)
+					d.Printf("Creating bucket %s", name)
 				}
 				b, err := storageService.Buckets.Insert(d.Conf.Project, &storage.Bucket{
 					Id:   name,
@@ -527,7 +568,7 @@ func (d *Deployer) setBuckets(storageService *storage.Service, ctx *context.Cont
 					return
 				}
 				if Verbose {
-					log.Printf("Created bucket %s: %+v", name, b)
+					d.Printf("Created bucket %s: %+v", name, b)
 				}
 			}()
 		}
@@ -543,7 +584,7 @@ func (d *Deployer) setBuckets(storageService *storage.Service, ctx *context.Cont
 }
 
 // setFirewall adds the firewall rules needed for ports 80 & 433 to the default network.
-func (d *Deployer) setFirewall(ctx *context.Context, computeService *compute.Service) error {
+func (d *Deployer) setFirewall(ctx context.Context, computeService *compute.Service) error {
 	defaultNet, err := computeService.Networks.Get(d.Conf.Project, "default").Do()
 	if err != nil {
 		return fmt.Errorf("error getting default network: %v", err)
@@ -554,14 +595,14 @@ func (d *Deployer) setFirewall(ctx *context.Context, computeService *compute.Ser
 			Name:         "default-allow-http",
 			SourceRanges: []string{"0.0.0.0/0"},
 			SourceTags:   []string{"http-server"},
-			Allowed:      []*compute.FirewallAllowed{{"tcp", []string{"80"}}},
+			Allowed:      []*compute.FirewallAllowed{{IPProtocol: "tcp", Ports: []string{"80"}}},
 			Network:      defaultNet.SelfLink,
 		},
 		"default-allow-https": compute.Firewall{
 			Name:         "default-allow-https",
 			SourceRanges: []string{"0.0.0.0/0"},
 			SourceTags:   []string{"https-server"},
-			Allowed:      []*compute.FirewallAllowed{{"tcp", []string{"443"}}},
+			Allowed:      []*compute.FirewallAllowed{{IPProtocol: "tcp", Ports: []string{"443"}}},
 			Network:      defaultNet.SelfLink,
 		},
 	}
@@ -578,24 +619,26 @@ func (d *Deployer) setFirewall(ctx *context.Context, computeService *compute.Ser
 	}
 
 	if Verbose {
-		log.Printf("Need to create rules: %v", needRules)
+		d.Printf("Need to create rules: %v", needRules)
 	}
 	var wg syncutil.Group
 	for name, rule := range needRules {
-		if ctx.IsCanceled() {
-			return context.ErrCanceled
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
 		name, rule := name, rule
 		wg.Go(func() error {
 			if Verbose {
-				log.Printf("Creating rule %s", name)
+				d.Printf("Creating rule %s", name)
 			}
 			r, err := computeService.Firewalls.Insert(d.Conf.Project, &rule).Do()
 			if err != nil {
 				return fmt.Errorf("error creating rule %s: %v", name, err)
 			}
 			if Verbose {
-				log.Printf("Created rule %s: %+v", name, r)
+				d.Printf("Created rule %s: %+v", name, r)
 			}
 			return nil
 		})
@@ -603,11 +646,17 @@ func (d *Deployer) setFirewall(ctx *context.Context, computeService *compute.Ser
 	return wg.Err()
 }
 
+// TODO(bradfitz,mpl): Once we do ACME (LetsEncrypt.org) on their instance, we
+// don't need to generate their TLS certs for them in setupHTTPS.
+
 // setupHTTPS uploads to the configuration bucket the certificate and key used by the
 // instance for HTTPS. It generates them if d.Conf.CertFile or d.Conf.KeyFile is not defined.
 // It should be called after setBuckets.
 func (d *Deployer) setupHTTPS(storageService *storage.Service) error {
 	installedCert, _, err := d.getInstalledTLS()
+	if err != nil && err != os.ErrNotExist {
+		return err
+	}
 	if err == nil {
 		sigs, err := httputil.CertFingerprints(installedCert)
 		if err != nil {
@@ -615,7 +664,7 @@ func (d *Deployer) setupHTTPS(storageService *storage.Service) error {
 		}
 		d.certFingerprints = sigs
 		if Verbose {
-			log.Printf("Reusing existing certificate with fingerprint %v", sigs["SHA-256"])
+			d.Printf("Reusing existing certificate with fingerprint %v", sigs["SHA-256"])
 		}
 		return nil
 	}
@@ -637,7 +686,7 @@ func (d *Deployer) setupHTTPS(storageService *storage.Service) error {
 	} else {
 
 		if Verbose {
-			log.Printf("Generating self-signed certificate for %v ...", d.Conf.Hostname)
+			d.Printf("Generating self-signed certificate for %v ...", d.Conf.Hostname)
 		}
 		certBytes, keyBytes, err := httputil.GenSelfTLS(d.Conf.Hostname)
 		if err != nil {
@@ -649,22 +698,22 @@ func (d *Deployer) setupHTTPS(storageService *storage.Service) error {
 		}
 		d.certFingerprints = sigs
 		if Verbose {
-			log.Printf("Wrote certificate with SHA-256 fingerprint %s", sigs["SHA-256"])
+			d.Printf("Wrote certificate with SHA-256 fingerprint %s", sigs["SHA-256"])
 		}
 		cert = ioutil.NopCloser(bytes.NewReader(certBytes))
 		key = ioutil.NopCloser(bytes.NewReader(keyBytes))
 	}
 
 	if Verbose {
-		log.Print("Uploading certificate and key...")
+		d.Print("Uploading certificate and key...")
 	}
 	_, err = storageService.Objects.Insert(d.Conf.bucketBase(),
-		&storage.Object{Name: path.Join(configDir, certFilename)}).Media(cert).Do()
+		&storage.Object{Name: path.Join(configDir, certFilename())}).Media(cert).Do()
 	if err != nil {
 		return fmt.Errorf("cert upload failed: %v", err)
 	}
 	_, err = storageService.Objects.Insert(d.Conf.bucketBase(),
-		&storage.Object{Name: path.Join(configDir, keyFilename)}).Media(key).Do()
+		&storage.Object{Name: path.Join(configDir, keyFilename())}).Media(key).Do()
 	if err != nil {
 		return fmt.Errorf("key upload failed: %v", err)
 	}
@@ -739,7 +788,8 @@ coreos:
         Requires=docker.service
 
         [Service]
-        ExecStartPre=/usr/bin/docker run --rm -v /opt/bin:/opt/bin ibuildthecloud/systemd-docker
+        ExecStartPre=/bin/bash -c '/usr/bin/curl https://storage.googleapis.com/camlistore-release/docker/systemd-docker.tar.gz | /bin/gunzip -c | /usr/bin/docker load'
+        ExecStartPre=/usr/bin/docker run --rm -v /opt/bin:/opt/bin camlistore/systemd-docker
         ExecStart=/opt/bin/systemd-docker run --rm --name %n -v /var/lib/camlistore/mysql:/mysql -e INNODB_BUFFER_POOL_SIZE=NNN camlistore/mysql
         RestartSec=1s
         Restart=always
@@ -757,8 +807,8 @@ coreos:
         Requires=docker.service mysql.service
 
         [Service]
-        ExecStartPre=/usr/bin/docker run --rm -v /opt/bin:/opt/bin ibuildthecloud/systemd-docker
-        ExecStartPre=/bin/bash -c '/usr/bin/curl https://storage.googleapis.com/camlistore-release/docker/camlistored.tar.gz | /bin/gunzip -c | /usr/bin/docker load'
+        ExecStartPre=/usr/bin/docker run --rm -v /opt/bin:/opt/bin camlistore/systemd-docker
+        ExecStartPre=/bin/bash -c '/usr/bin/curl CAMLISTORED_TARBALL | /bin/gunzip -c | /usr/bin/docker load'
         ExecStart=/opt/bin/systemd-docker run --rm -p 80:80 -p 443:443 --name %n -v /run/camjournald.sock:/run/camjournald.sock -v /var/lib/camlistore/tmp:/tmp --link=mysql.service:mysqldb camlistore/server
         RestartSec=1s
         Restart=always

@@ -27,11 +27,12 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/constants/google"
-	"camlistore.org/pkg/jsonconfig"
-	"camlistore.org/pkg/oauthutil"
+	"camlistore.org/pkg/osutil"
+	"go4.org/jsonconfig"
 
+	"go4.org/oauthutil"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 )
 
 const testObjectContent = "Google Storage Test\n"
@@ -53,7 +54,7 @@ func doConfig(t *testing.T) (gsa *Client, bucket string) {
 		t.Skip("Skipping manual test. Set flag --gs_config_path to test Google Storage.")
 	}
 
-	cf, err := jsonconfig.ReadFile(*gsConfigPath)
+	cf, err := osutil.NewJSONConfigParser().ReadFile(*gsConfigPath)
 	if err != nil {
 		t.Fatalf("Failed to read config: %v", err)
 	}
